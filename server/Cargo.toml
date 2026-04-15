@@ -1,6 +1,6 @@
 [package]
 name = "v0"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -9,11 +9,16 @@ axum       = "0.7"
 tokio      = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["trace"] }
 
-# 数据库（注意：不需要 macros feature，用 query_as 运行时查询即可）
+# 数据库 — 替换 sqlite → postgres
+# ✅ 变更: features 从 ["sqlite", "runtime-tokio-rustls"]
+#          改为    ["postgres", "runtime-tokio-rustls"]
 sqlx = { version = "0.7", features = [
-    "sqlite",
+    "postgres",
     "runtime-tokio-rustls",
 ] }
+
+# UUID 用于生成唯一 License Key (HKEY-XXXX-XXXX-XXXX 格式)
+uuid = { version = "1", features = ["v4"] }
 
 # 序列化
 serde      = { version = "1", features = ["derive"] }
