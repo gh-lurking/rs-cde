@@ -1,0 +1,28 @@
+[package]
+name = "v0"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Web 框架
+axum       = "0.7"
+tokio      = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace"] }
+
+# 数据库（注意：不需要 macros feature，用 query_as 运行时查询即可）
+sqlx = { version = "0.7", features = [
+    "sqlite",
+    "runtime-tokio-rustls",
+] }
+
+# 序列化
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 日志
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = true
