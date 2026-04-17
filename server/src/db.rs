@@ -179,11 +179,12 @@ pub async fn batch_init_keys(pool: &DbPool, count: u32, note: &str) -> Result<u6
         let uid = Uuid::new_v4().simple().to_string().to_uppercase();
 
         let key = format!(
-            "{}-{}-{}-{}",
+            "{}-{}-{}-{}-{}",
             &uid[12..16],
             &uid[0..4],
             &uid[4..8],
             &uid[8..12],
+            &uid[16..20],
         );
 
         let key_hash = {
