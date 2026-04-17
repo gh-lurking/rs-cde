@@ -7,17 +7,19 @@ mod license_guard;
 mod network;
 mod storage;
 
-fn main() {
-    loc_detection();
+#[tokio::main]
+async fn main() {
+    loc_detection().await;
 
+    // license_guard 内部使用 ureq 同步调用，在 tokio 运行时中同步阻塞是可以的
+    // 若担心阻塞 tokio 线程，可用 tokio::task::spawn_blocking
     license_guard::check_and_enforce();
     println!("✅ Your license is valid");
 
     // your_business_logic();
-    run_client();
+    run_client().await;
 }
 
-#[tokio::main]
 async fn loc_detection() {
     // println!("LOC DETECTION...\n");
     // 所有策略共用同一 HTTP Client（连接池复用）
@@ -48,13 +50,21 @@ async fn fallback_to_cf_detection(client: Client) {
             eprintln!("❌ Your country (region) is not supported. Please contact the support team");
             process::exit(1);
         }
-        Ok(false) => println!("✅ Your country (region) is supported."),
-        Err(e) => eprintln!("Failure with DETECTION TWO: {e}"),
+        Ok(false) => {
+            println!("✅ Your country (region) is supported.");
+        }
+       // BUG-10 FIX: 两种检测都失败时退出，而不是静默放行
+        Err(e) => {
+            eprintln!("❌ Your country (region) is not supported. Please contact the support team");
+            process::exit(1);
+
+        }
         // Err(_) => eprintln!("ERR-DTCT-TWO"),
     }
 }
 
-fn run_client() {
+async fn run_client() {
     println!("🚀 Run the client now ...");
     // TODO: 在此处填写业务代码
 }
+

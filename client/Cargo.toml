@@ -32,6 +32,7 @@ local-ip-address = "0.6"
 
 # 错误处理（可选，使代码更简洁）
 anyhow = "1"
+tracing = "0.1.44"
 
 [profile.release]
 opt-level = 3

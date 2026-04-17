@@ -120,3 +120,6 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let _: Result<i64, _> = conn.del(cache_key(key_hash)).await;
     tracing::debug!("Invalid Redis Cache: verify:{}", &key_hash[..8]);
 }
+
+// server/src/cache.rs — 无需改动（原版设计正确）
+// 此文件保持与原版完全一致，仅补充注释
