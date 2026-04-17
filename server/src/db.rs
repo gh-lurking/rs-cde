@@ -5,9 +5,12 @@
 // ✅ 变更3: init_pool() 从 sqlite:// 连接串改为 postgres:// 连接串
 // ✅ 变更4: SQL 语法适配 PostgreSQL（? → $N 占位符，BOOLEAN → BOOL）
 // ✅ 变更5: 新增 add_key() 函数，供 /admin/add-key 接口调用
+// ✅ 变更6: 新增 batch_init() 函数，供 /admin/batch-init 接口调用
 
-use sqlx::PgPool;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use uuid::Uuid;
 
 pub type DbPool = PgPool;
 
@@ -65,7 +68,7 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
             created_at    BIGINT      NOT NULL,
             last_check    BIGINT,
             note          TEXT        NOT NULL DEFAULT ''
-        )"
+        )",
     )
     .execute(&pool)
     .await?;
@@ -84,8 +87,8 @@ pub async fn find_license(
 ) -> Result<Option<LicenseRecord>, sqlx::Error> {
     // ✅ 变更4: PostgreSQL 占位符为 $1, $2, ...（SQLite 用 ?）
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, note
-         FROM licenses WHERE key_hash = $1"
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
+         FROM licenses WHERE key_hash = $1",
     )
     .bind(key_hash)
     .fetch_optional(pool)
@@ -93,17 +96,14 @@ pub async fn find_license(
 }
 
 /// 激活时写入新 License 记录（key_hash 冲突时忽略，保证幂等）
-pub async fn insert_license(
-    pool: &DbPool,
-    r: &LicenseRecord,
-) -> Result<(), sqlx::Error> {
+pub async fn insert_license(pool: &DbPool, r: &LicenseRecord) -> Result<(), sqlx::Error> {
     // ✅ 变更4: PostgreSQL 用 ON CONFLICT DO NOTHING
     //           SQLite 用的是 INSERT OR IGNORE
     sqlx::query(
         "INSERT INTO licenses
              (key, key_hash, activation_ts, expires_at, revoked, created_at, note)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (key_hash) DO NOTHING"
+         ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(&r.key)
     .bind(&r.key_hash)
@@ -118,11 +118,7 @@ pub async fn insert_license(
 }
 
 /// 更新最后一次在线校验时间戳
-pub async fn update_last_check(
-    pool: &DbPool,
-    key_hash: &str,
-    ts: i64,
-) -> Result<(), sqlx::Error> {
+pub async fn update_last_check(pool: &DbPool, key_hash: &str, ts: i64) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE licenses SET last_check = $1 WHERE key_hash = $2")
         .bind(ts)
         .bind(key_hash)
@@ -151,23 +147,19 @@ pub async fn extend_license(
     key_hash: &str,
     extra_secs: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE licenses SET expires_at = expires_at + $1 WHERE key_hash = $2"
-    )
-    .bind(extra_secs)
-    .bind(key_hash)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE licenses SET expires_at = expires_at + $1 WHERE key_hash = $2")
+        .bind(extra_secs)
+        .bind(key_hash)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
 /// 查询所有 License 记录（管理员列表）
-pub async fn list_all_licenses(
-    pool: &DbPool,
-) -> Result<Vec<LicenseRecord>, sqlx::Error> {
+pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
         "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, note
-         FROM licenses ORDER BY created_at DESC"
+         FROM licenses ORDER BY created_at DESC",
     )
     .fetch_all(pool)
     .await
@@ -198,7 +190,7 @@ pub async fn add_key(
         "INSERT INTO licenses
              (key, key_hash, activation_ts, expires_at, revoked, created_at, note)
          VALUES ($1, $2, 0, $3, FALSE, $4, $5)
-         ON CONFLICT (key_hash) DO NOTHING"
+         ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(key)
     .bind(key_hash)
@@ -210,4 +202,48 @@ pub async fn add_key(
 
     // rows_affected == 1 表示真正插入；== 0 表示 key_hash 已存在被忽略
     Ok(result.rows_affected() == 1)
+}
+
+/// 批量生成 License Key 并入库（系统初始化用）
+///
+/// - activation_ts 默认值 0（未激活）
+/// - expires_at 默认值 0（未激活不过期）
+/// - created_at 为生成时间
+/// - last_check 默认值 0
+/// - note 字段默认 "系统初始化生成"
+pub async fn batch_init_keys(pool: &DbPool, count: u32, note: &str) -> Result<u64, sqlx::Error> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let mut inserted: u64 = 0;
+    for _ in 0..count {
+        // 生成格式为 HKEY-XXXX-XXXX-XXXX 的随机秘钥
+        let uid = Uuid::new_v4().simple().to_string().to_uppercase();
+        let key = format!("{}-{}-{}-{}", &uid[12..16],  &uid[0..4], &uid[4..8], &uid[8..12]);
+        let key_hash = {
+            let mut h = Sha256::new();
+            h.update(key.as_bytes());
+            hex::encode(h.finalize())
+        };
+
+        let result = sqlx::query(
+            "INSERT INTO licenses
+                (key, key_hash, activation_ts, expires_at,
+                 revoked, created_at, last_check, note)
+             VALUES ($1, $2, 0, 0, FALSE, $3, 0, $4)
+             ON CONFLICT (key_hash) DO NOTHING",
+        )
+        .bind(&key)
+        .bind(&key_hash)
+        .bind(now)
+        .bind(note)
+        .execute(pool)
+        .await?;
+
+        inserted += result.rows_affected();
+    }
+    Ok(inserted)
 }

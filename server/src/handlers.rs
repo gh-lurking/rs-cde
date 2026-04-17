@@ -33,15 +33,14 @@ fn now_secs() -> i64 {
 fn hash_key(key: &str) -> String {
     let mut h = Sha256::new();
     h.update(key.as_bytes());
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 /// 生成格式为 HKEY-XXXX-XXXX-XXXX 的随机秘钥（基于 UUID v4）
 fn generate_hkey() -> String {
     // UUID v4 = 32 hex chars，拆为 3×8 字符段
-    let uid = Uuid::new_v4().to_simple().to_string().to_uppercase();
-    // 取前 20 字符，分为 3 段
-    format!("HKEY-{}-{}-{}", &uid[0..4], &uid[4..8], &uid[8..12])
+    let uid = Uuid::new_v4().simple().to_string().to_uppercase();
+    format!("{}-{}-{}-{}", &uid[12..16], &uid[0..4], &uid[4..8], &uid[8..12])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,61 +60,54 @@ pub async fn activate(
 ) -> impl IntoResponse {
     let now = now_secs();
 
-    // 防重放：时间戳偏差不超过 ±60 秒
     if (now - req.timestamp).abs() > 60 {
         return (StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "时间戳偏差过大"}))).into_response();
+            Json(serde_json::json!({"error": "时间戳偏差过大"}))
+        ).into_response();
     }
-
-    let _ = &req.signature; // 进阶可做 HMAC 验签
 
     match db::find_license(&pool, &req.key_hash).await {
         Ok(Some(record)) => {
             if record.activation_ts == 0 {
-                // ✅ 变更1a: key 存在但尚未激活 → 写入激活时间（首次激活）
+                // ✅ 新逻辑：激活时设置过期时间 = 激活时间 + 1年
                 let activated_at = now;
-                let expires_at   = record.expires_at; // 使用管理员预设的过期时间
+                let year_sec= 365 * 86400;
+                let expires_at = activated_at + year_sec; // 365 * 86400
 
-                let updated = LicenseRecord {
-                    activation_ts: activated_at,
-                    ..record
-                };
-                // 用 upsert 更新激活时间
-                let _ = sqlx::query(
-                    "UPDATE licenses SET activation_ts = $1 WHERE key_hash = $2"
+                sqlx::query(
+                    "UPDATE licenses
+                     SET activation_ts = $1, expires_at = $2
+                     WHERE key_hash = $3"
                 )
                 .bind(activated_at)
+                .bind(expires_at)
                 .bind(&req.key_hash)
                 .execute(pool.as_ref())
-                .await;
+                .await
+                .ok();
 
                 (StatusCode::CREATED, Json(serde_json::json!({
                     "activation_ts": activated_at,
-                    "expires_at":    expires_at,
-                    "message":       "激活成功"
+                    "expires_at": expires_at,
+                    "message": "激活成功，有效期一年"
                 }))).into_response()
             } else {
-                // 已激活：幂等返回原始激活时间
                 (StatusCode::OK, Json(serde_json::json!({
                     "activation_ts": record.activation_ts,
-                    "expires_at":    record.expires_at,
-                    "message":       "已激活（返回原始时间）"
+                    "expires_at": record.expires_at,
+                    "message": "已激活（返回原始时间）"
                 }))).into_response()
             }
         }
         Ok(None) => {
-            // ✅ 变更1b: key_hash 不在 DB 中 → 拒绝激活
-            // 原逻辑（SQLite 版）在此处直接 INSERT，默认所有 key 都有效。
-            // 新逻辑要求 key 必须由管理员通过 /admin/add-key 预置后才可激活，
-            // 彻底消除客户端 VALID_KEYS 硬编码白名单的必要。
-            (StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": "无效或未授权的秘钥，请联系管理员"
-            }))).into_response()
+            (StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "无效或未授权的秘钥"}))
+            ).into_response()
         }
         Err(e) => {
-            let msg = e.to_string();
             (StatusCode::INTERNAL_SERVER_ERROR,
-             Json(serde_json::json!({"error": msg}))).into_response()
+                Json(serde_json::json!({"error": e.to_string()}))
+            ).into_response()
         }
     }
 }
@@ -147,13 +139,23 @@ pub async fn verify(
         Ok(Some(record)) => {
             let _ = db::update_last_check(&pool, &req.key_hash, now).await;
 
-            // ✅ 变更2: 返回 expires_at，客户端收到后与当前时间比较，
+            // ✅ 过期秘钥自动吊销 - 仅对已激活的秘钥检查（expires_at > 0）
+            let mut revoked = record.revoked;
+            if !revoked && record.expires_at > 0 && now >= record.expires_at {
+                // 自动吊销过期秘钥
+                let _ = db::revoke_license(
+                    &pool, &req.key_hash, "秘钥已过期，系统自动吊销"
+                ).await;
+                revoked = true;
+            }
+
+            // ✅ 返回 expires_at，客户端收到后与当前时间比较，
             //   若 now >= expires_at 则客户端主动退出，无需服务端多一次判断。
             //   revoked=true 时客户端同样退出。
             (StatusCode::OK, Json(serde_json::json!({
                 "activation_ts": record.activation_ts,
                 "expires_at":    record.expires_at,
-                "revoked":       record.revoked,
+                "revoked":       revoked,
             }))).into_response()
         }
         Ok(None) => {
@@ -321,3 +323,48 @@ pub async fn extend_license(
 }
 
 pub async fn health() -> &'static str { "ok" }
+
+#[derive(Deserialize)]
+pub struct BatchInitReq {
+    token: String,
+    /// 生成数量，默认 200
+    count: Option<u32>,
+    /// 备注，默认 "系统初始化生成"
+    note: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BatchInitResp {
+    inserted: u64,
+    message: String,
+}
+
+pub async fn batch_init(
+    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(admin_token): Extension<Arc<String>>,
+    Json(req): Json<BatchInitReq>,
+) -> impl IntoResponse {
+    if !auth::verify_admin_token(&req.token, &admin_token) {
+        return (StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "无权限"}))
+        ).into_response();
+    }
+
+    let count = req.count.unwrap_or(200);
+    let note = req.note.clone()
+        .unwrap_or_else(|| "系统初始化生成".to_string());
+
+    match db::batch_init_keys(&pool, count, &note).await {
+        Ok(inserted) => {
+            (StatusCode::CREATED, Json(BatchInitResp {
+                inserted,
+                message: format!("成功初始化 {} 个秘钥", inserted),
+            })).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()}))
+            ).into_response()
+        }
+    }
+}

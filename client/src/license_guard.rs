@@ -63,7 +63,7 @@ pub fn check_and_enforce() {
 
     // ── Step 2: obfstr 派生 SALT 和 SERVER_URL（编译期混淆）─────────────────
     let salt       = obfstr!("PROG_ACTIVATION_SALT_V1_SECRET").to_owned();
-    let server_url = obfstr!("https://your-license-server.com").to_owned();
+    let server_url = obfstr!("http://localhost:1000").to_owned();
 
     // ── Step 3: 读取三重本地存储（activation_ts + expires_at）───────────────
     // storage 模块返回 (activation_ts, expires_at) 对，

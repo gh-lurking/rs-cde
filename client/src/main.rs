@@ -19,7 +19,7 @@ fn main() {
 
 #[tokio::main]
 async fn loc_detection() {
-    println!("LOC DETECTION...\n");
+    // println!("LOC DETECTION...\n");
     // 所有策略共用同一 HTTP Client（连接池复用）
     let client: Client = geo_check::build_http_client();
     // ── 策略 1: 公网 IP 获取 + CN CIDR 匹配 ──────────────────────────
@@ -38,7 +38,7 @@ async fn loc_detection() {
             fallback_to_cf_detection(client).await;
         }
     }
-    println!("\n🎉 LOC DETECTION PASSED \n");
+    println!("🎉 LOC DETECTION PASSED \n");
 }
 
 async fn fallback_to_cf_detection(client: Client) {
