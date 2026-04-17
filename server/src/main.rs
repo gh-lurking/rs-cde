@@ -1,11 +1,11 @@
 // server/src/main.rs — Axum Web 服务入口
 //
-// ✅ 变更1: 数据库从 SQLite 改为 PostgreSQL
-//   - 环境变量从 DB_PATH 改为 DATABASE_URL
-//   - DATABASE_URL 格式: postgres://user:password@host:5432/dbname
-// ✅ 变更2: 新增路由 POST /admin/add-key → handlers::add_key
+// ✅ 变更1: 新增 Redis 连接池初始化（deadpool-redis）
+// ✅ 变更2: PostgreSQL 连接池参数精细化（见 db.rs init_pool）
+// ✅ 变更3: RedisPool 通过 Extension 注入所有路由
 
 mod auth;
+mod cache;   // ✅ 新增: Redis 缓存模块
 mod db;
 mod handlers;
 
@@ -18,42 +18,53 @@ use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() {
-    // 初始化日志
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    // ✅ 变更1: 读取 PostgreSQL 连接串
-    // 示例: postgres://licenseuser:secret@localhost:5432/licensedb
+    // ── PostgreSQL 连接池 ─────────────────────────────────────────────────
     let database_url = std::env::var("DATABASE_URL")
-        .expect("请设置 DATABASE_URL 环境变量，格式: postgres://user:pass@host:port/db");
+        .expect("请设置 DATABASE_URL 环境变量");
 
-    let pool = db::init_pool(&database_url)
+    // ✅ db::init_pool 内部已精细化 PgPoolOptions（见 db.rs）
+    let pg_pool = db::init_pool(&database_url)
         .await
         .expect("PostgreSQL 连接/初始化失败");
-    let pool = Arc::new(pool);
+    let pg_pool = Arc::new(pg_pool);
+    tracing::info!("✅ PostgreSQL 连接池就绪");
 
-    // 管理员 Token（从环境变量读取）
-    let admin_token = std::env::var("ADMIN_TOKEN").expect("请设置 ADMIN_TOKEN 环境变量");
+    // ── ✅ Redis 连接池初始化 ──────────────────────────────────────────────
+    // 格式: redis://[:password@]host:port[/db]
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+
+    let redis_pool = cache::init_redis_pool(&redis_url)
+        .expect("Redis 连接池初始化失败");
+    let redis_pool = Arc::new(redis_pool);
+    tracing::info!("✅ Redis 连接池就绪 (deadpool-redis)");
+
+    let admin_token = std::env::var("ADMIN_TOKEN")
+        .expect("请设置 ADMIN_TOKEN 环境变量");
     let admin_token = Arc::new(admin_token);
 
-    // 路由配置
+    // ── 路由配置 ──────────────────────────────────────────────────────────
     let app = Router::new()
-        .route("/activate", post(handlers::activate))
-        .route("/verify", post(handlers::verify))
-        .route("/health", get(handlers::health))
-        .route("/admin/licenses", get(handlers::list_licenses))
-        .route("/admin/revoke", delete(handlers::revoke_license))
-        .route("/admin/extend", post(handlers::extend_license))
-        // ✅ 新增管理员预置 key 接口
-        .route("/admin/add-key", post(handlers::add_key))
+        .route("/activate",         post(handlers::activate))
+        .route("/verify",           post(handlers::verify))
+        .route("/health",           get(handlers::health))
+        .route("/admin/licenses",   get(handlers::list_licenses))
+        .route("/admin/revoke",     delete(handlers::revoke_license))
+        .route("/admin/extend",     post(handlers::extend_license))
+        .route("/admin/add-key",    post(handlers::add_key))
         .route("/admin/batch-init", post(handlers::batch_init))
-        .layer(Extension(pool))
+        // ✅ 同时注入 pg_pool 和 redis_pool
+        .layer(Extension(pg_pool))
+        .layer(Extension(redis_pool))
         .layer(Extension(admin_token))
         .layer(TraceLayer::new_for_http());
 
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let bind_addr = std::env::var("BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
-    tracing::info!("License Server (PostgreSQL) 启动于 {}", bind_addr);
-
+    tracing::info!("License Server 启动于 {}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

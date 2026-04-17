@@ -4,32 +4,35 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-# Web 框架
+# ── Web 框架 ────────────────────────────────────────────────────────────────
 axum       = "0.7"
 tokio      = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["trace"] }
-
-# 数据库 — 替换 sqlite → postgres
-# ✅ 变更: features 从 ["sqlite", "runtime-tokio-rustls"]
-#          改为    ["postgres", "runtime-tokio-rustls"]
+# ── PostgreSQL 连接池（sqlx 内置池，精细化配置见 db.rs）────────────────────
+# ✅ 变更: 补充 macros 特性
 sqlx = { version = "0.7", features = [
     "postgres",
     "runtime-tokio-rustls",
+    "macros",         # ✅ 新增: query! 宏支持
 ] }
-
-# UUID 用于生成唯一 License Key (HKEY-XXXX-XXXX-XXXX 格式)
+# ── ✅ 新增: Redis 客户端 + 连接池 ─────────────────────────────────────────
+# redis: 异步客户端核心
+redis = { version = "0.25", features = [
+    "tokio-comp",         # tokio 异步兼容
+    "connection-manager", # 自动重连管理器
+] }
+# deadpool-redis: 生产级 Redis 连接池
+deadpool-redis = { version = "0.15", features = ["rt_tokio_1"] }
+# UUID 用于生成唯一 License Key
 uuid = { version = "1", features = ["v4"] }
-
 # 序列化
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-
 # 日志
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11.0"
-
-hex = "0.4"
+hex  = "0.4"
 
 [profile.release]
 opt-level = 3
