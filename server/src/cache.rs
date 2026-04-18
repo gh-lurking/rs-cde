@@ -1,4 +1,6 @@
-// server/src/cache.rs — 优化版（BUG-B FIX: VerifyCacheEntry 增加 key 字段）
+// server/src/cache.rs — 优化版
+// BUG-B FIX: VerifyCacheEntry 增加 key 字段，cache-hit 时也需要用 key 做签名验证
+
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,7 @@ pub type RedisPool = Pool;
 /// BUG-B FIX: 新增 key 字段，cache-hit 时也需要用 key 做签名验证
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VerifyCacheEntry {
-    pub key: String, // BUG-B FIX: 缓存原始 key（明文），用于 cache-hit 验签
+    pub key: String, // BUG-B FIX: 缓存原始 key，用于 cache-hit 验签
     pub activation_ts: i64,
     pub expires_at: i64,
     pub revoked: bool,
@@ -78,7 +80,7 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let _: Result<i64, _> = conn.del(cache_key(key_hash)).await;
+    let _: Result<(), _> = conn.del(cache_key(key_hash)).await;
     tracing::debug!(
         "Invalidated Redis Cache: verify:{}",
         &key_hash[..8.min(key_hash.len())]

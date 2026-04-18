@@ -1,11 +1,14 @@
-// client/src/network.rs — 优化版（BUG-G FIX + BUG-J FIX）
+// client/src/network.rs — 优化版
+// BUG-G FIX: 收到 ERR-TIME-RECORD 时，提取服务端时间自动重试一次
+// BUG-J FIX: 全局单例 Client，连接池跨调用复用（OnceLock 线程安全）
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<sha2::Sha256>;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Serialize)]
 struct VerifyRequest {
@@ -14,6 +17,7 @@ struct VerifyRequest {
     signature: String,
 }
 
+// BUG-05 FIX: 统一使用 i64，避免 u64→i64 转换溢出
 #[derive(Deserialize)]
 pub struct VerifyResponse {
     pub activation_ts: i64,
@@ -56,12 +60,12 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-/// BUG-G FIX: 支持时间偏移的单次请求
+/// BUG-G FIX: 支持时间偏移的单次请求（ts_offset 用于时钟修正重试）
 async fn do_verify(
     hkey: &str,
     server_url: &str,
     timeout_secs: u64,
-    ts_offset: i64,
+    ts_offset: i64, // 时钟偏差补偿值（正常调用传 0）
 ) -> Result<VerifyResponse, String> {
     let ts = now_secs() + ts_offset;
     let key_hash = hash_key(hkey);
@@ -72,10 +76,10 @@ async fn do_verify(
         timestamp: ts,
         signature,
     };
-
     let url = format!("{}/verify", server_url);
-    let client = get_http_client(timeout_secs); // BUG-J FIX: 复用全局 Client
 
+    // BUG-J FIX: 复用全局 Client（避免每次重建 TCP/TLS 连接）
+    let client = get_http_client(timeout_secs);
     let resp = client
         .post(&url)
         .json(&req)
@@ -96,7 +100,7 @@ async fn do_verify(
             .as_str()
             .unwrap_or("unknown error")
             .to_string();
-        // BUG-G FIX: 将 server_time 附加到错误信息中，供调用方重试使用
+        // BUG-G FIX: 将 server_time 附加到错误信息中，供调用方重试
         if let Some(st) = body["server_time"].as_i64() {
             Err(format!("ERR-TIME-RECORD:server_time={}", st))
         } else {
@@ -105,8 +109,9 @@ async fn do_verify(
     }
 }
 
-/// BUG-G FIX: 收到 ERR-TIME-RECORD 时，提取服务端时间自动重试一次
-/// BUG-J FIX: 使用全局 Client 单例，避免重建连接池
+/// 主入口：在线校验，收到时钟错误时自动修正重试一次
+/// BUG-G FIX: 自动时钟修正
+/// BUG-J FIX: 全局 Client 单例
 pub async fn verify_online(
     hkey: &str,
     server_url: &str,
@@ -116,7 +121,7 @@ pub async fn verify_online(
 
     match &result {
         Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
-            // 提取服务端时间，计算偏移后重试
+            // 提取服务端时间，计算偏移后重试一次
             let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
             if let Ok(server_ts) = server_time_str.parse::<i64>() {
                 let offset = server_ts - now_secs();

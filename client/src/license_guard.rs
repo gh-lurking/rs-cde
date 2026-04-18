@@ -1,15 +1,16 @@
-// client/src/license_guard.rs — 优化版（BUG-F FIX + 原有 BUG-04/05/06）
-
-// BUG-04 FIX: 启动多副本校验（副本数 ≥ 2），三者不一致时直接退出
+// client/src/license_guard.rs — 优化版
+// BUG-04 FIX: 启动多副本校验（副本数 >= 2），三者不一致时直接退出
 // BUG-05 FIX: 时间戳统一使用 i64，避免 u64→i64 转换溢出导致永不过期
-// BUG-06 FIX: 调用 async verify_online() 使用 .await，不阻塞线程
-// BUG-10 FIX: 地理检测双重降级失败时不放行避免离线环境绕过检测
+// BUG-06 FIX: 声明为 async fn，调用 verify_online 时正确 .await
+// BUG-F  FIX: 先检查 replica_count（B），再 unwrap local_record（A），顺序不能颠倒
+
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const NET_TIMEOUT_SECS: u64 = 10;
 
+// BUG-06 FIX: 声明为 async fn（原来是同步 fn，导致 verify_online 的 Future 被丢弃）
 pub async fn check_and_enforce() {
     // ── Step 1: 读取 HKEY ─────────────────────────────────────────────────
     let hkey = std::env::var("HKEY").unwrap_or_else(|_| {
@@ -21,13 +22,14 @@ pub async fn check_and_enforce() {
     let salt = obfstr!("PROG_ACTIVATION_SALT_V1_SECRET").to_owned();
     let server_url = obfstr!("http://localhost:1000").to_owned();
 
-    // ── Step 3: 读取三份本地副本（BUG-04 FIX: 多副本校验）────────────────
+    // ── Step 3: 读取三份本地副本（BUG-04 FIX: 多副本投票校验）──────────
     let (local_record, replica_count) = storage::read_local_record_with_count(&hkey, &salt);
 
+    // BUG-05 FIX: 统一使用 i64（i64 最大覆盖 2038+ 年，绝不截断）
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64; // BUG-05 FIX: 统一 i64
+        .as_secs() as i64;
 
     // ── Step 4: 在线校验（BUG-06 FIX: async .await）──────────────────────
     match network::verify_online(&hkey, &server_url, NET_TIMEOUT_SECS).await {
@@ -38,7 +40,7 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
 
-            // 4b: 服务端已过期（统一 i64）
+            // 4b: 服务端已过期（BUG-05 FIX: 统一 i64，无截断风险）
             if now >= resp.expires_at {
                 let days = (now - resp.expires_at) / 86400;
                 eprintln!("[License] 许可证已过期 {} 天，请联系支持", days);
@@ -66,17 +68,21 @@ pub async fn check_and_enforce() {
         Err(e) => {
             eprintln!("[License] 在线校验失败（{}），使用本地缓存校验", e);
 
-            // BUG-F FIX: 先检查副本数，再 unwrap local_record（原代码顺序颠倒）
-            // Step B 必须在 Step A 之前，否则"副本不足"永远不会打印
+            // BUG-F FIX: ⚠️ 顺序关键！必须先检查副本数（B），再 unwrap（A）
+            // 原始代码顺序颠倒（先 unwrap 再检查），导致：
+            //   - local_record=None 时直接 panic，而不是打印"副本不足"并退出
+            //   - "副本不足"的防护形同虚设
+
+            // STEP B（先执行）: 副本数不足时直接退出
             if replica_count < 2 {
                 eprintln!(
-                    "[License] 本地副本不足（当前 {}/3），可能遭到篡改或首次运行未缓存，退出",
+                    "[License] 本地副本不足（{}/3），可能遭篡改或首次运行未缓存，退出",
                     replica_count
                 );
                 std::process::exit(1);
             }
 
-            // BUG-F FIX: 副本数足够才 unwrap（此时 local_record 理论上必然 Some）
+            // STEP A（后执行）: 副本数足够才安全解包
             let (local_ts, local_expires) = match local_record {
                 Some(v) => v,
                 None => {
@@ -86,7 +92,7 @@ pub async fn check_and_enforce() {
                 }
             };
 
-            // BUG-05 FIX: 转换为 i64 后比较
+            // BUG-05 FIX: 转换为 i64 后比较（local_ts/local_expires 存储为 u64）
             let local_ts_i64 = local_ts as i64;
             let local_expires_i64 = local_expires as i64;
 

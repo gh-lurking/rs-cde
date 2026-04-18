@@ -1,8 +1,12 @@
-// server/src/main.rs — 优化版（BUG-H FIX: revoke 改 POST）
+// server/src/main.rs — 优化版
+// BUG-H FIX: /admin/revoke 由 delete() → post()（DELETE+body 在代理层不兼容）
+// BUG-G FIX: TIMESTAMP_WINDOW_SECS 环境变量控制时间戳容忍窗口（默认 300s）
+
 mod auth;
 mod cache;
 mod db;
 mod handlers;
+
 use axum::{
     Extension, Router,
     routing::{get, post},
@@ -33,14 +37,12 @@ async fn main() {
     let admin_token = Arc::new(admin_token);
 
     // ── 路由配置 ────────────────────────────────────────────────────────────
-    // BUG-H FIX: /admin/revoke 由 delete() → post()（DELETE+body 在代理层不兼容）
-    // BUG-G FIX: TIMESTAMP_WINDOW_SECS 环境变量控制时间戳容忍窗口（默认 300s）
     let app = Router::new()
         .route("/activate", post(handlers::activate))
         .route("/verify", post(handlers::verify))
         .route("/health", get(handlers::health))
         .route("/admin/licenses", get(handlers::list_licenses))
-        .route("/admin/revoke", post(handlers::revoke_license)) // BUG-H FIX
+        .route("/admin/revoke", post(handlers::revoke_license)) // BUG-H FIX: DELETE → POST
         .route("/admin/extend", post(handlers::extend_license))
         .route("/admin/add-key", post(handlers::add_key))
         .route("/admin/batch-init", post(handlers::batch_init))
