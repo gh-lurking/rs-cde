@@ -1,13 +1,11 @@
-// client/src/network.rs — 优化版（修复 BUG-06: 改为 async reqwest）
-
-// BUG-06 FIX: 原码使用 ureq（同步阻塞），会阻塞 tokio 工作线程。
-//             改为 reqwest async，在 tokio 上下文中安全调用。
-
+// client/src/network.rs — 优化版（BUG-G FIX + BUG-J FIX）
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 #[derive(Serialize)]
 struct VerifyRequest {
@@ -16,7 +14,6 @@ struct VerifyRequest {
     signature: String,
 }
 
-/// 验证响应：/verify 接口返回体
 #[derive(Deserialize)]
 pub struct VerifyResponse {
     pub activation_ts: i64,
@@ -24,14 +21,33 @@ pub struct VerifyResponse {
     pub revoked: bool,
 }
 
-/// SHA256(hkey) → hex string
+// BUG-J FIX: 全局单例 Client，连接池跨调用复用
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn get_http_client(timeout_secs: u64) -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("Failed to build HTTP client")
+    })
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 pub fn hash_key(hkey: &str) -> String {
     let mut h = Sha256::new();
     h.update(hkey.as_bytes());
     format!("{:x}", h.finalize())
 }
 
-/// HMAC-SHA256(secret=hkey, msg="key_hash|timestamp")
 fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
     let mut mac = HmacSha256::new_from_slice(hkey.as_bytes()).unwrap();
     mac.update(key_hash.as_bytes());
@@ -40,21 +56,14 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-/// 在线校验：POST /verify（BUG-06 FIX: async reqwest）
-///
-/// 返回 Err 时调用方降级到本地缓存校验
-pub async fn verify_online(
+/// BUG-G FIX: 支持时间偏移的单次请求
+async fn do_verify(
     hkey: &str,
     server_url: &str,
     timeout_secs: u64,
+    ts_offset: i64,
 ) -> Result<VerifyResponse, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
+    let ts = now_secs() + ts_offset;
     let key_hash = hash_key(hkey);
     let signature = sign_request(hkey, &key_hash, ts);
 
@@ -65,12 +74,7 @@ pub async fn verify_online(
     };
 
     let url = format!("{}/verify", server_url);
-
-    // BUG-06 FIX: reqwest async，不阻塞 tokio 线程
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = get_http_client(timeout_secs); // BUG-J FIX: 复用全局 Client
 
     let resp = client
         .post(&url)
@@ -79,12 +83,48 @@ pub async fn verify_online(
         .await
         .map_err(|e| e.to_string())?;
 
-    resp.json::<VerifyResponse>()
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    if status.is_success() {
+        serde_json::from_value(body).map_err(|e| e.to_string())
+    } else {
+        let err_msg = body["error"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
+        // BUG-G FIX: 将 server_time 附加到错误信息中，供调用方重试使用
+        if let Some(st) = body["server_time"].as_i64() {
+            Err(format!("ERR-TIME-RECORD:server_time={}", st))
+        } else {
+            Err(err_msg)
+        }
+    }
 }
 
-// BUG-06 FIX: activate_online() 也改为 async reqwest
-// 从未激活的情况下调用激活接口，获取 activation_ts 和 expires_at，
-// 写入本地存储后由 license_guard 中统一处理。
-// 不在 license_guard 中调用（保持职责单一）
+/// BUG-G FIX: 收到 ERR-TIME-RECORD 时，提取服务端时间自动重试一次
+/// BUG-J FIX: 使用全局 Client 单例，避免重建连接池
+pub async fn verify_online(
+    hkey: &str,
+    server_url: &str,
+    timeout_secs: u64,
+) -> Result<VerifyResponse, String> {
+    let result = do_verify(hkey, server_url, timeout_secs, 0).await;
+
+    match &result {
+        Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
+            // 提取服务端时间，计算偏移后重试
+            let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
+            if let Ok(server_ts) = server_time_str.parse::<i64>() {
+                let offset = server_ts - now_secs();
+                tracing::warn!("[License] 时钟偏差 {}s，自动修正后重试", offset);
+                return do_verify(hkey, server_url, timeout_secs, offset).await;
+            }
+            result
+        }
+        _ => result,
+    }
+}

@@ -55,10 +55,10 @@ async fn fallback_to_cf_detection(client: Client) {
             println!("✅ Your country (region) is supported.");
         }
         // BUG-10 FIX: 两种检测都失败时退出，而不是静默放行
-        Err(_) => {
-            eprintln!("❌ Your country (region) is not supported. Please contact the support team");
+        Err(e) => {
+            eprintln!("❌ Network unavailable: {}, Please check your internet connection", e);
             process::exit(1);
-        } // Err(_) => eprintln!("ERR-DTCT-TWO"),
+        } // Err(_) => eprintln!("ERR-DTCT-TWO")
     }
 }
 
