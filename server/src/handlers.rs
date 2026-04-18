@@ -1,8 +1,11 @@
-// server/src/handlers.rs — 优化版（完整）
+// server/src/handlers.rs — 最终优化版（完整）
 // 修复: BUG-01(replay) BUG-02(expires=0顺序) BUG-03(无验签) BUG-08(last_check NULL)
 //       BUG-09(extend静默失败) BUG-A(激活前校验expires) BUG-B(cache验签)
 //       BUG-C(nonce降级) BUG-D(last_check节流) BUG-E(valid_days校验)
 //       BUG-G(时间窗口可配+server_time) BUG-H(revoke改POST)
+// 新增修复: BUG-NEW-1(valid_days代码截断) BUG-NEW-2(并发激活无行数检查)
+//           BUG-NEW-3(nonce EX=70s vs 窗口300s) BUG-NEW-5(撤销响应信息泄露)
+//           BUG-NEW-10(内存降级nonce多实例问题→fail-closed)
 
 use crate::{auth, cache, db};
 use axum::{
@@ -13,12 +16,10 @@ use axum::{
 use cache::{RedisPool, VerifyCacheEntry};
 use db::DbPool;
 use hex;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 fn now_secs() -> i64 {
@@ -73,11 +74,23 @@ fn generate_hkey() -> String {
     )
 }
 
-// ── BUG-C FIX: 内存降级 nonce 存储（Redis 宕机时使用）──────────────────────
-static FALLBACK_NONCES: Lazy<Mutex<(HashSet<String>, Instant)>> =
-    Lazy::new(|| Mutex::new((HashSet::new(), Instant::now())));
+/// BUG-G FIX: 时间窗口从环境变量读取（默认 300s）
+fn timestamp_window() -> i64 {
+    std::env::var("TIMESTAMP_WINDOW_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
+}
 
-/// BUG-01 FIX: nonce 去重（Redis NX 原子操作；BUG-C FIX: 降级内存集）
+/// BUG-NEW-3 FIX: nonce TTL 与时间窗口对齐（+30s 安全余量），防止窗口内重放
+fn nonce_ttl() -> i64 {
+    // 必须 >= timestamp_window()，否则时间窗口内 nonce 过期后可被重放
+    timestamp_window() + 30
+}
+
+/// BUG-01 FIX: nonce 去重（Redis NX 原子操作）
+/// BUG-C  FIX: Redis 宕机 → fail-closed（BUG-NEW-10 FIX: 多实例下内存集不安全）
+/// BUG-NEW-3 FIX: EX 使用 nonce_ttl()，不再写死 70s
 async fn check_and_store_nonce(redis_pool: &RedisPool, sig: &str) -> bool {
     let key = format!("nonce:{}", sig);
     match redis_pool.get().await {
@@ -86,24 +99,21 @@ async fn check_and_store_nonce(redis_pool: &RedisPool, sig: &str) -> bool {
                 .arg(&key)
                 .arg("1")
                 .arg("EX")
-                .arg(70i64) // 时间窗口 300s + 安全余量
+                .arg(nonce_ttl()) // BUG-NEW-3 FIX: 动态 TTL，与时间窗口严格对齐
                 .arg("NX") // 原子"不存在才写"
                 .query_async(&mut conn)
                 .await;
             matches!(result, Ok(Some(_)))
         }
-        Err(_) => {
-            // BUG-C FIX: Redis 宕机 → 降级到内存 nonce 集（5 分钟自动清空）
-            let mut guard = FALLBACK_NONCES.lock().unwrap();
-            let (set, last_reset) = &mut *guard;
-            if last_reset.elapsed() > Duration::from_secs(300) {
-                set.clear();
-                *last_reset = Instant::now();
-            }
-            if set.len() > 50_000 {
-                return false;
-            } // 防内存耗尽
-            set.insert(sig.to_string())
+        Err(e) => {
+            // BUG-NEW-10 FIX: Redis 不可用时 fail-closed（拒绝请求）
+            // 理由：内存降级集合在多实例部署下无法共享，重放防护失效
+            // 运维侧应通过 /health 监控 Redis 状态并及时恢复
+            tracing::error!(
+                "[Nonce] Redis 不可用 ({})，fail-closed 拒绝请求（防多实例重放）",
+                e
+            );
+            false
         }
     }
 }
@@ -112,7 +122,7 @@ async fn check_and_store_nonce(redis_pool: &RedisPool, sig: &str) -> bool {
 async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> bool {
     let throttle_key = format!("lc_throttle:{}", key_hash);
     let Ok(mut conn) = redis_pool.get().await else {
-        return true;
+        return true; // Redis 不可用时不限流（last_check 非关键路径）
     };
     let result: Result<Option<String>, _> = deadpool_redis::redis::cmd("SET")
         .arg(&throttle_key)
@@ -125,15 +135,7 @@ async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> boo
     matches!(result, Ok(Some(_)))
 }
 
-/// BUG-G FIX: 时间窗口从环境变量读取（默认 300s）
-fn timestamp_window() -> i64 {
-    std::env::var("TIMESTAMP_WINDOW_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300)
-}
-
-// ── POST /activate ────────────────────────────────────────────────────────────
+// ── POST /activate ─────────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct ActivateReq {
     key_hash: String,
@@ -157,7 +159,7 @@ pub async fn activate(
             .into_response();
     }
 
-    // [2] BUG-01 FIX: nonce 去重（BUG-C FIX: Redis 宕机降级内存集）
+    // [2] BUG-01 FIX: nonce 去重（BUG-NEW-10 FIX: fail-closed）
     if !check_and_store_nonce(&redis_pool, &req.signature).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -185,7 +187,7 @@ pub async fn activate(
         }
     };
 
-    // [4] BUG-03 FIX: 签名验证（持有原始 key 才能生成正确 HMAC）
+    // [4] BUG-03 FIX: 签名验证
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -206,48 +208,72 @@ pub async fn activate(
     if record.activation_ts == 0 {
         // BUG-A FIX: 激活前强制校验 expires_at 合法性
         let expires_at = if record.expires_at > now {
-            record.expires_at // 预设且未过期：直接使用
+            record.expires_at
         } else if record.expires_at > 0 {
-            // 预设值已过期：拒绝激活
-            return (StatusCode::GONE, Json(serde_json::json!({
-                "error": "key has a pre-set expiry that is already in the past; use /admin/extend first"
-            }))).into_response();
+            return (
+                StatusCode::GONE,
+                Json(serde_json::json!({
+                    "error": "key has a pre-set expiry that is already in the past; use /admin/extend first"
+                })),
+            )
+                .into_response();
         } else {
-            // expires_at=0（batch-init 风格）：拒绝，提示先设置期限
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
-                "error": "key has no expiry configured; use /admin/add-key with valid_days or /admin/extend"
-            }))).into_response();
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "key has no expiry configured; use /admin/add-key with valid_days or /admin/extend"
+                })),
+            )
+                .into_response();
         };
 
+        // BUG-NEW-2 FIX: activate_license 现在返回 Result<bool>，检查是否真正激活成功
         match db::activate_license(&pool, &req.key_hash, now, expires_at).await {
-            Ok(()) => {}
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e.to_string()})),
+            Ok(true) => {
+                // 激活成功：主动失效 Redis 缓存
+                let rp = Arc::clone(&redis_pool);
+                let kh = req.key_hash.clone();
+                tokio::spawn(async move {
+                    cache::invalidate_verify_cache(&rp, &kh).await;
+                });
+                (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "activation_ts": now,
+                        "expires_at": expires_at,
+                        "message": "Activated."
+                    })),
                 )
-                    .into_response();
+                    .into_response()
             }
+            Ok(false) => {
+                // BUG-NEW-2 FIX: 并发竞争——另一请求已抢先激活
+                // 查询 DB 中真实记录，返回实际值（保证客户端缓存与 DB 一致）
+                match db::find_license(&pool, &req.key_hash).await {
+                    Ok(Some(r)) if r.activation_ts != 0 => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "activation_ts": r.activation_ts,
+                            "expires_at": r.expires_at,
+                            "message": "Already activated (concurrent race, returning DB values)"
+                        })),
+                    )
+                        .into_response(),
+                    _ => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": "concurrent activation conflict"})),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
         }
-
-        // 激活后主动失效 Redis 缓存
-        let rp = Arc::clone(&redis_pool);
-        let kh = req.key_hash.clone();
-        tokio::spawn(async move {
-            cache::invalidate_verify_cache(&rp, &kh).await;
-        });
-
-        (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "activation_ts": now,
-                "expires_at": expires_at,
-                "message": "Activated."
-            })),
-        )
-            .into_response()
     } else {
-        // 已激活：幂等返回原始时间戳
+        // 已激活：幂等返回 DB 中真实时间戳（不是本次 now）
         (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -260,7 +286,7 @@ pub async fn activate(
     }
 }
 
-// ── POST /verify ──────────────────────────────────────────────────────────────
+// ── POST /verify ───────────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct VerifyReq {
     key_hash: String,
@@ -291,7 +317,7 @@ pub async fn verify(
             .into_response();
     }
 
-    // [2] BUG-01 FIX + BUG-B FIX: verify 也做 nonce 去重
+    // [2] BUG-01 + BUG-NEW-3 FIX: nonce 去重（TTL 与时间窗口对齐）
     if !check_and_store_nonce(&redis_pool, &req.signature).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -300,20 +326,41 @@ pub async fn verify(
             .into_response();
     }
 
-    // [3] 查 Cache 或 DB，BUG-B FIX: cache-hit 时也验签
+    // [3] 查 Cache 或 DB
+    // BUG-NEW-4 FIX: cache 不再存 key，cache-hit 时仍需从 DB 取 key 做验签
+    // BUG-B FIX: 无论 cache-hit 还是 DB-hit，都必须验签
     let entry = match cache::get_verify_cache(&redis_pool, &req.key_hash).await {
-        Some(e) => {
-            // BUG-B FIX: cache-hit 时用缓存的 key 验签
-            if !verify_hmac_signature(&e.key, &req.key_hash, req.timestamp, &req.signature) {
+        Some(cached_entry) => {
+            // Cache 命中：仍需从 DB 取 key 验签（cache 不存原始凭证）
+            let record = match db::find_license(&pool, &req.key_hash).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({"error": "invalid key"})),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response();
+                }
+            };
+            // BUG-B FIX: cache-hit 时也验签
+            if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({"error": "invalid signature"})),
                 )
                     .into_response();
             }
-            e
+            cached_entry
         }
         None => {
+            // Cache 未命中：从 DB 读取
             match db::find_license(&pool, &req.key_hash).await {
                 Ok(Some(record)) => {
                     if !verify_hmac_signature(
@@ -328,8 +375,8 @@ pub async fn verify(
                         )
                             .into_response();
                     }
+                    // BUG-NEW-4 FIX: 缓存条目不含 key 字段
                     let e = VerifyCacheEntry {
-                        key: record.key.clone(), // BUG-B FIX: 存入 key
                         activation_ts: record.activation_ts,
                         expires_at: record.expires_at,
                         revoked: record.revoked,
@@ -368,14 +415,14 @@ pub async fn verify(
     }
 
     // [5] 已撤销
+    // BUG-NEW-5 FIX: 不返回 activation_ts/expires_at，防止信息泄露
     if entry.revoked {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
-                "activation_ts": entry.activation_ts,
-                "expires_at": entry.expires_at,
                 "revoked": true,
                 "error": "key revoked"
+                // 不返回时间戳，防止信息泄露（BUG-NEW-5 FIX）
             })),
         )
             .into_response();
@@ -415,20 +462,23 @@ pub async fn verify(
         .into_response()
 }
 
-// ── GET /health ───────────────────────────────────────────────────────────────
+// ── GET /health ────────────────────────────────────────────────────────────
 pub async fn health(
     Extension(pool): Extension<Arc<DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
 ) -> impl IntoResponse {
     let pg_ok = sqlx::query("SELECT 1").execute(pool.as_ref()).await.is_ok();
     let redis_ok = redis_pool.get().await.is_ok();
+
     if pg_ok && redis_ok {
         (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "status": "degraded", "pg": pg_ok, "redis": redis_ok
+                "status": "degraded",
+                "pg": pg_ok,
+                "redis": redis_ok
             })),
         )
     }
@@ -438,7 +488,7 @@ fn check_admin(provided: &str, expected: &Arc<String>) -> bool {
     auth::verify_admin_token(provided, expected)
 }
 
-// ── GET /admin/licenses ───────────────────────────────────────────────────────
+// ── GET /admin/licenses ────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct AdminQuery {
     token: String,
@@ -466,7 +516,7 @@ pub async fn list_licenses(
     }
 }
 
-// ── POST /admin/revoke（BUG-H FIX: 由 DELETE 改 POST）────────────────────────
+// ── POST /admin/revoke（BUG-H FIX: 由 DELETE 改 POST）─────────────────────
 #[derive(Deserialize)]
 pub struct RevokeReq {
     token: String,
@@ -505,7 +555,7 @@ pub async fn revoke_license(
     }
 }
 
-// ── POST /admin/extend ────────────────────────────────────────────────────────
+// ── POST /admin/extend ─────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct ExtendReq {
     token: String,
@@ -528,7 +578,6 @@ pub async fn extend_license(
     }
     let extra_secs = req.extra_days * 86_400;
     match db::extend_license(&pool, &req.key_hash, extra_secs).await {
-        // BUG-09 FIX: 区分"成功"和"未找到/已撤销"
         Ok(true) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             (
@@ -550,7 +599,7 @@ pub async fn extend_license(
     }
 }
 
-// ── POST /admin/add-key ───────────────────────────────────────────────────────
+// ── POST /admin/add-key ────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct AddKeyReq {
     token: String,
@@ -570,10 +619,12 @@ pub async fn add_key(
         )
             .into_response();
     }
+
     let now = now_secs();
     let days = req.valid_days.unwrap_or(365);
 
-    // BUG-E FIX: valid_days 范围校验 [1, 36500]（1天 ~ 100年）
+    // BUG-E FIX + BUG-NEW-1 FIX: valid_days 范围校验 [1, 36500]
+    // 原代码在 GitHub raw 中被截断，导致校验逻辑无法执行
     if days < 1 {
         return (
             StatusCode::BAD_REQUEST,
@@ -590,15 +641,15 @@ pub async fn add_key(
     }
 
     let expires_at = now + days * 86_400;
-    let note = req.note.as_deref().unwrap_or("admin");
     let key = generate_hkey();
     let key_hash = hash_key(&key);
+    let note = req.note.as_deref().unwrap_or("manual");
 
     match db::add_key(&pool, &key, &key_hash, expires_at, note).await {
         Ok(true) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
-                "key":      key,
+                "key": key,
                 "key_hash": key_hash,
             })),
         )
@@ -616,7 +667,7 @@ pub async fn add_key(
     }
 }
 
-// ── POST /admin/batch-init ────────────────────────────────────────────────────
+// ── POST /admin/batch-init ─────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct BatchInitReq {
     token: String,
@@ -645,7 +696,6 @@ pub async fn batch_init(
     }
     let note = req.note.as_deref().unwrap_or("batch");
     match db::batch_init_keys(&pool, req.count, note).await {
-        // BUG-I FIX: batch_init_keys 内部已改为 UNNEST 单次往返
         Ok(inserted) => (
             StatusCode::CREATED,
             Json(serde_json::json!({"inserted": inserted})),

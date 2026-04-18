@@ -1,14 +1,16 @@
-// client/src/license_guard.rs — 优化版
+// client/src/license_guard.rs — 最终优化版
 // BUG-04 FIX: 启动多副本校验（副本数 >= 2），三者不一致时直接退出
 // BUG-05 FIX: 时间戳统一使用 i64，避免 u64→i64 转换溢出导致永不过期
 // BUG-06 FIX: 声明为 async fn，调用 verify_online 时正确 .await
-// BUG-F  FIX: 先检查 replica_count（B），再 unwrap local_record（A），顺序不能颠倒
-
+// BUG-F  FIX: 先检查 replica_count（B），再 unwrap local_record（A）
+// BUG-NEW-6 FIX: verify_online 不再需要 NET_TIMEOUT_SECS 参数（接口已更新）
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const NET_TIMEOUT_SECS: u64 = 10;
+// BUG-NEW-6 FIX: NET_TIMEOUT_SECS 常量仅保留作文档说明，不再传入 verify_online
+// 实际超时由 network.rs 中的 NET_DEFAULT_TIMEOUT_SECS 常量控制
+// const NET_TIMEOUT_SECS: u64 = 10;
 
 // BUG-06 FIX: 声明为 async fn（原来是同步 fn，导致 verify_online 的 Future 被丢弃）
 pub async fn check_and_enforce() {
@@ -32,7 +34,8 @@ pub async fn check_and_enforce() {
         .as_secs() as i64;
 
     // ── Step 4: 在线校验（BUG-06 FIX: async .await）──────────────────────
-    match network::verify_online(&hkey, &server_url, NET_TIMEOUT_SECS).await {
+    // BUG-NEW-6 FIX: verify_online 无需再传入 NET_TIMEOUT_SECS
+    match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
             // 4a: 服务端已撤销
             if resp.revoked {
