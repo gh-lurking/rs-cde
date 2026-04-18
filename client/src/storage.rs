@@ -42,8 +42,8 @@ fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
     PathBuf::from(&bases[slot as usize % 3]).join(files[slot as usize % 3])
 }
 
-// ─── BUG-07 FIX: 写入时生成随机 nonce ───────────────────────────────────────
-// 文件格式：[random_nonce(12B)] + [ciphertext(16B plaintext + 16B GCM tag = 32B)] = 44B
+// ─── BUG-07 FIX: 写入时生成随机 nonce ────────────────────────────────────────
+// 文件格式：[random_nonce(12B)] + [ciphertext(32B)] = 44B
 fn write_slot(
     path: &PathBuf,
     key_bytes: &[u8; 16],
@@ -61,7 +61,6 @@ fn write_slot(
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&activation.to_le_bytes());
     plain[8..].copy_from_slice(&expires.to_le_bytes());
-
     let ct = cipher
         .encrypt(nonce, plain.as_ref())
         .map_err(|e| format!("encrypt: {e}"))?;
@@ -70,25 +69,24 @@ fn write_slot(
         let _ = fs::create_dir_all(p);
     }
 
-    // ✅ nonce 前置写入文件（读取时从文件头恢复，而不是重新派生）
+    // ✅ nonce 前置写入文件（读取时从文件头恢复）
     let mut out = nonce_bytes.to_vec(); // 12 字节随机 nonce
-    out.extend_from_slice(&ct); // 32 字节密文
+    out.extend_from_slice(&ct); // 32 字节密文（16B 明文 + 16B GCM tag）
     fs::write(path, &out).map_err(|e| format!("write: {e}"))
 }
 
-// ─── BUG-07 FIX: 读取时从文件头读 nonce ─────────────────────────────────────
+// ─── BUG-07 FIX: 读取时从文件头读 nonce ──────────────────────────────────────
 fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     let data = fs::read(path).ok()?;
     if data.len() != 44 {
         return None;
-    }
+    } // 12 nonce + 32 ciphertext
 
-    // BUG-07 FIX: nonce 从文件头读取（不再用固定派生 nonce）
+    // BUG-07 FIX: nonce 从文件头读取（不再重新派生固定 nonce）
     let stored_nonce = &data[..12];
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
     let nonce = Nonce::from_slice(stored_nonce);
-
     let plain = cipher.decrypt(nonce, &data[12..]).ok()?;
     if plain.len() != 16 {
         return None;
@@ -99,21 +97,19 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     Some((act, exp))
 }
 
-// ─── 公开 API ─────────────────────────────────────────────────────────────────
+// ─── 公开 API ────────────────────────────────────────────────────────────────
 
 /// BUG-04 FIX: 读取三个副本，严格多数投票（best_count * 2 > replica_count）才信任
-/// 返回 (Option<(activation, expires)>, 成功读取的副本数)
+/// 返回 (Option<(activation_ts, expires_at)>, 成功读取的副本数)
 pub fn read_local_record_with_count(hkey: &str, salt: &str) -> (Option<(u64, u64)>, usize) {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::new();
-
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
         if let Some(pair) = read_slot(&path, &key) {
             values.push(pair);
         }
     }
-
     let replica_count = values.len();
     if values.is_empty() {
         return (None, 0);
@@ -128,7 +124,6 @@ pub fn read_local_record_with_count(hkey: &str, salt: &str) -> (Option<(u64, u64
             counts.push((v, 1));
         }
     }
-
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
     // 严格多数（> N/2）才信任

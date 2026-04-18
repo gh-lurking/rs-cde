@@ -25,7 +25,7 @@ fn verify_cache_ttl() -> u64 {
         .unwrap_or(30)
 }
 
-pub fn init_redis_pool(redis_url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolError> {
+pub fn init_redis_pool(redis_url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
     let max_size: usize = std::env::var("REDIS_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -80,7 +80,7 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let _: Result<(), _> = conn.del(cache_key(key_hash)).await;
+    let _: Result<i64, _> = conn.del(cache_key(key_hash)).await;
     tracing::debug!(
         "Invalidated Redis Cache: verify:{}",
         &key_hash[..8.min(key_hash.len())]

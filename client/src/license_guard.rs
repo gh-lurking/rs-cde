@@ -25,7 +25,7 @@ pub async fn check_and_enforce() {
     // ── Step 3: 读取三份本地副本（BUG-04 FIX: 多副本投票校验）──────────
     let (local_record, replica_count) = storage::read_local_record_with_count(&hkey, &salt);
 
-    // BUG-05 FIX: 统一使用 i64（i64 最大覆盖 2038+ 年，绝不截断）
+    // BUG-05 FIX: 统一使用 i64
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -69,9 +69,7 @@ pub async fn check_and_enforce() {
             eprintln!("[License] 在线校验失败（{}），使用本地缓存校验", e);
 
             // BUG-F FIX: ⚠️ 顺序关键！必须先检查副本数（B），再 unwrap（A）
-            // 原始代码顺序颠倒（先 unwrap 再检查），导致：
-            //   - local_record=None 时直接 panic，而不是打印"副本不足"并退出
-            //   - "副本不足"的防护形同虚设
+            // 原始代码顺序颠倒，local_record=None 时 unwrap 直接 panic
 
             // STEP B（先执行）: 副本数不足时直接退出
             if replica_count < 2 {
@@ -86,13 +84,12 @@ pub async fn check_and_enforce() {
             let (local_ts, local_expires) = match local_record {
                 Some(v) => v,
                 None => {
-                    // 防御性保留：replica_count>=2 但 storage 返回 None 属于内部错误
                     eprintln!("[License] 内部错误：副本数足够但记录为空，退出");
                     std::process::exit(1);
                 }
             };
 
-            // BUG-05 FIX: 转换为 i64 后比较（local_ts/local_expires 存储为 u64）
+            // BUG-05 FIX: 转换为 i64 后比较
             let local_ts_i64 = local_ts as i64;
             let local_expires_i64 = local_expires as i64;
 

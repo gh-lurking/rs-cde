@@ -1,7 +1,6 @@
 // client/src/network.rs — 优化版
 // BUG-G FIX: 收到 ERR-TIME-RECORD 时，提取服务端时间自动重试一次
 // BUG-J FIX: 全局单例 Client，连接池跨调用复用（OnceLock 线程安全）
-
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -78,7 +77,7 @@ async fn do_verify(
     };
     let url = format!("{}/verify", server_url);
 
-    // BUG-J FIX: 复用全局 Client（避免每次重建 TCP/TLS 连接）
+    // BUG-J FIX: 复用全局 Client
     let client = get_http_client(timeout_secs);
     let resp = client
         .post(&url)
@@ -118,10 +117,8 @@ pub async fn verify_online(
     timeout_secs: u64,
 ) -> Result<VerifyResponse, String> {
     let result = do_verify(hkey, server_url, timeout_secs, 0).await;
-
     match &result {
         Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
-            // 提取服务端时间，计算偏移后重试一次
             let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
             if let Ok(server_ts) = server_time_str.parse::<i64>() {
                 let offset = server_ts - now_secs();

@@ -2,7 +2,6 @@
 // BUG-08 FIX: last_check 用 Option<i64>（schema 中该列允许 NULL）
 // BUG-09 FIX: extend_license 返回 bool，区分"未找到"和"成功"
 // BUG-I  FIX: batch_init_keys 用 UNNEST 批量 INSERT，单次往返，原子事务
-
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,7 +36,7 @@ fn hash_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
-// BUG-08 FIX: last_check 声明为 Option<i64>，正确处理 NULL
+/// BUG-08 FIX: last_check 声明为 Option<i64>，正确处理 SQL NULL
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct LicenseRecord {
     pub key: String,
@@ -46,11 +45,11 @@ pub struct LicenseRecord {
     pub expires_at: i64,
     pub revoked: bool,
     pub created_at: i64,
-    pub last_check: Option<i64>, // BUG-08 FIX: NULL 安全
+    pub last_check: Option<i64>, // BUG-08 FIX: NULL 安全（从未校验时为 NULL）
     pub note: String,
 }
 
-pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
+pub async fn init_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let max_conn: u32 = std::env::var("PG_POOL_MAX_CONN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -69,17 +68,17 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .connect(database_url)
         .await?;
 
-    // 建表（idempotent）
+    // 建表（幂等，BUG-08 FIX: last_check 无 NOT NULL 约束）
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key           TEXT    NOT NULL,
-            key_hash      TEXT    PRIMARY KEY,
-            activation_ts BIGINT  NOT NULL DEFAULT 0,
-            expires_at    BIGINT  NOT NULL DEFAULT 0,
-            revoked       BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at    BIGINT  NOT NULL,
-            last_check    BIGINT,          -- nullable，BUG-08 FIX
-            note          TEXT    NOT NULL DEFAULT ''
+            key          TEXT    NOT NULL,
+            key_hash     TEXT    PRIMARY KEY,
+            activation_ts BIGINT NOT NULL DEFAULT 0,
+            expires_at   BIGINT  NOT NULL DEFAULT 0,
+            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   BIGINT  NOT NULL,
+            last_check   BIGINT,          -- nullable，BUG-08 FIX
+            note         TEXT    NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
@@ -98,8 +97,7 @@ pub async fn find_license(
     key_hash: &str,
 ) -> Result<Option<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses WHERE key_hash = $1",
     )
     .bind(key_hash)
@@ -107,8 +105,7 @@ pub async fn find_license(
     .await
 }
 
-/// BUG-A FIX 配套：activate_license() 写入 activation_ts 和 expires_at
-/// 使用 activation_ts = 0 AND revoked = FALSE 保证原子性（防并发双重激活）
+/// BUG-A 配套：activate_license() 使用 activation_ts = 0 AND revoked = FALSE 保证原子性
 pub async fn activate_license(
     pool: &DbPool,
     key_hash: &str,
@@ -119,7 +116,7 @@ pub async fn activate_license(
         "UPDATE licenses
          SET activation_ts = $1, expires_at = $2
          WHERE key_hash = $3
-           AND activation_ts = 0    -- 只允许激活一次
+           AND activation_ts = 0  -- 只允许激活一次（防并发双重激活）
            AND revoked = FALSE",
     )
     .bind(activation_ts)
@@ -152,8 +149,8 @@ pub async fn revoke_license(
     Ok(())
 }
 
-// BUG-09 FIX: 返回 bool 表示是否真的更新了（revoked/不存在 → rows_affected=0 → false）
-// GREATEST(expires_at, now) 防止对已过期密钥产生错误基准
+/// BUG-09 FIX: 返回 bool，true=成功，false=未找到/已撤销
+/// GREATEST(expires_at, now) 防止对已过期密钥产生错误基准
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
@@ -175,8 +172,7 @@ pub async fn extend_license(
 
 pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -192,22 +188,17 @@ pub async fn add_key(
 ) -> Result<bool, sqlx::Error> {
     let now = now_db();
     let result = sqlx::query(
-        "INSERT INTO licenses
-             (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
+        "INSERT INTO licenses (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
          VALUES ($1, $2, 0, $3, FALSE, $4, NULL, $5)
          ON CONFLICT (key_hash) DO NOTHING",
     )
-    .bind(key)
-    .bind(key_hash)
-    .bind(expires_at)
-    .bind(now)
-    .bind(note)
+    .bind(key).bind(key_hash).bind(expires_at).bind(now).bind(note)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
 }
 
-/// BUG-I FIX: 批量 UNNEST INSERT，单条 SQL + 原子事务，替代串行 for 循环
+/// BUG-I FIX: UNNEST 批量 INSERT，单条 SQL + 原子事务
 /// 性能：1000 条 → 1 次 DB 往返（原来需要 1000 次）
 pub async fn batch_init_keys(pool: &DbPool, count: u32, note: &str) -> Result<u64, sqlx::Error> {
     let now = now_db();
@@ -223,8 +214,7 @@ pub async fn batch_init_keys(pool: &DbPool, count: u32, note: &str) -> Result<u6
 
     // 单条批量 INSERT via UNNEST（原子事务，性能远优于串行 INSERT）
     let result = sqlx::query(
-        "INSERT INTO licenses
-             (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
+        "INSERT INTO licenses (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
          SELECT k, kh, 0::bigint, 0::bigint, false, $3::bigint, NULL::bigint, $4::text
          FROM UNNEST($1::text[], $2::text[]) AS t(k, kh)
          ON CONFLICT (key_hash) DO NOTHING",
