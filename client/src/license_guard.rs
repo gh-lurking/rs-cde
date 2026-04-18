@@ -1,50 +1,45 @@
-// client/src/license_guard.rs — 完整优化版
-// 原有修复: BUG-04/05/06/F/NEW-6
-// 新增修复: BUG-NEW-C(用枚举精确区分副本状态)
-//           BUG-NEW-E(写缓存前校验 i64 正值，防 as u64 负值转超大数)
+// client/src/license_guard.rs — 优化版 v2
+// CRIT-3 FIX: 业务拒绝错误码（ERR-REVOKED/ERR-INVALID-KEY/ERR-NOT-ACTIVATED）
+//   触发立即退出，不进入离线缓存流程
+// MINOR-1 FIX: 本地副本读取延迟到在线校验失败后（lazy evaluation）
 
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// BUG-06 FIX: 声明为 async fn
 pub async fn check_and_enforce() {
-    // Step 1: 读取 HKEY
     let hkey = std::env::var("HKEY").unwrap_or_else(|_| {
         eprintln!("[License] 未找到 HKEY 环境变量，请激活");
         std::process::exit(1);
     });
 
-    // Step 2: 派生混淆盐 + 服务器 URL
     let salt = obfstr!("PROG_ACTIVATION_SALT_V1_SECRET").to_owned();
     let server_url = obfstr!("http://localhost:1000").to_owned();
 
-    // Step 3: 读取三份本地副本
-    // BUG-NEW-C FIX: 使用枚举返回值，精确区分「副本不足」「投票失败」「成功」
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64; // BUG-05 FIX: 统一 i64
+        .as_secs() as i64;
 
-    let local_result = storage::read_local_record(&hkey, &salt);
+    // MINOR-1 FIX: 不在此处预读本地副本（在线成功时纯属浪费）
+    // local_result 移入 Err 分支（lazy evaluation）
 
-    // Step 4: 在线校验（BUG-06 FIX: async .await）
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
-            // 4a: 服务端已撤销
+            // 服务端已撤销
             if resp.revoked {
                 eprintln!("[License] 许可证已被吊销，请联系支持");
                 std::process::exit(1);
             }
 
-            // 4b: 服务端已过期（BUG-05 FIX: 统一 i64）
+            // 服务端已过期
             if now >= resp.expires_at {
                 let days = (now - resp.expires_at) / 86400;
                 eprintln!("[License] 许可证已过期 {} 天，请联系支持", days);
                 std::process::exit(1);
             }
 
-            // 4c: 未激活
+            // 未激活
             if resp.activation_ts == 0 {
                 eprintln!("[License] Key 尚未激活，请先完成激活");
                 std::process::exit(1);
@@ -53,8 +48,7 @@ pub async fn check_and_enforce() {
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] ✅ 在线校验通过，剩余 {} 天", remaining);
 
-            // 4d: 同步最新数据到本地三份副本
-            // BUG-NEW-E FIX: 写缓存前校验时间戳合法性，防止负值 as u64 = 超大数
+            // 同步最新数据到本地三份副本
             if resp.activation_ts > 0 && resp.expires_at > now {
                 storage::write_all_replicas(
                     &hkey,
@@ -64,26 +58,43 @@ pub async fn check_and_enforce() {
                 );
             } else {
                 tracing::warn!(
-                    "[License] 服务端返回异常时间戳，跳过本地缓存写入                      activation_ts={} expires_at={}",
+                    "[License] 服务端返回异常时间戳，跳过本地缓存写入 activation_ts={} expires_at={}",
                     resp.activation_ts,
                     resp.expires_at
                 );
             }
         }
 
-        Err(e) => {
+        Err(ref e) => {
+            // CRIT-3 FIX: 业务明确拒绝 → 立即退出，不走离线缓存
+            if e == network::ERR_REVOKED {
+                eprintln!("[License] 许可证已被吊销（服务端确认），立即退出");
+                std::process::exit(1);
+            }
+            if e == network::ERR_INVALID_KEY {
+                eprintln!("[License] 无效的 License Key（服务端确认），立即退出");
+                std::process::exit(1);
+            }
+            if e == network::ERR_NOT_ACTIVATED {
+                eprintln!("[License] License Key 尚未激活（服务端确认），立即退出");
+                std::process::exit(1);
+            }
+
+            // 真正的网络错误 → 降级到本地缓存
             eprintln!("[License] 在线校验失败（{}），使用本地缓存校验", e);
 
-            // BUG-NEW-C FIX: 枚举精确处理各种失败场景
+            // MINOR-1 FIX: 仅在此处（在线失败时）才读取本地副本
+            let local_result = storage::read_local_record(&hkey, &salt);
+
             match local_result {
-                storage::LocalReadResult::Insufficient{read_count: count} => {
+                storage::LocalReadResult::Insufficient { read_count: count } => {
                     eprintln!(
                         "[License] 本地副本不足（{}/3），可能首次运行未缓存或文件丢失，退出",
                         count
                     );
                     std::process::exit(1);
                 }
-                storage::LocalReadResult::Tampered{read_count: count} => {
+                storage::LocalReadResult::Tampered { read_count: count } => {
                     eprintln!(
                         "[License] 检测到本地副本篡改（{}/3副本不一致），退出",
                         count
