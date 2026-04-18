@@ -1,12 +1,6 @@
-// server/src/handlers.rs — 完整优化版 v2
-// 修复清单：
-//   CRIT-1: cache-hit 时在 VerifyCacheEntry 中保留 key，消除多余 DB 查询
-//   CRIT-2: valid_days 下界校验完整（>= 1）
-//   CRIT-3: revoked/invalid-key 等业务错误码明确，client 不误入离线缓存
-//   CRIT-4: extra_days 下界校验
-//   MAJOR-1: nonce key 含 key_hash 防跨用户碰撞
-//   MAJOR-2: nonce 去重移至签名验证之后
-//   MAJOR-6: activate 成功后同步失效缓存
+// server/src/handlers.rs — 完整优化版 v3
+// M-02 FIX: activate 竞争条件时也失效缓存
+// M-03 FIX: 已激活 key 附加 expired 状态字段
 
 use crate::{auth, cache, db};
 use axum::{
@@ -40,6 +34,7 @@ fn hash_key(key: &str) -> String {
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
+
     let mut mac = match HmacSha256::new_from_slice(key.as_bytes()) {
         Ok(m) => m,
         Err(_) => return false,
@@ -47,7 +42,9 @@ fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -
     mac.update(key_hash.as_bytes());
     mac.update(b"|");
     mac.update(timestamp.to_string().as_bytes());
+
     let expected = hex::encode(mac.finalize().into_bytes());
+
     if expected.len() != sig.len() {
         return false;
     }
@@ -82,8 +79,6 @@ fn nonce_ttl() -> i64 {
     timestamp_window() + 30
 }
 
-// MAJOR-1 FIX: nonce key 包含 key_hash 前缀，防跨用户签名碰撞
-// MAJOR-2 FIX: 此函数只在签名验证通过后调用
 async fn check_and_store_nonce(redis_pool: &RedisPool, key_hash: &str, sig: &str) -> bool {
     let key = format!("nonce:{}:{}", &key_hash[..16.min(key_hash.len())], sig);
     match redis_pool.get().await {
@@ -121,7 +116,7 @@ async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> boo
     matches!(result, Ok(Some(_)))
 }
 
-// ── POST /activate ───────────────────────────────────────────────────────────
+// ── POST /activate ───────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct ActivateReq {
     key_hash: String,
@@ -145,7 +140,7 @@ pub async fn activate(
             .into_response();
     }
 
-    // [2] 查 DB（先查再验签，MAJOR-2 FIX 顺序）
+    // [2] 查 DB
     let record = match db::find_license(&pool, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -164,7 +159,7 @@ pub async fn activate(
         }
     };
 
-    // [3] 签名验证（在 nonce 消耗之前，MAJOR-2 FIX）
+    // [3] 签名验证
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -173,7 +168,7 @@ pub async fn activate(
             .into_response();
     }
 
-    // [4] nonce 去重（签名验证通过后，MAJOR-1 + MAJOR-2 FIX）
+    // [4] nonce 去重
     if !check_and_store_nonce(&redis_pool, &req.key_hash, &req.signature).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -182,7 +177,7 @@ pub async fn activate(
             .into_response();
     }
 
-    // [5] 已撤销 — 明确错误码（CRIT-3 FIX）
+    // [5] 已撤销
     if record.revoked {
         return (
             StatusCode::FORBIDDEN,
@@ -206,7 +201,6 @@ pub async fn activate(
 
         match db::activate_license(&pool, &req.key_hash, now, expires_at).await {
             Ok(true) => {
-                // MAJOR-6 FIX: 同步失效缓存（代价极小，避免激活后5s内verify返回旧缓存）
                 cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
                 (
                     StatusCode::CREATED,
@@ -218,22 +212,26 @@ pub async fn activate(
                 )
                     .into_response()
             }
-            Ok(false) => match db::find_license(&pool, &req.key_hash).await {
-                Ok(Some(r)) if r.activation_ts != 0 => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "activation_ts": r.activation_ts,
-                        "expires_at": r.expires_at,
-                        "message": "Already activated (concurrent race, returning DB values)"
-                    })),
-                )
-                    .into_response(),
-                _ => (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error": "concurrent activation conflict"})),
-                )
-                    .into_response(),
-            },
+            Ok(false) => {
+                // M-02 FIX: 竞争条件时也失效缓存
+                cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
+                match db::find_license(&pool, &req.key_hash).await {
+                    Ok(Some(r)) if r.activation_ts != 0 => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "activation_ts": r.activation_ts,
+                            "expires_at": r.expires_at,
+                            "message": "Already activated (concurrent race, returning DB values)"
+                        })),
+                    )
+                        .into_response(),
+                    _ => (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": "concurrent activation conflict"})),
+                    )
+                        .into_response(),
+                }
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
@@ -241,19 +239,26 @@ pub async fn activate(
                 .into_response(),
         }
     } else {
+        // M-03 FIX: 附加过期状态字段，让调用方知晓 key 是否已过期
+        let expired = now >= record.expires_at;
         (
             StatusCode::OK,
             Json(serde_json::json!({
                 "activation_ts": record.activation_ts,
                 "expires_at": record.expires_at,
-                "message": "Already activated (returning original timestamps)"
+                "expired": expired,
+                "message": if expired {
+                    "Already activated (expired)"
+                } else {
+                    "Already activated (returning original timestamps)"
+                }
             })),
         )
             .into_response()
     }
 }
 
-// ── POST /verify ─────────────────────────────────────────────────────────────
+// ── POST /verify ─────────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct VerifyReq {
     key_hash: String,
@@ -284,11 +289,9 @@ pub async fn verify(
             .into_response();
     }
 
-    // [2] Cache + 验签（CRIT-1 FIX: cache-hit 直接用缓存中的 key，零额外 DB 查询）
-    // [3] nonce 去重在验签之后（MAJOR-2 FIX）
+    // [2] Cache + 验签
     let entry = match cache::get_verify_cache(&redis_pool, &req.key_hash).await {
         Some(cached_entry) => {
-            // CRIT-1 FIX: VerifyCacheEntry 包含 key，直接验签，无需 DB 查询
             if !verify_hmac_signature(
                 &cached_entry.key,
                 &req.key_hash,
@@ -301,7 +304,6 @@ pub async fn verify(
                 )
                     .into_response();
             }
-            // MAJOR-2 FIX: 验签通过后才消耗 nonce
             if !check_and_store_nonce(&redis_pool, &req.key_hash, &req.signature).await {
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -321,7 +323,6 @@ pub async fn verify(
                     )
                         .into_response();
                 }
-                // MAJOR-2 FIX: 验签通过后才消耗 nonce
                 if !check_and_store_nonce(&redis_pool, &req.key_hash, &req.signature).await {
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
@@ -329,7 +330,6 @@ pub async fn verify(
                     )
                         .into_response();
                 }
-                // CRIT-1 FIX: 缓存中包含 key（TTL=30s，IP 白名单保护，可接受）
                 let e = VerifyCacheEntry {
                     key: record.key.clone(),
                     activation_ts: record.activation_ts,
@@ -356,7 +356,7 @@ pub async fn verify(
         },
     };
 
-    // [4] 异步限流更新 last_check（不阻塞响应）
+    // [4] 异步限流更新 last_check
     {
         let pool2 = Arc::clone(&pool);
         let rp2 = Arc::clone(&redis_pool);
@@ -374,7 +374,7 @@ pub async fn verify(
         });
     }
 
-    // [5] 已撤销 — 明确错误码（CRIT-3 FIX）
+    // [5] 已撤销
     if entry.revoked {
         return (
             StatusCode::FORBIDDEN,
@@ -402,7 +402,6 @@ pub async fn verify(
             Json(serde_json::json!({
                 "revoked": false,
                 "error": "ERR-EXPIRED"
-                // INFO-2 FIX: 不返回 activation_ts/expires_at，防信息泄露
             })),
         )
             .into_response();
@@ -419,7 +418,7 @@ pub async fn verify(
         .into_response()
 }
 
-// ── GET /health ───────────────────────────────────────────────────────────────
+// ── GET /health ───────────────────────────────────────────────────────────
 pub async fn health(
     Extension(pool): Extension<Arc<DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
@@ -444,7 +443,7 @@ fn check_admin(provided: &str, expected: &Arc<String>) -> bool {
     auth::verify_admin_token(provided, expected)
 }
 
-// ── GET /admin/licenses ───────────────────────────────────────────────────────
+// ── GET /admin/licenses ──────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct AdminQuery {
     token: String,
@@ -472,7 +471,7 @@ pub async fn list_licenses(
     }
 }
 
-// ── POST /admin/revoke ────────────────────────────────────────────────────────
+// ── POST /admin/revoke ───────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct RevokeReq {
     token: String,
@@ -511,7 +510,7 @@ pub async fn revoke_license(
     }
 }
 
-// ── POST /admin/extend ────────────────────────────────────────────────────────
+// ── POST /admin/extend ───────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct ExtendReq {
     token: String,
@@ -532,8 +531,6 @@ pub async fn extend_license(
         )
             .into_response();
     }
-
-    // CRIT-4 FIX: extra_days 完整校验（原代码无下界校验）
     if req.extra_days < 1 {
         return (
             StatusCode::BAD_REQUEST,
@@ -548,8 +545,7 @@ pub async fn extend_license(
         )
             .into_response();
     }
-
-    let extra_secs = req.extra_days * 86_400;
+    let extra_secs = req.extra_days * 86400;
     match db::extend_license(&pool, &req.key_hash, extra_secs).await {
         Ok(true) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
@@ -572,7 +568,7 @@ pub async fn extend_license(
     }
 }
 
-// ── POST /admin/add-key ───────────────────────────────────────────────────────
+// ── POST /admin/add-key ──────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct AddKeyReq {
     token: String,
@@ -592,11 +588,8 @@ pub async fn add_key(
         )
             .into_response();
     }
-
     let now = now_secs();
     let days = req.valid_days.unwrap_or(365);
-
-    // CRIT-2 FIX: 完整双边校验（原代码下界校验被截断/缺失）
     if days < 1 {
         return (
             StatusCode::BAD_REQUEST,
@@ -607,16 +600,14 @@ pub async fn add_key(
     if days > 36500 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "valid_days must be <= 36500 (100 years)"})),
+            Json(serde_json::json!({"error": "valid_days must be <= 36500"})),
         )
             .into_response();
     }
-
-    let expires_at = now + days * 86_400;
+    let expires_at = now + days * 86400;
     let key = generate_hkey();
     let key_hash = hash_key(&key);
-    let note = req.note.as_deref().unwrap_or("manual");
-
+    let note = req.note.as_deref().unwrap_or("");
     match db::add_key(&pool, &key, &key_hash, expires_at, note).await {
         Ok(true) => (
             StatusCode::CREATED,
@@ -639,7 +630,7 @@ pub async fn add_key(
     }
 }
 
-// ── POST /admin/batch-init ────────────────────────────────────────────────────
+// ── POST /admin/batch-init ───────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct BatchInitReq {
     token: String,

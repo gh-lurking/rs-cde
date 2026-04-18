@@ -1,8 +1,8 @@
-// client/src/network.rs — 优化版 v2
-// CRIT-3 FIX: 明确区分业务拒绝错误码（ERR-REVOKED 等）与网络错误
-// MAJOR-3 FIX: 时钟重试严格限制为一次（通过 is_retry 参数保护）
+// client/src/network.rs — 优化版 v3
+// M-04 FIX: 用 loop + retried flag 替代 async_recursion
+// CRIT-3 FIX: 明确区分业务拒绝错误码与网络错误
+// MAJOR-3 FIX: 时钟重试严格限制为一次
 
-use async_recursion::async_recursion;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,8 +15,7 @@ type HmacSha256 = Hmac<sha2::Sha256>;
 const MAX_CLOCK_OFFSET_SECS: i64 = 600;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-/// 业务拒绝错误前缀 — license_guard 看到这些时立即退出，不走离线缓存
-/// CRIT-3 FIX
+/// 业务拒绝错误前缀
 pub const ERR_REVOKED: &str = "ERR-REVOKED";
 pub const ERR_INVALID_KEY: &str = "ERR-INVALID-KEY";
 pub const ERR_NOT_ACTIVATED: &str = "ERR-NOT-ACTIVATED";
@@ -73,7 +72,6 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
 
-    // 业务明确拒绝 — 用特殊前缀让调用方立即退出
     match err_code {
         "ERR-REVOKED" | "key revoked" => return ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" | "invalid key" => return ERR_INVALID_KEY.to_string(),
@@ -81,7 +79,6 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         _ => {}
     }
 
-    // 时钟偏差 — 需要重试
     if err_code == "ERR-TIME-RECORD" {
         if let Some(st) = body["server_time"].as_i64() {
             return format!("ERR-TIME-RECORD:server_time={}", st);
@@ -95,14 +92,16 @@ async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<Verif
     let ts = now_secs() + ts_offset;
     let key_hash = hash_key(hkey);
     let signature = sign_request(hkey, &key_hash, ts);
+
     let req = VerifyRequest {
         key_hash,
         timestamp: ts,
         signature,
     };
-    let url = format!("{}/verify", server_url);
 
+    let url = format!("{}/verify", server_url);
     let client = get_http_client();
+
     let resp = client
         .post(&url)
         .json(&req)
@@ -123,48 +122,44 @@ async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<Verif
     }
 }
 
-/// 主入口：在线校验
-/// MAJOR-3 FIX: 时钟重试严格限制一次（is_retry 参数保护，防无限重试）
-/// CRIT-3 FIX: 业务错误码直接透传，license_guard 层处理
+/// M-04 FIX: 用 loop + retried flag 替代 async_recursion
+/// 时钟重试严格限制一次，防无限重试
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
-    verify_online_inner(hkey, server_url, 0, false).await
-}
+    let mut ts_offset = 0i64;
+    let mut retried = false;
 
-#[async_recursion]
-async fn verify_online_inner(
-    hkey: &str,
-    server_url: &str,
-    ts_offset: i64,
-    is_retry: bool, // MAJOR-3 FIX: 明确重试标记，防无限重试
-) -> Result<VerifyResponse, String> {
-    let result = do_verify(hkey, server_url, ts_offset).await;
+    loop {
+        let result = do_verify(hkey, server_url, ts_offset).await;
 
-    if is_retry {
-        // 已经重试过一次，不再重试（无论结果如何直接返回）
-        return result;
-    }
-
-    match &result {
-        Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
-            let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
-            if let Ok(server_ts) = server_time_str.parse::<i64>() {
-                let offset = server_ts - now_secs();
-                if offset.abs() > MAX_CLOCK_OFFSET_SECS {
-                    tracing::error!(
-                        "[License] 服务端时钟偏差 {}s 超过安全阈值 {}s，拒绝修正",
-                        offset,
-                        MAX_CLOCK_OFFSET_SECS
-                    );
-                    return Err(format!(
-                        "server clock offset {}s exceeds safe threshold {}s",
-                        offset, MAX_CLOCK_OFFSET_SECS
-                    ));
-                }
-                tracing::warn!("[License] 时钟偏差 {}s，自动修正后重试（仅此一次）", offset);
-                return verify_online_inner(hkey, server_url, offset, true).await; // is_retry=true
-            }
-            result
+        if retried {
+            // 已重试过一次，直接返回
+            return result;
         }
-        _ => result,
+
+        match &result {
+            Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
+                let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
+                if let Ok(server_ts) = server_time_str.parse::<i64>() {
+                    let offset = server_ts - now_secs();
+                    if offset.abs() > MAX_CLOCK_OFFSET_SECS {
+                        tracing::error!(
+                            "[License] 服务端时钟偏差 {}s 超过安全阈值 {}s，拒绝修正",
+                            offset,
+                            MAX_CLOCK_OFFSET_SECS
+                        );
+                        return Err(format!(
+                            "server clock offset {}s exceeds safe threshold {}s",
+                            offset, MAX_CLOCK_OFFSET_SECS
+                        ));
+                    }
+                    tracing::warn!("[License] 时钟偏差 {}s，自动修正后重试（仅此一次）", offset);
+                    ts_offset = offset;
+                    retried = true;
+                    continue; // 重新循环执行重试
+                }
+                return result;
+            }
+            _ => return result,
+        }
     }
 }

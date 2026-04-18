@@ -4,11 +4,14 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-# AES-128-GCM 认证加密（BUG-07 FIX: 使用 OsRng 生成随机 nonce）
-aes-gcm = { version = "0.10", features = ["aes"] }
+# AES-128-GCM 认证加密
+# C-01 FIX: 添加 getrandom feature 使 OsRng 可用
+aes-gcm = { version = "0.10", features = ["aes", "getrandom"] }
 sha2 = "0.10"
 hmac = "0.12"
 
+# HKDF 密钥派生 (M-01 FIX)
+hkdf = "0.12"
 
 # 编译期字符串混淆（防逆向找 SALT）
 obfstr = "0.4"
@@ -17,12 +20,12 @@ obfstr = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# 异步运行时（BUG-06 FIX: verify_online 改为 async fn）
+# 异步运行时
 tokio = { version = "1", features = ["full"] }
 
-# HTTP 客户端（BUG-J FIX: 全局单例，连接池复用）
+# HTTP 客户端（全局单例，连接池复用）
 reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls", # TLS 使用 rustls（纯 Rust，无系统依赖）
+    "rustls-tls",
     "json",
     "gzip",
 ] }
@@ -34,7 +37,7 @@ local-ip-address = "0.6"
 anyhow = "1"
 tracing = "0.1"
 
-async-recursion = "1"
+# M-04 FIX: 移除 async-recursion，改用 loop + flag
 
 [profile.release]
 opt-level = 3

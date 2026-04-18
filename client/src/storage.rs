@@ -1,14 +1,16 @@
-// client/src/storage.rs — 优化版 v2
-// MAJOR-4 FIX: 1个副本存在时尝试自愈（原代码 read_count<2 直接报错）
-// 原有修复全部保留（BUG-04/07/NEW-9/NEW-C/NEW-E）
+// client/src/storage.rs — 优化版 v3
+// C-02 FIX: 修复 import 路径，使用 aes_gcm::aead::{Aead, KeyInit, OsRng}
+// C-03 FIX: 确保导入 KeyInit trait
+// M-01 FIX: 使用 HKDF-SHA256 替代 SHA256 截断进行密钥派生
 use aes_gcm::{
     Aes128Gcm, Key, Nonce,
-    aead::rand_core::RngCore,
     aead::{Aead, KeyInit, OsRng},
 };
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
+use aes_gcm::aead::rand_core::RngCore;
 
 pub enum LocalReadResult {
     Success {
@@ -23,11 +25,14 @@ pub enum LocalReadResult {
     },
 }
 
+/// M-01 FIX: 使用 HKDF-SHA256 派生加密密钥（替代原始 SHA256 截断）
+/// info = b"aes-key" 固定标签，确保与 path 派生使用不同上下文
 fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
-    let mut h = Sha256::new();
-    h.update(salt.as_bytes());
-    h.update(hkey.as_bytes());
-    h.finalize()[..16].try_into().unwrap()
+    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), hkey.as_bytes());
+    let mut okm = [0u8; 16];
+    hk.expand(b"aes-128-gcm-key", &mut okm)
+        .expect("HKDF expand 16 bytes should never fail");
+    okm
 }
 
 fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
@@ -91,7 +96,7 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     Some((act, exp))
 }
 
-/// MAJOR-4 FIX: 单副本时尝试自愈，0副本才 Insufficient
+/// 单副本时尝试自愈，0 副本才 Insufficient
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::new();
@@ -105,12 +110,10 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
 
     let read_count = values.len();
 
-    // MAJOR-4 FIX: 0 副本才报 Insufficient
     if read_count == 0 {
         return LocalReadResult::Insufficient { read_count: 0 };
     }
 
-    // MAJOR-4 FIX: 1 个副本 → 尝试自愈其余两个，返回 Success（附带警告）
     if read_count == 1 {
         let only_val = values[0];
         tracing::warn!("[Storage] 仅找到 1/3 个副本，尝试自愈其余副本");

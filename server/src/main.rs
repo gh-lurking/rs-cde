@@ -1,4 +1,7 @@
-// server/src/main.rs — 无实质变化（路由结构正确）
+// server/src/main.rs
+// m-01 FIX: 默认绑定地址改为 127.0.0.1
+// m-03 FIX: 添加优雅关停支持
+
 mod auth;
 mod cache;
 mod db;
@@ -45,8 +48,21 @@ async fn main() {
         .layer(Extension(admin_token))
         .layer(TraceLayer::new_for_http());
 
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    // m-01 FIX: 默认绑定 127.0.0.1 而非 0.0.0.0
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     tracing::info!("License Server 监听于 {}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // m-03 FIX: 优雅关停
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install CTRL+C handler");
+    tracing::info!("Graceful shutdown");
 }
