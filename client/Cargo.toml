@@ -31,7 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 
 # 地理检测
-local-ip-address = "0.6"
+# local-ip-address = "0.6"
 
 # 错误处理 & 追踪
 anyhow = "1"

@@ -1,4 +1,7 @@
-// client/src/network.rs — 优化版 v3
+// client/src/network.rs — 优化版 v4
+// [FIX-1] 新增 ERR_EXPIRED 常量 + parse_server_error 处理
+//   原Bug: 服务端返回 ERR-EXPIRED (402) 时，客户端不识别此错误码，
+//   将其当作网络错误降级到离线缓存，若客户端时钟落后则可能绕过过期校验。
 // M-04 FIX: 用 loop + retried flag 替代 async_recursion
 // CRIT-3 FIX: 明确区分业务拒绝错误码与网络错误
 // MAJOR-3 FIX: 时钟重试严格限制为一次
@@ -10,7 +13,6 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
-
 /// 时钟偏差安全阈值（±600s = ±10分钟）
 const MAX_CLOCK_OFFSET_SECS: i64 = 600;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -19,6 +21,7 @@ const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
 pub const ERR_REVOKED: &str = "ERR-REVOKED";
 pub const ERR_INVALID_KEY: &str = "ERR-INVALID-KEY";
 pub const ERR_NOT_ACTIVATED: &str = "ERR-NOT-ACTIVATED";
+pub const ERR_EXPIRED: &str = "ERR-EXPIRED"; // [FIX-1] 新增过期错误码
 
 #[derive(Serialize)]
 struct VerifyRequest {
@@ -68,23 +71,21 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-/// CRIT-3 FIX: 解析非 2xx 响应，明确区分业务错误与网络错误
+/// 解析非 2xx 响应，明确区分业务错误与网络错误
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
-
     match err_code {
         "ERR-REVOKED" | "key revoked" => return ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" | "invalid key" => return ERR_INVALID_KEY.to_string(),
         "ERR-NOT-ACTIVATED" | "not activated" => return ERR_NOT_ACTIVATED.to_string(),
+        "ERR-EXPIRED" | "expired" => return ERR_EXPIRED.to_string(), // [FIX-1] 新增
         _ => {}
     }
-
     if err_code == "ERR-TIME-RECORD" {
         if let Some(st) = body["server_time"].as_i64() {
             return format!("ERR-TIME-RECORD:server_time={}", st);
         }
     }
-
     format!("HTTP {} {}", status.as_u16(), err_code)
 }
 
@@ -122,20 +123,16 @@ async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<Verif
     }
 }
 
-/// M-04 FIX: 用 loop + retried flag 替代 async_recursion
+/// 用 loop + retried flag 替代 async_recursion
 /// 时钟重试严格限制一次，防无限重试
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let mut ts_offset = 0i64;
     let mut retried = false;
-
     loop {
         let result = do_verify(hkey, server_url, ts_offset).await;
-
         if retried {
-            // 已重试过一次，直接返回
             return result;
         }
-
         match &result {
             Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
                 let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
@@ -155,7 +152,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                     tracing::warn!("[License] 时钟偏差 {}s，自动修正后重试（仅此一次）", offset);
                     ts_offset = offset;
                     retried = true;
-                    continue; // 重新循环执行重试
+                    continue;
                 }
                 return result;
             }

@@ -1,8 +1,7 @@
-// client/src/license_guard.rs — 优化版 v2
-// CRIT-3 FIX: 业务拒绝错误码（ERR-REVOKED/ERR-INVALID-KEY/ERR-NOT-ACTIVATED）
-//   触发立即退出，不进入离线缓存流程
+// client/src/license_guard.rs — 优化版 v3
+// [FIX-1] ERR_EXPIRED 作为业务拒绝处理，立即退出，不走离线缓存
+// CRIT-3 FIX: 业务拒绝错误码触发立即退出
 // MINOR-1 FIX: 本地副本读取延迟到在线校验失败后（lazy evaluation）
-
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,9 +19,6 @@ pub async fn check_and_enforce() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-
-    // MINOR-1 FIX: 不在此处预读本地副本（在线成功时纯属浪费）
-    // local_result 移入 Err 分支（lazy evaluation）
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
@@ -79,11 +75,15 @@ pub async fn check_and_enforce() {
                 eprintln!("[License] License Key 尚未激活（服务端确认），立即退出");
                 std::process::exit(1);
             }
+            // [FIX-1] 新增: 过期也是业务拒绝，不走离线缓存
+            if e == network::ERR_EXPIRED {
+                eprintln!("[License] 许可证已过期（服务端确认），立即退出");
+                std::process::exit(1);
+            }
 
             // 真正的网络错误 → 降级到本地缓存
             eprintln!("[License] 在线校验失败（{}），使用本地缓存校验", e);
 
-            // MINOR-1 FIX: 仅在此处（在线失败时）才读取本地副本
             let local_result = storage::read_local_record(&hkey, &salt);
 
             match local_result {

@@ -1,4 +1,8 @@
-// server/src/handlers.rs — 完整优化版 v3
+// server/src/handlers.rs — 完整优化版 v4
+// [FIX-2] Nonce key 使用完整 key_hash（不再截断前16字符）
+// [FIX-3] add_key 响应添加 expires_at 字段
+// [FIX-4] extend_license 响应添加新 expires_at 字段
+// [FIX-6] 新增 validate_key_hash 格式校验
 // M-02 FIX: activate 竞争条件时也失效缓存
 // M-03 FIX: 已激活 key 附加 expired 状态字段
 
@@ -30,11 +34,15 @@ fn hash_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
+// [FIX-6] 新增: 校验 key_hash 格式（64字符十六进制）
+fn validate_key_hash(key_hash: &str) -> bool {
+    key_hash.len() == 64 && key_hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// 恒定时间 HMAC-SHA256 验签（防时序攻击）
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
-
     let mut mac = match HmacSha256::new_from_slice(key.as_bytes()) {
         Ok(m) => m,
         Err(_) => return false,
@@ -42,9 +50,7 @@ fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -
     mac.update(key_hash.as_bytes());
     mac.update(b"|");
     mac.update(timestamp.to_string().as_bytes());
-
     let expected = hex::encode(mac.finalize().into_bytes());
-
     if expected.len() != sig.len() {
         return false;
     }
@@ -80,7 +86,8 @@ fn nonce_ttl() -> i64 {
 }
 
 async fn check_and_store_nonce(redis_pool: &RedisPool, key_hash: &str, sig: &str) -> bool {
-    let key = format!("nonce:{}:{}", &key_hash[..16.min(key_hash.len())], sig);
+    // [FIX-2] 使用完整 key_hash 而非截断前16字符，避免前缀碰撞导致合法请求被拒
+    let key = format!("nonce:{}:{}", key_hash, sig);
     match redis_pool.get().await {
         Ok(mut conn) => {
             let result: Result<Option<String>, _> = deadpool_redis::redis::cmd("SET")
@@ -129,6 +136,15 @@ pub async fn activate(
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Json(req): Json<ActivateReq>,
 ) -> impl IntoResponse {
+    // [FIX-6] key_hash 格式校验
+    if !validate_key_hash(&req.key_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid key_hash format (expected 64 hex chars)"})),
+        )
+            .into_response();
+    }
+
     let now = now_secs();
 
     // [1] 时间戳窗口
@@ -190,13 +206,21 @@ pub async fn activate(
         let expires_at = if record.expires_at > now {
             record.expires_at
         } else if record.expires_at > 0 {
-            return (StatusCode::GONE, Json(serde_json::json!({
-                "error": "key has a pre-set expiry that is already in the past; use /admin/extend first"
-            }))).into_response();
+            return (
+                StatusCode::GONE,
+                Json(serde_json::json!({
+                    "error": "key has a pre-set expiry that is already in the past; use /admin/extend first"
+                })),
+            )
+                .into_response();
         } else {
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
-                "error": "key has no expiry configured; use /admin/add-key with valid_days or /admin/extend"
-            }))).into_response();
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "key has no expiry configured; use /admin/add-key with valid_days or /admin/extend"
+                })),
+            )
+                .into_response();
         };
 
         match db::activate_license(&pool, &req.key_hash, now, expires_at).await {
@@ -239,7 +263,7 @@ pub async fn activate(
                 .into_response(),
         }
     } else {
-        // M-03 FIX: 附加过期状态字段，让调用方知晓 key 是否已过期
+        // M-03 FIX: 附加过期状态字段
         let expired = now >= record.expires_at;
         (
             StatusCode::OK,
@@ -278,6 +302,15 @@ pub async fn verify(
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Json(req): Json<VerifyReq>,
 ) -> impl IntoResponse {
+    // [FIX-6] key_hash 格式校验
+    if !validate_key_hash(&req.key_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid key_hash format (expected 64 hex chars)"})),
+        )
+            .into_response();
+    }
+
     let now = now_secs();
 
     // [1] 时间戳窗口
@@ -546,16 +579,21 @@ pub async fn extend_license(
             .into_response();
     }
     let extra_secs = req.extra_days * 86400;
+
+    // [FIX-4] extend_license 现在返回新的 expires_at
     match db::extend_license(&pool, &req.key_hash, extra_secs).await {
-        Ok(true) => {
+        Ok(Some(new_expires)) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"message": "extended"})),
+                Json(serde_json::json!({
+                    "message": "extended",
+                    "expires_at": new_expires,
+                })),
             )
                 .into_response()
         }
-        Ok(false) => (
+        Ok(None) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": "key not found or revoked"})),
         )
@@ -604,19 +642,24 @@ pub async fn add_key(
         )
             .into_response();
     }
-    let expires_at = now + days * 86400;
     let key = generate_hkey();
     let key_hash = hash_key(&key);
+    let expires_at = now + (days as i64) * 86400;
     let note = req.note.as_deref().unwrap_or("");
+
     match db::add_key(&pool, &key, &key_hash, expires_at, note).await {
-        Ok(true) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "key": key,
-                "key_hash": key_hash,
-            })),
-        )
-            .into_response(),
+        Ok(true) => {
+            // [FIX-3] 响应添加 expires_at 字段
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "key": key,
+                    "key_hash": key_hash,
+                    "expires_at": expires_at,
+                })),
+            )
+                .into_response()
+        }
         Ok(false) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "key_hash conflict (extremely rare)"})),
