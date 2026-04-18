@@ -1,3 +1,6 @@
 /target
 /backup
+
+# scripts
 /git-commit.sh
+/repo-sync.sh

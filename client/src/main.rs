@@ -13,7 +13,8 @@ async fn main() {
 
     // license_guard 内部使用 ureq 同步调用，在 tokio 运行时中同步阻塞是可以的
     // 若担心阻塞 tokio 线程，可用 tokio::task::spawn_blocking
-    license_guard::check_and_enforce();
+    // license_guard 现在是 async fn（BUG-06 FIX），需要 .await
+    license_guard::check_and_enforce().await;
     println!("✅ Your license is valid");
 
     // your_business_logic();
@@ -53,13 +54,11 @@ async fn fallback_to_cf_detection(client: Client) {
         Ok(false) => {
             println!("✅ Your country (region) is supported.");
         }
-       // BUG-10 FIX: 两种检测都失败时退出，而不是静默放行
-        Err(e) => {
+        // BUG-10 FIX: 两种检测都失败时退出，而不是静默放行
+        Err(_) => {
             eprintln!("❌ Your country (region) is not supported. Please contact the support team");
             process::exit(1);
-
-        }
-        // Err(_) => eprintln!("ERR-DTCT-TWO"),
+        } // Err(_) => eprintln!("ERR-DTCT-TWO"),
     }
 }
 
@@ -67,4 +66,3 @@ async fn run_client() {
     println!("🚀 Run the client now ...");
     // TODO: 在此处填写业务代码
 }
-

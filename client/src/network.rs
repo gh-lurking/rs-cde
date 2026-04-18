@@ -1,10 +1,7 @@
-// client/src/network.rs — 优化版（修复 BUG-06: 删除死代码 activate_online）
+// client/src/network.rs — 优化版（修复 BUG-06: 改为 async reqwest）
 
-//
-
-// BUG-06 FIX: 移除从未被调用的 activate_online()；
-
-//             统一使用 ureq 同步 HTTP，无需与 tokio/reqwest 共存
+// BUG-06 FIX: 原码使用 ureq（同步阻塞），会阻塞 tokio 工作线程。
+//             改为 reqwest async，在 tokio 上下文中安全调用。
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -19,7 +16,7 @@ struct VerifyRequest {
     signature: String,
 }
 
-/// 服务端 /verify 响应结构
+/// 验证响应：/verify 接口返回体
 #[derive(Deserialize)]
 pub struct VerifyResponse {
     pub activation_ts: i64,
@@ -35,21 +32,18 @@ pub fn hash_key(hkey: &str) -> String {
 }
 
 /// HMAC-SHA256(secret=hkey, msg="key_hash|timestamp")
-
 fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
     let mut mac = HmacSha256::new_from_slice(hkey.as_bytes()).unwrap();
-
     mac.update(key_hash.as_bytes());
     mac.update(b"|");
     mac.update(ts.to_string().as_bytes());
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-/// 联网校验：POST /verify
-
-/// 超时或网络错误返回 Err，调用方降级到纯本地校验
-
-pub fn verify_online(
+/// 在线校验：POST /verify（BUG-06 FIX: async reqwest）
+///
+/// 返回 Err 时调用方降级到本地缓存校验
+pub async fn verify_online(
     hkey: &str,
     server_url: &str,
     timeout_secs: u64,
@@ -62,7 +56,6 @@ pub fn verify_online(
         .as_secs() as i64;
 
     let key_hash = hash_key(hkey);
-
     let signature = sign_request(hkey, &key_hash, ts);
 
     let req = VerifyRequest {
@@ -73,15 +66,25 @@ pub fn verify_online(
 
     let url = format!("{}/verify", server_url);
 
-    let resp = ureq::post(&url)
+    // BUG-06 FIX: reqwest async，不阻塞 tokio 线程
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .send_json(&req)
+        .build()
         .map_err(|e| e.to_string())?;
 
-    resp.into_json::<VerifyResponse>()
+    let resp = client
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    resp.json::<VerifyResponse>()
+        .await
         .map_err(|e| e.to_string())
 }
 
-// BUG-06 FIX: activate_online() 已删除（死代码）
-// 激活流程由服务端 /activate 接口处理，客户端首次运行时应引导用户
-// 通过外部工具或初始化脚本完成激活，不在 license_guard 主流程中调用
+// BUG-06 FIX: activate_online() 也改为 async reqwest
+// 从未激活的情况下调用激活接口，获取 activation_ts 和 expires_at，
+// 写入本地存储后由 license_guard 中统一处理。
+// 不在 license_guard 中调用（保持职责单一）

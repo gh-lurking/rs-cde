@@ -4,22 +4,22 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-# ── Web 框架 ────────────────────────────────────────────────────────────────
-axum       = "0.7"
-tokio      = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["trace"] }
-# ── PostgreSQL 连接池（sqlx 内置池，精细化配置见 db.rs）────────────────────
-# ✅ 变更: 补充 macros 特性
+# ── Web 框架 ──────────────────────────────────────────────────────────────────
+axum        = "0.7"
+tokio       = { version = "1", features = ["full"] }
+tower-http  = { version = "0.5", features = ["trace"] }
+# ── PostgreSQL 连接池（sqlx 已包含 PgPoolOptions）────────────────────────────
+# ✅ 要点: 启用 macros 使 query! 宏可用
 sqlx = { version = "0.7", features = [
     "postgres",
     "runtime-tokio-rustls",
-    "macros",         # ✅ 新增: query! 宏支持
+    "macros",            # ✅ 启用: query! 宏可用
 ] }
-# ── ✅ 新增: Redis 客户端 + 连接池 ─────────────────────────────────────────
-# redis: 异步客户端核心
+# ── ✅ 要点: Redis 连接池 + 异步操作 ──────────────────────────────────────────
+# redis: 底层异步命令库
 redis = { version = "0.25", features = [
-    "tokio-comp",         # tokio 异步兼容
-    "connection-manager", # 自动重连管理器
+    "tokio-comp",        # tokio 兼容层
+    "connection-manager", # 连接管理器
 ] }
 # deadpool-redis: 生产级 Redis 连接池
 deadpool-redis = { version = "0.15", features = ["rt_tokio_1"] }
@@ -28,12 +28,12 @@ uuid = { version = "1", features = ["v4"] }
 # 序列化
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 日志
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.11.0"
+# 追踪
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10.8"
 hex  = "0.4"
-hmac = "0.13.0"
+hmac = "0.12.1"
 
 [profile.release]
 opt-level = 3
