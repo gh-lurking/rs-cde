@@ -9,6 +9,7 @@ mod handlers;
 
 use axum::{
     Extension, Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -38,11 +39,12 @@ async fn main() {
         .route("/activate", post(handlers::activate))
         .route("/verify", post(handlers::verify))
         .route("/health", get(handlers::health))
-        .route("/admin/licenses", get(handlers::list_licenses))
+        .route("/admin/licenses", post(handlers::list_licenses))
         .route("/admin/revoke", post(handlers::revoke_license))
         .route("/admin/extend", post(handlers::extend_license))
         .route("/admin/add-key", post(handlers::add_key))
         .route("/admin/batch-init", post(handlers::batch_init))
+        .layer(DefaultBodyLimit::max(65536)) // BUG-06 FIX: 限制请求体最大 64KB
         .layer(Extension(pg_pool))
         .layer(Extension(redis_pool))
         .layer(Extension(admin_token))
