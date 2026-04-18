@@ -1,7 +1,6 @@
-// client/src/storage.rs — 最终优化版
-// BUG-04  FIX: 三份副本 + 严格多数投票（> N/2）才信任，防单文件篡改
-// BUG-07  FIX: 写入时用 OsRng 生成随机 nonce，读取时从文件头读取 nonce
-// BUG-NEW-9 FIX: 副本修复逻辑同时修复"读取失败（损坏/缺失）"的槽位
+// client/src/storage.rs — 完整优化版
+// 原有修复: BUG-04/07/NEW-9
+// 新增修复: BUG-NEW-C(LocalReadResult 枚举，精确区分副本状态)
 
 use aes_gcm::{
     Aes128Gcm, Key, Nonce,
@@ -12,7 +11,19 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
-// ─── 密钥派生（与写入/读取共用）──────────────────────────────────────────────
+// BUG-NEW-C FIX: 枚举返回值，精确区分三种状态
+pub enum LocalReadResult {
+    /// 投票成功，返回 (value, 成功读取的副本数)
+    Success {
+        value: (u64, u64),
+        read_count: usize,
+    },
+    /// 投票失败——副本数足够但无多数共识（可能遭篡改）
+    Tampered { read_count: usize },
+    /// 副本数不足（< 2）——可能首次运行或文件丢失
+    Insufficient { read_count: usize },
+}
+
 fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(salt.as_bytes());
@@ -20,20 +31,16 @@ fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
     h.finalize()[..16].try_into().unwrap()
 }
 
-// ─── 路径派生（三个不同槽位，存储在不同目录和文件名）──────────────────────
 fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
     let mut h = Sha256::new();
     h.update(salt.as_bytes());
     h.update(hkey.as_bytes());
     let d = h.finalize();
     let dir_name = format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3]);
-
     let files = ["index.db", "cache.bin", "meta.dat"];
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".to_string());
-
-    // 三个不同目录（Linux/macOS 隐藏目录）
     let bases = [
         format!("{}/.cache/.sys/{}", home, dir_name),
         format!("{}/.local/share/.sys/{}", home, dir_name),
@@ -42,7 +49,7 @@ fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
     PathBuf::from(&bases[slot as usize % 3]).join(files[slot as usize % 3])
 }
 
-// ─── BUG-07 FIX: 写入时生成随机 nonce ──────────────────────────────────────
+// BUG-07 FIX: 写入时生成随机 nonce
 // 文件格式：[random_nonce(12B)] + [ciphertext(32B)] = 44B
 fn write_slot(
     path: &PathBuf,
@@ -53,9 +60,8 @@ fn write_slot(
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
 
-    // BUG-07 FIX: 每次写入生成全新随机 nonce（OsRng = 系统密码学随机源）
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes); // BUG-07 FIX: 每次写入随机 nonce
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let mut plain = [0u8; 16];
@@ -70,40 +76,34 @@ fn write_slot(
         let _ = fs::create_dir_all(p);
     }
 
-    // ✅ nonce 前置写入文件（读取时从文件头恢复）
-    let mut out = nonce_bytes.to_vec(); // 12 字节随机 nonce
-    out.extend_from_slice(&ct); // 32 字节密文（16B 明文 + 16B GCM tag）
+    let mut out = nonce_bytes.to_vec();
+    out.extend_from_slice(&ct);
     fs::write(path, &out).map_err(|e| format!("write: {e}"))
 }
 
-// ─── BUG-07 FIX: 读取时从文件头读 nonce ─────────────────────────────────────
+// BUG-07 FIX: 读取时从文件头读 nonce
 fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     let data = fs::read(path).ok()?;
     if data.len() != 44 {
         return None; // 12 nonce + 32 ciphertext
     }
-
-    // BUG-07 FIX: nonce 从文件头读取（不再重新派生固定 nonce）
     let stored_nonce = &data[..12];
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
     let nonce = Nonce::from_slice(stored_nonce);
-
     let plain = cipher.decrypt(nonce, &data[12..]).ok()?;
     if plain.len() != 16 {
         return None;
     }
-
     let act = u64::from_le_bytes(plain[..8].try_into().unwrap());
     let exp = u64::from_le_bytes(plain[8..].try_into().unwrap());
     Some((act, exp))
 }
 
-// ─── 公开 API ─────────────────────────────────────────────────────────────
-/// BUG-04 FIX: 读取三个副本，严格多数投票（best_count * 2 > replica_count）才信任
-/// BUG-NEW-9 FIX: 修复逻辑同时覆盖"读取失败（损坏/缺失）"的槽位，确保副本完全恢复
-/// 返回 (Option<(u64,u64)>, 成功读取的副本数)
-pub fn read_local_record_with_count(hkey: &str, salt: &str) -> (Option<(u64, u64)>, usize) {
+/// BUG-NEW-C FIX: 返回 LocalReadResult 枚举，精确区分三种状态
+/// BUG-04 FIX: 三副本严格多数投票（> N/2）
+/// BUG-NEW-9 FIX: 修复逻辑覆盖损坏/缺失的槽位
+pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::new();
 
@@ -114,13 +114,14 @@ pub fn read_local_record_with_count(hkey: &str, salt: &str) -> (Option<(u64, u64
         }
     }
 
-    let replica_count = values.len();
+    let read_count = values.len();
 
-    if values.is_empty() {
-        return (None, 0);
+    // 副本数不足（< 2）
+    if read_count < 2 {
+        return LocalReadResult::Insufficient { read_count };
     }
 
-    // BUG-04 FIX: 投票找多数值
+    // 多数投票
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(entry) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -132,16 +133,15 @@ pub fn read_local_record_with_count(hkey: &str, salt: &str) -> (Option<(u64, u64
 
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
-    // 严格多数（> N/2）才信任
-    if best_count * 2 > replica_count {
+    if best_count * 2 > read_count {
         // BUG-NEW-9 FIX: 修复所有不一致的副本，包括损坏/缺失的槽位
-        // 原版只修复"读取成功但值不同"的副本，忽略了损坏/缺失槽
         if best_count < 3 {
             for slot in 0..3u8 {
                 let path = derive_path(hkey, salt, slot);
-                let needs_repair = match read_slot(&path, &key) {
-                    Some(pair) => pair != best_val, // 值不一致
-                    None => true,                   // 读取失败（损坏或缺失）← BUG-NEW-9 FIX
+                let slot_val = read_slot(&path, &key);
+                let needs_repair = match slot_val {
+                    Some(pair) => pair != best_val,
+                    None => true, // BUG-NEW-9 FIX: 覆盖损坏/缺失
                 };
                 if needs_repair {
                     if let Err(e) = write_slot(&path, &key, best_val.0, best_val.1) {
@@ -152,18 +152,17 @@ pub fn read_local_record_with_count(hkey: &str, salt: &str) -> (Option<(u64, u64
                 }
             }
         }
-        (Some(best_val), replica_count)
+        LocalReadResult::Success {
+            value: best_val,
+            read_count,
+        }
     } else {
-        // 平票或无多数 → 视为篡改
-        eprintln!(
-            "[Storage] 本地副本无法形成多数共识（{}/{}），可能遭篡改",
-            best_count, replica_count
-        );
-        (None, replica_count)
+        // 平票或无多数 → 视为篡改（BUG-NEW-C FIX: 精确枚举值）
+        LocalReadResult::Tampered { read_count }
     }
 }
 
-/// 向所有三个槽位写入最新数据（BUG-07 FIX: write_slot 返回 Result，记录失败）
+/// 向所有三个槽位写入最新数据
 pub fn write_all_replicas(hkey: &str, salt: &str, activation: u64, expires: u64) {
     let key = derive_key(hkey, salt);
     for slot in 0..3u8 {
