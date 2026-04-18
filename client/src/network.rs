@@ -2,6 +2,7 @@
 // CRIT-3 FIX: 明确区分业务拒绝错误码（ERR-REVOKED 等）与网络错误
 // MAJOR-3 FIX: 时钟重试严格限制为一次（通过 is_retry 参数保护）
 
+use async_recursion::async_recursion;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -129,6 +130,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
     verify_online_inner(hkey, server_url, 0, false).await
 }
 
+#[async_recursion]
 async fn verify_online_inner(
     hkey: &str,
     server_url: &str,
