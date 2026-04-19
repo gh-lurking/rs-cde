@@ -1,14 +1,9 @@
-// server/src/handlers.rs — 优化版 v6
+// server/src/handlers.rs — 优化版 v7 (Bug修复版)
 //
-// ✅ OPT-CRIT-1/2: revoke 时写入 tombstone 而非单纯 DEL，确保吊销即时生效
-// ✅ OPT-CRIT-3: nonce 顺序统一为「时间窗口 → nonce → DB/Cache → 验签 → 业务」
-//               注：nonce 必须在验签后（否则无法确认请求合法性即消耗 nonce slot）
-//               正确顺序：时间窗口 → DB/Cache(取key) → 验签 → nonce → 业务逻辑
-// ✅ OPT-MAJOR-1: set_verify_cache 前过滤 revoked/expired 条目，避免无效缓存写入
-// ✅ OPT-MAJOR-2: activate 对已激活且过期的密钥返回 410
-// ✅ OPT-MAJOR-4: nonce fail-closed 时增加内存 fallback（DashMap）
-// ✅ OPT-MAJOR-5: extend 对未激活密钥返回 422，明确语义
-// ✅ OPT-MINOR-2: spawn 任务增加 timeout 保护
+// ✅ CRIT-1 FIX: cache hit 分支先判断 tombstone(revoked=true)，再用 cached_entry.key 验签
+// ✅ CRIT-3 FIX: 写缓存条件增加 expires_at > 0 显式断言
+// ✅ MAJOR-3 FIX: tombstone 使用 tombstone_ttl()（set_revoked_tombstone 已更新）
+// ✅ MINOR-4 FIX: tokio::spawn 前捕获 req_time
 
 use crate::{auth, cache, db, nonce_fallback};
 use axum::{
@@ -18,7 +13,6 @@ use axum::{
 };
 use cache::{RedisPool, VerifyCacheEntry};
 use db::DbPool;
-
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,7 +40,6 @@ fn validate_key_hash(key_hash: &str) -> bool {
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
-
     let server_id = std::env::var("SERVER_ID").unwrap_or_default();
     let mut mac = match HmacSha256::new_from_slice(key.as_bytes()) {
         Ok(m) => m,
@@ -89,10 +82,9 @@ fn timestamp_window() -> i64 {
 }
 
 fn nonce_ttl() -> i64 {
-    timestamp_window() * 2 + 30 // ✅ OPT: 覆盖双向时钟偏差范围
+    timestamp_window() * 2 + 30
 }
 
-// ✅ OPT-MAJOR-4: Redis 不可用时降级到内存 nonce（DashMap）
 async fn check_and_store_nonce(redis_pool: &RedisPool, key_hash: &str, sig: &str) -> bool {
     let key = format!("nonce:{}:{}", key_hash, sig);
     match redis_pool.get().await {
@@ -112,7 +104,6 @@ async fn check_and_store_nonce(redis_pool: &RedisPool, key_hash: &str, sig: &str
                 "[Nonce] Redis 不可用 ({})，降级到内存 nonce（安全性略降）",
                 e
             );
-            // ✅ OPT-MAJOR-4: 使用内存 fallback，避免服务完全不可用
             nonce_fallback::check_and_store(&key, nonce_ttl() as u64)
         }
     }
@@ -134,7 +125,7 @@ async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> boo
     matches!(result, Ok(Some(_)))
 }
 
-// ── POST /activate ────────────────────────────────────────────────────────────
+// ── POST /activate ──────────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct ActivateReq {
     key_hash: String,
@@ -185,7 +176,7 @@ pub async fn activate(
         }
     };
 
-    // [3] 验签（先于 nonce 消耗，防止伪签名污染 nonce 空间）
+    // [3] 验签（先于 nonce 消耗）
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -219,7 +210,7 @@ pub async fn activate(
             return (
                 StatusCode::GONE,
                 Json(serde_json::json!({
-                    "error": "key has a pre-set expiry that is already in the past; use /admin/extend first"
+                    "error": "key has a pre-set expiry that is already in the past"
                 })),
             )
                 .into_response();
@@ -227,7 +218,7 @@ pub async fn activate(
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({
-                    "error": "key has no expiry configured; use /admin/add-key with valid_days or /admin/extend"
+                    "error": "key has no expiry configured; use /admin/add-key with valid_days"
                 })),
             )
                 .into_response();
@@ -272,7 +263,6 @@ pub async fn activate(
                 .into_response(),
         }
     } else {
-        // ✅ OPT-MAJOR-2: 已激活且过期 → 410，而非 200
         if now >= record.expires_at {
             return (
                 StatusCode::GONE,
@@ -297,7 +287,7 @@ pub async fn activate(
     }
 }
 
-// ── POST /verify ──────────────────────────────────────────────────────────────
+// ── POST /verify ─────────────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct VerifyReq {
     key_hash: String,
@@ -336,10 +326,19 @@ pub async fn verify(
             .into_response();
     }
 
-    // [2] 取 entry（Cache → DB），统一验签 + nonce 后处理业务
+    // [2] 取 entry（Cache → DB）
     let entry = match cache::get_verify_cache(&redis_pool, &req.key_hash).await {
         Some(cached_entry) => {
-            // cache hit：使用缓存中的 key 验签
+            // ✅ CRIT-1 FIX: 先检查 tombstone(revoked)，再用 cached_entry.key 验签
+            // tombstone.key = "" → 若先验签，空 key 会产生可预测的 HMAC 值
+            if cached_entry.revoked {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "ERR-REVOKED"})),
+                )
+                    .into_response();
+            }
+
             if !verify_hmac_signature(
                 &cached_entry.key,
                 &req.key_hash,
@@ -384,8 +383,13 @@ pub async fn verify(
                     expires_at: record.expires_at,
                     revoked: record.revoked,
                 };
-                // ✅ OPT-MAJOR-1: 仅对合法状态写入缓存，过滤 revoked/expired
-                if !e.revoked && e.activation_ts > 0 && e.expires_at > now {
+                // ✅ CRIT-3 FIX: 写缓存条件增加 expires_at > 0 显式断言
+                // 防止系统时钟极端异常(now≈0)时将无效条目写入缓存
+                if !e.revoked
+                    && e.activation_ts > 0
+                    && e.expires_at > 0       // ← CRIT-3 新增
+                    && e.expires_at > now
+                {
                     cache::set_verify_cache(&redis_pool, &req.key_hash, &e).await;
                 }
                 e
@@ -407,17 +411,17 @@ pub async fn verify(
         },
     };
 
-    // [3] 异步 last_check 更新（✅ OPT-MINOR-2: 增加 timeout 保护）
+    // [3] 异步 last_check 更新
+    // ✅ MINOR-4 FIX: spawn 前捕获 req_time，保证时间戳准确
+    let req_time = now_secs();
     {
         let pool2 = Arc::clone(&pool);
         let rp2 = Arc::clone(&redis_pool);
         let kh = req.key_hash.clone();
         tokio::spawn(async move {
-            // 整个任务最多执行 2s，防止 redis pool 耗尽时任务堆积
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
                 if should_update_last_check(&rp2, &kh).await {
-                    let actual_now = now_secs();
-                    if let Err(e) = db::update_last_check(&pool2, &kh, actual_now).await {
+                    if let Err(e) = db::update_last_check(&pool2, &kh, req_time).await {
                         tracing::warn!(
                             "[LastCheck] 更新失败 kh={}...: {}",
                             &kh[..8.min(kh.len())],
@@ -430,7 +434,7 @@ pub async fn verify(
         });
     }
 
-    // [4] 已撤销 → 403
+    // [4] 已撤销 → 403（cache hit 路径已在上方提前返回，此处为 DB 路径兜底）
     if entry.revoked {
         return (
             StatusCode::FORBIDDEN,
@@ -469,7 +473,7 @@ pub async fn verify(
         .into_response()
 }
 
-// ── GET /health ────────────────────────────────────────────────────────────────
+// ── GET /health ───────────────────────────────────────────────────────────────
 pub async fn health(
     Extension(pool): Extension<Arc<DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
@@ -494,7 +498,7 @@ fn check_admin(provided: &str, expected: &Arc<String>) -> bool {
     auth::verify_admin_token(provided, expected)
 }
 
-// ── GET /admin/licenses ────────────────────────────────────────────────────────
+// ── GET /admin/licenses ───────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct AdminQuery {
     token: String,
@@ -522,7 +526,7 @@ pub async fn list_licenses(
     }
 }
 
-// ── POST /admin/revoke ─────────────────────────────────────────────────────────
+// ── POST /admin/revoke ────────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct RevokeReq {
     token: String,
@@ -544,11 +548,9 @@ pub async fn revoke_license(
             .into_response();
     }
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
-
     match db::revoke_license(&pool, &req.key_hash, reason).await {
         Ok(()) => {
-            // ✅ OPT-CRIT-1/2: 写入 tombstone 而非单纯 DEL
-            // tombstone 条目 revoked=true，TTL 内仍可被缓存命中并正确拒绝
+            // ✅ MAJOR-3: tombstone 使用更长 TTL（见 cache::set_revoked_tombstone）
             cache::set_revoked_tombstone(&redis_pool, &req.key_hash).await;
             (
                 StatusCode::OK,
@@ -564,7 +566,7 @@ pub async fn revoke_license(
     }
 }
 
-// ── POST /admin/extend ─────────────────────────────────────────────────────────
+// ── POST /admin/extend ────────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct ExtendReq {
     token: String,
@@ -599,7 +601,6 @@ pub async fn extend_license(
         )
             .into_response();
     }
-
     let record = match db::find_license(&pool, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -617,7 +618,6 @@ pub async fn extend_license(
                 .into_response();
         }
     };
-
     if record.revoked {
         return (
             StatusCode::FORBIDDEN,
@@ -625,20 +625,16 @@ pub async fn extend_license(
         )
             .into_response();
     }
-
-    // ✅ OPT-MAJOR-5: 对未激活密钥拒绝 extend，语义明确
     if record.activation_ts == 0 {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": "ERR-NOT-ACTIVATED",
-                "message": "未激活密钥不支持 extend。请先激活，或使用 /admin/add-key 的 valid_days 设置激活后有效期。",
-                "hint": "若要设置激活截止日期（deadline），请使用 /admin/set-deadline 接口（需单独实现）"
+                "message": "未激活密钥不支持 extend。请先激活，或使用 /admin/add-key 的 valid_days 设置激活后有效期。"
             })),
         )
             .into_response();
     }
-
     let extra_secs = req.extra_days * 86400;
     match db::extend_license(&pool, &req.key_hash, extra_secs).await {
         Ok(Some(new_expires)) => {
@@ -665,7 +661,7 @@ pub async fn extend_license(
     }
 }
 
-// ── POST /admin/add-key ────────────────────────────────────────────────────────
+// ── POST /admin/add-key ───────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct AddKeyReq {
     token: String,
@@ -701,11 +697,10 @@ pub async fn add_key(
         )
             .into_response();
     }
-    let note = req.note.as_deref().unwrap_or("");
     let key = generate_hkey();
     let key_hash = hash_key(&key);
     let expires_at = now + days * 86400;
-
+    let note = req.note.as_deref().unwrap_or("");
     match db::add_key(&pool, &key, &key_hash, expires_at, note).await {
         Ok(true) => (
             StatusCode::CREATED,
@@ -713,6 +708,9 @@ pub async fn add_key(
                 "key": key,
                 "key_hash": key_hash,
                 "expires_at": expires_at,
+                // ✅ MAJOR-2: 明确说明 expires_at 语义，并返回 created_at 供管理员计算激活窗口
+                "expires_at_note": "从创建时刻算起的绝对截止日期，非激活后有效期",
+                "created_at": now,
             })),
         )
             .into_response(),
@@ -729,7 +727,7 @@ pub async fn add_key(
     }
 }
 
-// ── POST /admin/batch-init ─────────────────────────────────────────────────────
+// ── POST /admin/batch-init ────────────────────────────────────────────────────
 #[derive(Deserialize)]
 pub struct BatchInitReq {
     token: String,
@@ -757,10 +755,14 @@ pub async fn batch_init(
             .into_response();
     }
     let note = req.note.as_deref().unwrap_or("batch");
+    // ✅ MINOR-2 FIX: batch_init_keys 现在返回 (inserted, keys) 元组
     match db::batch_init_keys(&pool, req.count, note).await {
-        Ok(inserted) => (
+        Ok((inserted, keys)) => (
             StatusCode::CREATED,
-            Json(serde_json::json!({"inserted": inserted})),
+            Json(serde_json::json!({
+                "inserted": inserted,
+                "keys": keys,   // ✅ MINOR-2: 返回生成的 key 列表
+            })),
         )
             .into_response(),
         Err(e) => (

@@ -1,8 +1,8 @@
-// client/src/license_guard.rs — 优化版 v5
+// client/src/license_guard.rs — 优化版 v6 (Bug修复版)
 //
-// ✅ OPT-MINOR-3: 移除 Ok(resp) 分支中的冗余双重条件检查（dead code 消除）
-// ✅ 保留所有原有修复（FIX CRIT-1/MAJOR-1/CRIT-3）
-// ✅ 新增：写缓存前卫语句仅保留一次，逻辑更清晰
+// ✅ MAJOR-1 FIX: Ok(resp) 分支增加 expires_at==0 防御性检查
+//   防止服务端返回 200 + expires_at=0（DB异常）时 now>=0 恒真导致所有用户被锁出
+// ✅ 保留所有原有修复（CRIT-1/CRIT-3/OPT-MINOR-3）
 
 use crate::{network, storage};
 use obfstr::obfstr;
@@ -25,29 +25,35 @@ pub async fn check_and_enforce() {
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
             // 服务端 verify() 在 revoked/not-activated/expired 时返回非 2xx，
-            // 所以 Ok(resp) 只有「正常已激活未过期」状态。
-            // ✅ OPT-MINOR-3: 只做一次检查，移除冗余的写缓存前二次检查
+            // Ok(resp) 理论上只有「正常已激活未过期」状态。
+            // 但需防御性校验，防止服务端 Bug 或 DB 异常返回无效数据。
 
-            // 未激活（activation_ts=0 先于 expires_at，防 expires_at=0 误报）
-            if resp.activation_ts == 0 {
-                eprintln!("[License] Key 尚未激活，请先完成激活");
+            // ✅ MAJOR-1 FIX: 检查 activation_ts 和 expires_at 都必须 > 0
+            // 若服务端返回 200 + expires_at=0（DB异常），
+            // 原代码的 now >= 0 恒真，会拒绝所有合法用户（DoS）
+            if resp.activation_ts == 0 || resp.expires_at == 0 {
+                eprintln!(
+                    "[License] 服务端返回无效数据(activation_ts={}, expires_at={})，拒绝信任，请联系支持",
+                    resp.activation_ts, resp.expires_at
+                );
                 std::process::exit(1);
             }
 
-            // 已过期（activation_ts>0 时 expires_at 才有意义）
+            // ✅ MAJOR-1 FIX: 保留过期检查（防客户端时钟超前 > 服务端授权范围的极端情况）
+            // 此时 resp.expires_at > 0 已保证，now >= expires_at 不会恒真
             if now >= resp.expires_at {
                 let days = (now - resp.expires_at) / 86400;
-                eprintln!("[License] 许可证已过期 {} 天，请联系支持", days);
+                eprintln!(
+                    "[License] 客户端时钟可能超前 {} 天（服务端授权到期: {}，当前时钟: {}），请检查系统时间",
+                    days, resp.expires_at, now
+                );
                 std::process::exit(1);
             }
-
-            // 服务端在 revoked=true 时返回 403+ERR-REVOKED → Err(ERR-REVOKED) → exit(1)
-            // Ok 分支到达这里时 revoked 必然为 false（服务端保证），无需检查
 
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] ✅ 在线校验通过，剩余 {} 天", remaining);
 
-            // ✅ OPT-MINOR-3: 直接写入（前置检查已保证状态合法，移除重复的 if 条件）
+            // 写入本地缓存（前置检查已保证数据合法）
             storage::write_all_replicas(
                 &hkey,
                 &salt,
@@ -75,7 +81,6 @@ pub async fn check_and_enforce() {
                 eprintln!("[License] 许可证已过期（服务端确认），立即退出");
                 std::process::exit(1);
             }
-            // ERR-FORBIDDEN:* 通用业务拒绝
             if e.starts_with("ERR-FORBIDDEN:") {
                 eprintln!("[License] 服务端业务拒绝 ({})，立即退出", e);
                 std::process::exit(1);

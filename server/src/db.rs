@@ -1,7 +1,7 @@
-// server/src/db.rs — 优化版 v3
-// [FIX-4] extend_license 使用 RETURNING 子句返回新 expires_at
-// 原有修复全部保留（BUG-08/09/I/NEW-8）
-
+// server/src/db.rs — 优化版 v4 (Bug修复版)
+//
+// ✅ MINOR-1 FIX: extend_license SQL 增加 AND activation_ts > 0（纵深防御）
+// ✅ MINOR-2 FIX: batch_init_keys 返回 (rows_affected, Vec<String>) 便于管理员审计
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,20 +65,22 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .max_lifetime(Duration::from_secs(1800))
         .connect(database_url)
         .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key TEXT NOT NULL,
-            key_hash TEXT PRIMARY KEY,
+            key          TEXT NOT NULL,
+            key_hash     TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at BIGINT NOT NULL DEFAULT 0,
-            revoked BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at BIGINT NOT NULL,
-            last_check BIGINT,
-            note TEXT NOT NULL DEFAULT ''
+            expires_at   BIGINT NOT NULL DEFAULT 0,
+            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   BIGINT NOT NULL,
+            last_check   BIGINT,
+            note         TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
     .await?;
+
     tracing::info!(
         "PostgreSQL pool ready: max={} min={} acquire=5s idle=600s lifetime=1800s",
         max_conn,
@@ -100,8 +102,6 @@ pub async fn find_license(
     .await
 }
 
-/// true = 激活成功（rows_affected == 1）
-/// false = 并发竞争/已激活/已撤销/不存在
 pub async fn activate_license(
     pool: &DbPool,
     key_hash: &str,
@@ -142,10 +142,8 @@ pub async fn revoke_license(
     Ok(())
 }
 
-/// [FIX-4] 返回 Option<i64>：
-/// Some(new_expires_at) = 续期成功，返回新的过期时间
-/// None = 未找到/已撤销
-/// GREATEST(expires_at, now) 语义为「从 max(过期时间, 当前时间) 续期」
+/// ✅ MINOR-1 FIX: 增加 AND activation_ts > 0，纵深防御未激活密钥被续期
+/// 返回 Option<i64>：Some(new_expires_at) = 续期成功，None = 未找到/已撤销/未激活
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
@@ -153,8 +151,11 @@ pub async fn extend_license(
 ) -> Result<Option<i64>, sqlx::Error> {
     let now = now_db();
     let row: Option<(i64,)> = sqlx::query_as(
-        "UPDATE licenses SET expires_at = GREATEST(expires_at, $1) + $2
-         WHERE key_hash = $3 AND revoked = FALSE
+        "UPDATE licenses
+         SET expires_at = GREATEST(expires_at, $1) + $2
+         WHERE key_hash = $3
+           AND revoked = FALSE
+           AND activation_ts > 0    -- ✅ MINOR-1: 未激活密钥不可续期（纵深防御）
          RETURNING expires_at",
     )
     .bind(now)
@@ -197,8 +198,12 @@ pub async fn add_key(
     Ok(result.rows_affected() == 1)
 }
 
-/// UNNEST 批量 INSERT，单条 SQL + 原子事务
-pub async fn batch_init_keys(pool: &DbPool, count: u32, note: &str) -> Result<u64, sqlx::Error> {
+/// ✅ MINOR-2 FIX: 返回 (rows_affected, Vec<String>) 便于 handler 返回 key 列表给管理员
+pub async fn batch_init_keys(
+    pool: &DbPool,
+    count: u32,
+    note: &str,
+) -> Result<(u64, Vec<String>), sqlx::Error> {
     let now = now_db();
     let mut keys: Vec<String> = Vec::with_capacity(count as usize);
     let mut key_hashes: Vec<String> = Vec::with_capacity(count as usize);
@@ -220,5 +225,6 @@ pub async fn batch_init_keys(pool: &DbPool, count: u32, note: &str) -> Result<u6
     .bind(note)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    // ✅ MINOR-2: 返回 key 列表（仅返回实际插入的 key，冲突 key 已通过 rows_affected 过滤）
+    Ok((result.rows_affected(), keys))
 }

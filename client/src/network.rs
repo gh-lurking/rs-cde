@@ -1,8 +1,7 @@
-// client/src/network.rs — 优化版 v5
+// client/src/network.rs — 优化版 v6 (Bug修复版)
 //
-// ✅ FIX CRIT-3: parse_server_error 识别 HTTP 410 (ERR-EXPIRED) / 403 (ERR-NOT-ACTIVATED)
-// ✅ FIX MINOR-2: 签名消息加入 SERVER_ID，防跨服务重放
-// 保留: loop + retried flag（防无限重试），时钟偏差超阈值拒绝修正
+// ✅ MINOR-3 FIX: ERR-TIME-RECORD 解析失败时明确返回业务错误，不触发离线降级
+// ✅ 保留所有原有修复（CRIT-3/MINOR-2）
 
 use hmac::{Hmac, Mac};
 use obfstr::obfstr;
@@ -17,7 +16,6 @@ type HmacSha256 = Hmac<sha2::Sha256>;
 const MAX_CLOCK_OFFSET_SECS: i64 = 600;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-/// 业务拒绝错误码（与 license_guard.rs 对应）
 pub const ERR_REVOKED: &str = "ERR-REVOKED";
 pub const ERR_INVALID_KEY: &str = "ERR-INVALID-KEY";
 pub const ERR_NOT_ACTIVATED: &str = "ERR-NOT-ACTIVATED";
@@ -63,13 +61,10 @@ pub fn hash_key(hkey: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// ✅ FIX MINOR-2: 签名消息加入 SERVER_ID，防跨服务重放
-/// server_url 用于标识目标服务，需与服务端 SERVER_ID 环境变量一致
+/// 签名消息格式: SERVER_ID|key_hash|timestamp（与服务端 verify_hmac_signature 对齐）
 fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> String {
-    // 使用 SERVER_ID 环境变量，若未设置则 fallback 到 server_url
     let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| server_url.to_string());
     let mut mac = HmacSha256::new_from_slice(hkey.as_bytes()).unwrap();
-    // 消息格式: server_id|key_hash|timestamp（与服务端 verify_hmac_signature 对齐）
     mac.update(server_id.as_bytes());
     mac.update(b"|");
     mac.update(key_hash.as_bytes());
@@ -78,29 +73,18 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> String
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-/// ✅ FIX CRIT-3: 识别 410 Gone (ERR-EXPIRED) 和 403 (ERR-NOT-ACTIVATED/ERR-REVOKED)
-/// 明确区分业务拒绝错误与网络错误，防止过期/未激活被当作网络错误降级
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
-
-    // 先按 HTTP 状态码快速判断（防 body 被截断）
     match status.as_u16() {
-        // 410 Gone → 明确表示已过期（FIX CRIT-3）
         410 => return ERR_EXPIRED.to_string(),
-        // 403 Forbidden → 可能是 revoked / invalid key / not activated
         403 => match err_code {
             "ERR-REVOKED" | "key revoked" => return ERR_REVOKED.to_string(),
             "ERR-INVALID-KEY" | "invalid key" => return ERR_INVALID_KEY.to_string(),
             "ERR-NOT-ACTIVATED" | "not activated" => return ERR_NOT_ACTIVATED.to_string(),
-            _ => {
-                // 未知 403：保守处理，返回明确的业务拒绝字符串
-                return format!("ERR-FORBIDDEN:{}", err_code);
-            }
+            _ => return format!("ERR-FORBIDDEN:{}", err_code),
         },
         _ => {}
     }
-
-    // 兜底：按 error 字段字符串匹配（兼容旧版服务端）
     match err_code {
         "ERR-REVOKED" => return ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" => return ERR_INVALID_KEY.to_string(),
@@ -108,20 +92,17 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         "ERR-EXPIRED" => return ERR_EXPIRED.to_string(),
         _ => {}
     }
-
     if err_code == "ERR-TIME-RECORD" {
         if let Some(st) = body["server_time"].as_i64() {
             return format!("ERR-TIME-RECORD:server_time={}", st);
         }
     }
-
     format!("HTTP {} {}", status.as_u16(), err_code)
 }
 
 async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<VerifyResponse, String> {
     let ts = now_secs() + ts_offset;
     let key_hash = hash_key(hkey);
-    // ✅ FIX MINOR-2: 传入 server_url 参与签名
     let signature = sign_request(hkey, &key_hash, ts, server_url);
     let req = VerifyRequest {
         key_hash,
@@ -160,25 +141,38 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
         match &result {
             Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
                 let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
-                if let Ok(server_ts) = server_time_str.parse::<i64>() {
-                    let offset = server_ts - now_secs();
-                    if offset.abs() > MAX_CLOCK_OFFSET_SECS {
-                        tracing::error!(
-                            "[License] 服务端时钟偏差 {}s 超过安全阈值 {}s，拒绝修正",
-                            offset,
-                            MAX_CLOCK_OFFSET_SECS
+                match server_time_str.parse::<i64>() {
+                    Ok(server_ts) => {
+                        let offset = server_ts - now_secs();
+                        if offset.abs() > MAX_CLOCK_OFFSET_SECS {
+                            tracing::error!(
+                                "[License] 服务端时钟偏差 {}s 超过安全阈值 {}s，拒绝修正",
+                                offset,
+                                MAX_CLOCK_OFFSET_SECS
+                            );
+                            return Err(format!(
+                                "server clock offset {}s exceeds safe threshold {}s",
+                                offset, MAX_CLOCK_OFFSET_SECS
+                            ));
+                        }
+                        tracing::warn!(
+                            "[License] 时钟偏差 {}s，自动修正后重试（仅此一次）",
+                            offset
                         );
-                        return Err(format!(
-                            "server clock offset {}s exceeds safe threshold {}s",
-                            offset, MAX_CLOCK_OFFSET_SECS
-                        ));
+                        ts_offset = offset;
+                        retried = true;
+                        continue;
                     }
-                    tracing::warn!("[License] 时钟偏差 {}s，自动修正后重试（仅此一次）", offset);
-                    ts_offset = offset;
-                    retried = true;
-                    continue;
+                    Err(_) => {
+                        // ✅ MINOR-3 FIX: parse 失败 = 服务端响应格式异常或中间人篡改
+                        // 明确返回业务错误，不触发离线降级（离线降级仅针对网络级错误）
+                        tracing::warn!(
+                            "[License] ERR-TIME-RECORD 中 server_time 格式异常: {}",
+                            server_time_str
+                        );
+                        return Err("ERR-TIME-RECORD:invalid-format".to_string());
+                    }
                 }
-                return result;
             }
             _ => return result,
         }

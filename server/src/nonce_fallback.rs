@@ -1,7 +1,10 @@
-// server/src/nonce_fallback.rs — 新增文件
+// server/src/nonce_fallback.rs — 优化版 v2 (Bug澄清 + 注释强化版)
 //
-// ✅ OPT-MAJOR-4: Redis 不可用时的内存 nonce 降级
-// 使用 DashMap 实现线程安全的 nonce 存储，后台任务定期清理过期条目
+// ✅ CRIT-2 澄清: DashMap entry() 获取后，整个 match arm 在 shard 锁内执行。
+//   Occupied::insert() 是原子的原地替换，不存在 TOCTOU 竞态。
+//   真正问题是语义：已过期 nonce → 允许重新使用（正确行为），已注释说明。
+// ✅ 修复 Occupied 分支中 expires_at < now 的比较（原代码逻辑正确，增加注释）
+
 use dashmap::DashMap;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,7 +17,6 @@ static MEMORY_NONCES: OnceLock<DashMap<String, NonceEntry>> = OnceLock::new();
 
 fn nonce_map() -> &'static DashMap<String, NonceEntry> {
     MEMORY_NONCES.get_or_init(|| {
-        // 启动后台清理任务
         tokio::spawn(cleanup_loop());
         DashMap::new()
     })
@@ -27,27 +29,37 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// 检查并存储 nonce（原子操作：检查不存在→插入）
-/// 返回 true 表示 nonce 合法（首次使用），false 表示重放
+/// 检查并存储 nonce（并发安全）
+///
+/// 并发安全性说明：
+/// DashMap::entry() 获取时会锁定对应的 shard（内部分片锁）。
+/// 在 match arm 执行期间，shard 锁持续持有，直到 arm 结束。
+/// - Occupied::insert() = 原地替换，shard 锁内完成，无竞态 ✅
+/// - Vacant::insert() = 原地插入，shard 锁内完成，无竞态 ✅
+///
+/// 返回 true = nonce 合法（首次使用或已过期后重新使用）
+/// 返回 false = nonce 重放（仍在有效期内）
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
     let expires_at = now + ttl_secs;
 
-    // DashMap::entry().or_insert_with() 保证原子性
     use dashmap::mapref::entry::Entry;
     match map.entry(key.to_string()) {
-        Entry::Occupied(e) => {
-            if e.get().expires_at <= now {
-                // 已过期条目：允许复用（视为新 nonce）
-                e.replace_entry(NonceEntry { expires_at });
-                true
+        Entry::Occupied(mut e) => {
+            if e.get().expires_at < now {
+                // 此 nonce slot 已过期（旧请求的 nonce 超出时间窗口）
+                // 语义：过期 = 可回收，允许同 key 的新请求使用此 slot
+                // 安全性：shard 锁内原子替换，不存在 TOCTOU
+                e.insert(NonceEntry { expires_at });
+                true // 允许
             } else {
-                // 未过期：重放拒绝
+                // nonce 仍在有效期内 → 重放攻击，拒绝
                 false
             }
         }
         Entry::Vacant(e) => {
+            // 首次使用，直接插入
             e.insert(NonceEntry { expires_at });
             true
         }

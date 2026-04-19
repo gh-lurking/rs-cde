@@ -1,8 +1,9 @@
-// client/src/storage.rs — 优化版 v4
+// client/src/storage.rs — 优化版 v5 (Bug确认+修复版)
 //
-// ✅ FIX MAJOR-2: 单副本时返回 Insufficient（不再自愈）
-//                 单副本无法区分正常丢失与篡改，必须在线校验后才能信任
-// 保留: AES-128-GCM + HKDF-SHA256 + OsRng nonce + 多数投票 + 2/3自愈
+// ✅ MAJOR-4 确认: read_count < 2 → Insufficient（非 < 1）
+//   单副本无法区分正常丢失 vs 篡改，必须要求在线校验
+// ✅ 保留: AES-128-GCM + HKDF-SHA256 + OsRng nonce + 多数投票 + 2/3自愈
+
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     Aes128Gcm, Key, Nonce,
@@ -81,8 +82,8 @@ fn write_slot(
 fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     let data = fs::read(path).ok()?;
     if data.len() != 44 {
-        return None;
-    } // 12 nonce + 32 ciphertext(16 plain + 16 GCM tag)
+        return None; // 12 nonce + 32 ciphertext(16 plain + 16 GCM tag)
+    }
     let stored_nonce = &data[..12];
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
@@ -96,10 +97,14 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     Some((act, exp))
 }
 
-/// ✅ FIX MAJOR-2: 单副本 → Insufficient（不再自愈）
-/// 0副本 → Insufficient
-/// 1副本 → Insufficient（无法区分正常丢失 vs 篡改，需在线校验）
-/// 2-3副本 → 多数投票，修复少数异常副本
+/// ✅ MAJOR-4 确认: read_count < 2 → Insufficient
+///
+/// 多数投票行为说明（read_count >= 2 时）：
+/// - 2副本一致: best_count=2, 2*2=4 > 2 → Success ✓
+/// - 2副本不一致: best_count=1, 1*2=2 > 2 false → Tampered ✓
+/// - 3副本全一致: best_count=3, 3*2=6 > 3 → Success ✓
+/// - 3副本2:1: best_count=2, 2*2=4 > 3 → Success（修复少数副本）✓
+/// - 3副本1:1:1: best_count=1, 1*2=2 > 3 false → Tampered ✓
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::new();
@@ -111,13 +116,8 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     }
     let read_count = values.len();
 
-    // ✅ FIX MAJOR-2: 0副本 或 1副本 → Insufficient，要求在线校验
-    if read_count <= 1 {
-        if read_count == 1 {
-            tracing::warn!(
-                "[Storage] 仅找到 1/3 个副本，无法区分正常丢失 vs 篡改，                 需在线校验后重写。退出以强制在线校验。"
-            );
-        }
+    // ✅ MAJOR-4: 明确 < 2（非 < 1），单副本不可信
+    if read_count < 2 {
         return LocalReadResult::Insufficient { read_count };
     }
 
@@ -133,7 +133,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
     if best_count * 2 > read_count {
-        // 修复不一致的少数副本
+        // 有多数共识（> 50%），修复少数不一致副本
         if best_count < read_count {
             for slot in 0..3u8 {
                 let path = derive_path(hkey, salt, slot);
@@ -155,7 +155,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             read_count,
         }
     } else {
-        // 无多数共识（如 1:1 分裂）→ Tampered
+        // 无多数共识（如 2副本不一致 或 1:1:1）→ Tampered
         LocalReadResult::Tampered { read_count }
     }
 }
