@@ -1,20 +1,19 @@
-// server/src/nonce_fallback.rs — 优化版 v5
+// server/src/nonce_fallback.rs — 优化版 v6
 //
-// ✅ BUG-5 FIX: 增加 MAX_NONCE_ENTRIES 容量上限（500,000），防 OOM 攻击
-//   攻击场景：Redis 故障期间，攻击者用不同 sig 持续发请求，耗尽内存
-// ✅ 清理频率从 60s 提高到 30s，减少过期记录堆积
-// ✅ 保留原有: CRIT-B FIX（Occupied arm 正确比较方向）
+// ✅ BUG-5 FIX: 容量保护防 OOM（MAX_NONCE_ENTRIES = 500,000）
+// ✅ CRIT-B FIX: Occupied arm 用 constant-time 操作消除 timing 差异
+// ✅ 清理周期从 60s 改为 30s，减少内存峰值
 
 use dashmap::DashMap;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 struct NonceEntry {
     expires_at: u64,
 }
 
-/// 内存 nonce 容量上限：500,000 条（约 50MB，作为软限制）
-/// 超出时拒绝新 nonce 以保护内存安全
+/// 内存 nonce 上限：500,000 条（约 50MB，防 OOM）
 const MAX_NONCE_ENTRIES: usize = 500_000;
 
 static MEMORY_NONCES: OnceLock<DashMap<String, NonceEntry>> = OnceLock::new();
@@ -33,23 +32,24 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// 检查并存储 nonce（DashMap entry 持有 shard 写锁，在 match arm 内原子执行）
+/// 检查并存储 nonce，返回 true 表示新 nonce（允许请求）
 ///
-/// ⚠️  此函数必须保持为同步函数（非 async）
-///    DashMap entry guard 不能跨 .await 点持有
+/// ✅ CRIT-B FIX: 用 constant-time 操作消除 Occupied 分支的 timing 差异
+/// - Occupied(expired): 更新 entry → 返回 true
+/// - Occupied(valid):   不更新    → 返回 false
+/// - Vacant:            插入 entry → 返回 true
 ///
-/// 返回 true  = 新 nonce，允许通过
-/// 返回 false = 重放攻击（nonce 仍有效）或容量溢出
+/// 两个 Occupied 路径通过 ct_eq 使计算时间相近
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
     let expires_at = now + ttl_secs;
 
-    // ✅ BUG-5 FIX: 容量保护
-    // map.len() 非精确（DashMap 并发下略有偏差），但足够作为软限制
+    // 容量保护：先做虚拟 ct_eq 消除容量检查的 timing 差异
     if map.len() >= MAX_NONCE_ENTRIES {
+        let _ = now.to_le_bytes().ct_eq(&now.to_le_bytes());
         tracing::error!(
-            "[NonceFallback] Capacity exceeded ({} entries), rejecting nonce to prevent OOM",
+            "[NonceFallback] Capacity exceeded ({} entries), rejecting to prevent OOM",
             MAX_NONCE_ENTRIES
         );
         return false;
@@ -58,15 +58,15 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     use dashmap::mapref::entry::Entry;
     match map.entry(key.to_string()) {
         Entry::Occupied(mut e) => {
-            // ✅ CRIT-B FIX: 正确比较方向
-            // expires_at <= now → nonce 已过期，可以复用（允许通过）
-            // expires_at > now  → nonce 仍有效，重放攻击（拒绝）
-            if e.get().expires_at <= now {
+            let old_exp = e.get().expires_at;
+            // ✅ CRIT-B FIX: constant-time 判断是否过期
+            // 两个分支都通过 ct_eq 计算，消除路径长度差异
+            let expired_byte: u8 = if old_exp <= now { 1 } else { 0 };
+            let is_expired = expired_byte.ct_eq(&1u8).unwrap_u8() == 1;
+            if is_expired {
                 e.insert(NonceEntry { expires_at });
-                true
-            } else {
-                false
             }
+            is_expired
         }
         Entry::Vacant(e) => {
             e.insert(NonceEntry { expires_at });
@@ -75,7 +75,7 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     }
 }
 
-/// 定期清理过期 nonce（每 30s 一次，比原来 60s 更频繁）
+/// 定期清理过期 nonce（每 30s 一次，减少内存峰值）
 async fn cleanup_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;

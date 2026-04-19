@@ -1,9 +1,8 @@
-// client/src/network.rs — 优化版 v9
+// client/src/network.rs — 优化版 v10
 //
-// ✅ BUG-4 FIX: RTT 补偿修正
-//   原始代码: rtt_half = now_secs() - local_ts  ← 实际是完整 RTT！
-//   修复后:  full_rtt = t4 - local_ts; rtt_half = full_rtt / 2  ← 真正的单程延迟
-// ✅ 保留原有: MINOR-A（SERVER_ID 默认值与服务端对齐），MINOR-3（MAX_CLOCK_OFFSET 600s）
+// ✅ BUG-4 FIX: RTT 半程估算修正（full_rtt = T4-T1; rtt_half = full_rtt/2）
+// ✅ MINOR-A FIX: server_id 从 /health 接口获取，而非本地 env var
+// ✅ MINOR-3 FIX: MAX_CLOCK_OFFSET 600s；BUG-3 FIX: 409 冲突码解析
 
 use hmac::{Hmac, Mac};
 use obfstr::obfstr;
@@ -37,6 +36,38 @@ pub struct VerifyResponse {
     pub revoked: bool,
 }
 
+/// ✅ MINOR-A FIX: 从 /health 接口缓存 server_id
+static SERVER_ID_CACHE: OnceLock<String> = OnceLock::new();
+
+async fn fetch_server_id(server_url: &str) -> String {
+    #[derive(Deserialize)]
+    struct HealthResp {
+        server_id: String,
+    }
+    let client = get_http_client();
+    let url = format!("{}/health", server_url);
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            if let Ok(h) = resp.json::<HealthResp>().await {
+                return h.server_id;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[Network] Failed to fetch server_id from /health: {}", e);
+        }
+    }
+    // fallback: 环境变量或默认值
+    std::env::var("SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string())
+}
+
+async fn get_server_id(server_url: &str) -> &'static str {
+    if let Some(id) = SERVER_ID_CACHE.get() {
+        return id;
+    }
+    let id = fetch_server_id(server_url).await;
+    SERVER_ID_CACHE.get_or_init(|| id)
+}
+
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_http_client() -> &'static reqwest::Client {
@@ -63,10 +94,10 @@ pub fn hash_key(hkey: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// 签名格式: HMAC-SHA256(key=hkey, msg=SERVER_ID|key_hash|timestamp)
-/// ✅ MINOR-A: 默认值 "license-server-v1" 与服务端 get_server_id() 对齐
-fn sign_request(hkey: &str, key_hash: &str, ts: i64, _server_url: &str) -> String {
-    let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string());
+/// HMAC-SHA256(key=hkey, msg=server_id|key_hash|timestamp)
+/// ✅ MINOR-A FIX: server_id 从 /health 接口获取
+async fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> String {
+    let server_id = get_server_id(server_url).await;
     let mut mac = HmacSha256::new_from_slice(hkey.as_bytes()).unwrap();
     mac.update(server_id.as_bytes());
     mac.update(b"|");
@@ -86,7 +117,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
             "ERR-NOT-ACTIVATED" | "not activated" => return ERR_NOT_ACTIVATED.to_string(),
             _ => return format!("ERR-FORBIDDEN:{}", err_code),
         },
-        // ✅ BUG-3 FIX 对应：服务端现在返回 409 Conflict 表示未激活
+        // ✅ BUG-3 FIX: 409 Conflict 映射到 ERR-NOT-ACTIVATED
         409 if err_code == "ERR-NOT-ACTIVATED" => return ERR_NOT_ACTIVATED.to_string(),
         _ => {}
     }
@@ -111,7 +142,7 @@ async fn do_verify(
     ts_override: i64,
 ) -> Result<VerifyResponse, String> {
     let key_hash = hash_key(hkey);
-    let signature = sign_request(hkey, &key_hash, ts_override, server_url);
+    let signature = sign_request(hkey, &key_hash, ts_override, server_url).await;
     let req = VerifyRequest {
         key_hash,
         timestamp: ts_override,
@@ -137,57 +168,55 @@ async fn do_verify(
     }
 }
 
-/// 在线验证入口：自动处理时钟偏差（单次重试）
+/// ✅ BUG-4 FIX: 正确的 RTT 半程估算（NTP-style）
 ///
-/// ✅ BUG-4 FIX: RTT 补偿修正
-/// NTP 单向延迟估算（对称假设）：
-///   T1 = local_ts（发出请求前）
-///   T4 = t4（收到响应后）
-///   full_RTT = T4 - T1
-///   rtt_half = full_RTT / 2（单向延迟估算）
-///   corrected_ts = server_ts + rtt_half（响应在途期间服务端时钟走过的时间）
+/// T1 = local_ts（发送前）
+/// T4 = t4（收到响应后）
+/// full_RTT = T4 - T1
+/// rtt_half = full_RTT / 2（正确的单程估算）
+/// corrected_ts = server_ts + rtt_half
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
-    let local_ts = now_secs(); // T1
-    let result = do_verify(hkey, server_url, local_ts).await;
+    let t1 = now_secs(); // T1
+    let result = do_verify(hkey, server_url, t1).await;
 
     match &result {
         Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
             let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
             let server_ts = match server_time_str.parse::<i64>() {
                 Ok(ts) => ts,
-                Err(_) => return Err(e.clone()), // 解析失败，不重试
+                Err(_) => return result,
             };
 
-            // ✅ BUG-4 FIX: 正确的 RTT/2 计算
-            let t4 = now_secs(); // T4: 收到响应后的时间
-            let full_rtt = (t4 - local_ts).max(0); // 完整往返时延
-            let rtt_half = full_rtt / 2; // 单向延迟估算（对称假设）
+            let t4 = now_secs(); // T4：收到响应后
+            let full_rtt = t4 - t1; // ✅ BUG-4 FIX: 完整 RTT = T4 - T1
 
-            // corrected_ts ≈ 服务端当前时间（响应发出后 rtt_half 已过去）
-            let corrected_ts = server_ts + rtt_half;
-
-            let offset = corrected_ts - t4; // 时钟偏差
-
-            if offset.abs() > MAX_CLOCK_OFFSET_SECS {
-                tracing::error!(
-                    "[License] Server clock offset {}s exceeds safe threshold {}s, refusing sync",
-                    offset,
-                    MAX_CLOCK_OFFSET_SECS
+            // 合理性检查：RTT 不应超过超时时间
+            if full_rtt < 0 || full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
+                eprintln!(
+                    "[Network] Unreasonable RTT: {}s, skipping time correction",
+                    full_rtt
                 );
-                return Err(format!(
-                    "server clock offset {}s exceeds safe threshold {}s",
-                    offset, MAX_CLOCK_OFFSET_SECS
-                ));
+                return result;
             }
 
-            if offset.abs() > 60 {
-                tracing::warn!(
-                    "[License] Client clock skew {}s detected, consider NTP sync",
-                    offset
+            let rtt_half = full_rtt / 2; // ✅ 正确半程 RTT
+            let corrected_ts = server_ts + rtt_half; // ✅ NTP-style 校正
+
+            // 验证时钟偏差是否在允许范围内
+            let clock_offset = (t1 - corrected_ts).abs();
+            if clock_offset > MAX_CLOCK_OFFSET_SECS {
+                eprintln!(
+                    "[Network] Clock offset {}s exceeds limit {}s, aborting",
+                    clock_offset, MAX_CLOCK_OFFSET_SECS
                 );
+                return Err(format!("ERR-CLOCK-SKEW:{}", clock_offset));
             }
 
-            // 重试（仅一次）
+            eprintln!(
+                "[Network] Time corrected: local={} server={} rtt_half={}s corrected={}",
+                t1, server_ts, rtt_half, corrected_ts
+            );
+            // 用校正后的时间戳重试
             do_verify(hkey, server_url, corrected_ts).await
         }
         _ => result,

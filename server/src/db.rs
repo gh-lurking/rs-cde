@@ -1,13 +1,11 @@
-// server/src/db.rs — 优化版 v7
+// server/src/db.rs — 优化版 v8
 //
-// ✅ OPT-1 FIX: batch_init_keys 使用 PostgreSQL unnest() 批量 INSERT
-//   原来: count=1000 → 1000 次 DB 往返
-//   现在: count=1000 → 1 次 DB 往返（性能 ~200x）
-// ✅ OPT-5 FIX: 增加 expires_at 部分索引（WHERE revoked=FALSE AND activation_ts>0）
-// ✅ 保留原有：MINOR-1, MINOR-2, LOGIC-A, extend_license 上界钳位
+// ✅ OPT-1 FIX: batch_init_keys 使用 unnest() 批量 INSERT
+// ✅ OPT-5 FIX: expires_at 部分索引（WHERE revoked=FALSE AND activation_ts>0）
+// ✅ LOGIC-A: extend_license 使用 GREATEST(expires_at, now) + extra_secs
 
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -72,26 +70,24 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key TEXT NOT NULL,
-            key_hash TEXT PRIMARY KEY,
+            key          TEXT NOT NULL,
+            key_hash     TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at BIGINT NOT NULL DEFAULT 0,
-            revoked BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at BIGINT NOT NULL,
-            last_check BIGINT,
-            note TEXT NOT NULL DEFAULT ''
+            expires_at   BIGINT NOT NULL DEFAULT 0,
+            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   BIGINT NOT NULL,
+            last_check   BIGINT,
+            note         TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
     .await?;
 
-    // 主键查询索引（point lookup by key_hash）
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_licenses_key_hash ON licenses (key_hash)")
         .execute(&pool)
         .await?;
 
-    // ✅ OPT-5 FIX: expires_at 部分索引（已激活且未撤销）
-    // 覆盖场景：后台任务按过期时间批量查询活跃 key
+    // ✅ OPT-5 FIX: 部分索引，仅覆盖有效且已激活的 key
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires
          ON licenses (expires_at)
@@ -119,6 +115,27 @@ pub async fn find_license(
     .bind(key_hash)
     .fetch_optional(pool)
     .await
+}
+
+pub async fn insert_license(
+    pool: &DbPool,
+    key: &str,
+    key_hash: &str,
+    created_at: i64,
+    note: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO licenses (key, key_hash, created_at, note)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (key_hash) DO NOTHING",
+    )
+    .bind(key)
+    .bind(key_hash)
+    .bind(created_at)
+    .bind(note)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn activate_license(
@@ -162,22 +179,21 @@ pub async fn revoke_license(
 }
 
 /// ✅ LOGIC-A: GREATEST(expires_at, now) + extra_secs
-/// - 已激活未过期: expires_at += extra_secs（从原到期日叠加）
-/// - 已激活已过期: now + extra_secs（从今天起算）
+/// 已过期的 key 从当前时间续期；未过期的从原到期时间续期
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
     extra_secs: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
     let now = now_db();
-    // 防御性钳位（handler 层已校验 extra_days <= 3650）
+    // 最大续期 10年
     let extra_secs = extra_secs.min(315_360_000);
     let row: Option<(i64,)> = sqlx::query_as(
         "UPDATE licenses
          SET expires_at = GREATEST(expires_at, $1) + $2
          WHERE key_hash = $3
            AND revoked = FALSE
-           AND activation_ts > 0  -- 未激活密钥不允许延期
+           AND activation_ts > 0  -- 未激活的 key 不允许续期
          RETURNING expires_at",
     )
     .bind(now)
@@ -197,68 +213,32 @@ pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx
     .await
 }
 
-pub async fn add_key(
-    pool: &DbPool,
-    key: &str,
-    key_hash: &str,
-    expires_at: i64,
-    note: &str,
-) -> Result<bool, sqlx::Error> {
-    let now = now_db();
-    let result = sqlx::query(
-        "INSERT INTO licenses (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
-         VALUES ($1, $2, 0, $3, FALSE, $4, NULL, $5)
-         ON CONFLICT (key_hash) DO NOTHING"
-    ).bind(key).bind(key_hash).bind(expires_at).bind(now).bind(note)
-     .execute(pool).await?;
-    Ok(result.rows_affected() == 1)
-}
-
-/// ✅ OPT-1 FIX: 使用 PostgreSQL unnest() 批量插入，count=1000 仅需 1 次 DB 往返
-/// 原来: for 循环逐条 INSERT → count=1000 次 DB 往返
-/// 现在: 单条 INSERT ... SELECT * FROM unnest(...) → 1 次 DB 往返
+/// ✅ OPT-1 FIX: 使用 unnest() 批量 INSERT，O(1) DB trips
 pub async fn batch_init_keys(
     pool: &DbPool,
-    count: u32,
-    expires_at: i64,
+    keys: &[String],
     note: &str,
-) -> Result<(u64, Vec<String>), sqlx::Error> {
-    let now = now_db();
-    let mut keys: Vec<String> = Vec::with_capacity(count as usize);
-    let mut key_hashes: Vec<String> = Vec::with_capacity(count as usize);
-
-    for _ in 0..count {
-        let hkey = generate_hkey();
-        key_hashes.push(hash_key(&hkey));
-        keys.push(hkey);
+) -> Result<(), sqlx::Error> {
+    if keys.is_empty() {
+        return Ok(());
     }
+    let now = now_db();
+    let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
+    let created_ats = vec![now; keys.len()];
+    let notes = vec![note.to_string(); keys.len()];
 
-    // 批量 INSERT：PostgreSQL unnest() 将数组展开为多行
-    let result = sqlx::query(
-        "INSERT INTO licenses
-           (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
-         SELECT * FROM unnest(
-           $1::text[], $2::text[],
-           $3::bigint[], $4::bigint[],
-           $5::bool[], $6::bigint[],
-           $7::bigint[], $8::text[]
-         )
+    sqlx::query(
+        "INSERT INTO licenses (key, key_hash, created_at, note)
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[])
          ON CONFLICT (key_hash) DO NOTHING",
     )
-    .bind(&keys)
+    .bind(keys)
     .bind(&key_hashes)
-    .bind(vec![0i64; count as usize]) // activation_ts = 0
-    .bind(vec![expires_at; count as usize]) // expires_at
-    .bind(vec![false; count as usize]) // revoked = false
-    .bind(vec![now; count as usize]) // created_at
-    .bind(vec![None::<i64>; count as usize]) // last_check = NULL
-    .bind(vec![note.to_string(); count as usize]) // note
+    .bind(&created_ats)
+    .bind(&notes)
     .execute(pool)
     .await?;
 
-    let rows_affected = result.rows_affected();
-    // 注意：ON CONFLICT DO NOTHING 时实际插入数 <= count
-    // keys 向量保留所有生成的 key（含冲突未插入的）
-    // 调用方可通过 rows_affected 知道实际插入数
-    Ok((rows_affected, keys))
+    tracing::info!("[DB] batch_init_keys: {} keys inserted", keys.len());
+    Ok(())
 }

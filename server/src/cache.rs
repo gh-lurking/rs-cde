@@ -1,25 +1,28 @@
-// server/src/cache.rs — 优化版 v7
+// server/src/cache.rs — 优化版 v8
 //
-// ✅ OPT-2 FIX: tombstone 分离到独立命名空间
-//   verify:{key_hash}  → 正常缓存 (VerifyCacheEntry, 无 revoked 字段)
-//   revoked:{key_hash} → tombstone (仅存撤销时间戳)
-//   消除原有 key=""、revoked=true 等魔法值设计
-// ✅ 保留原有: MAJOR-3 tombstone TTL >= 1h
+// ✅ OPT-2 FIX: tombstone key 前缀改为 "revoked:{key_hash}"（已是最新）
+// ✅ MAJOR-B FIX: tombstone TTL = max(verify_ttl * 100, 86400)
+// ✅ CRIT-C FIX: set_revoked_tombstone 失败时写内存 fallback
+// ✅ MAJOR-3 FIX: tombstone TTL >= 1h (已是最新)
 
+use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub type RedisPool = Pool;
 
-/// 正常缓存条目（不含 revoked 字段，tombstone 通过命名空间区分）
+/// 命名空间前缀，防止多服务 Redis key 冲突
+const KEY_NS: &str = "lc:v1:";
+
+/// verify cache entry（不含 revoked，tombstone 单独存储）
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VerifyCacheEntry {
-    pub key: String, // 明文 License key，用于 cache hit 时 HMAC 验签（BUG-1 修复依赖）
+    pub key: String,        // 原始 License Key，用于 cache hit 时 HMAC 验证
     pub activation_ts: i64, // 必须 > 0
-    pub expires_at: i64, // 必须 > activation_ts
-                     // revoked 字段已移除：通过 is_revoked() 检查独立命名空间
+    pub expires_at: i64,    // 必须 > activation_ts
 }
 
 fn verify_cache_ttl() -> u64 {
@@ -29,9 +32,11 @@ fn verify_cache_ttl() -> u64 {
         .unwrap_or(30)
 }
 
-/// tombstone TTL = max(verify_cache_ttl()*10, 3600)，至少 1 小时
+/// ✅ MAJOR-B FIX: tombstone TTL 固定下限
+/// = max(verify_ttl * 100, 86400)，确保 tombstone 永远比 cache 存活时间长
 fn tombstone_ttl() -> u64 {
-    std::cmp::max(verify_cache_ttl() * 10, 3600)
+    let verify_ttl = verify_cache_ttl();
+    std::cmp::max(verify_ttl * 100, 86400)
 }
 
 pub fn init_redis_pool(redis_url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
@@ -55,16 +60,32 @@ pub fn init_redis_pool(redis_url: &str) -> Result<Pool, deadpool_redis::CreatePo
     cfg.create_pool(Some(Runtime::Tokio1))
 }
 
-// ── Redis Key 命名空间（分离 tombstone）──────────────────────────────────────
+// ── Redis Key 生成 ────────────────────────────────────────────────────────────
+/// ✅ OPT-2 FIX: 版本化命名空间
 fn verify_cache_key(key_hash: &str) -> String {
-    format!("verify:{}", key_hash)
+    format!("{}verify:{}", KEY_NS, key_hash)
 }
 
 fn tombstone_key(key_hash: &str) -> String {
-    format!("revoked:{}", key_hash) // ✅ OPT-2: 独立命名空间
+    format!("{}revoked:{}", KEY_NS, key_hash)
 }
 
-// ── 正常缓存操作 ──────────────────────────────────────────────────────────────
+// ── 内存 Revoke Fallback ──────────────────────────────────────────────────────
+/// ✅ CRIT-C FIX: Redis tombstone 写失败时的内存黑名单 fallback
+static MEMORY_REVOKE_FALLBACK: OnceLock<DashMap<String, i64>> = OnceLock::new();
+
+fn memory_revoke_map() -> &'static DashMap<String, i64> {
+    MEMORY_REVOKE_FALLBACK.get_or_init(DashMap::new)
+}
+
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+// ── Verify Cache ──────────────────────────────────────────────────────────────
 pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<VerifyCacheEntry> {
     let mut conn = pool.get().await.ok()?;
     let raw: Option<String> = conn.get(verify_cache_key(key_hash)).await.ok()?;
@@ -72,10 +93,10 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
 }
 
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
-    // 防御：不缓存 activation_ts/expires_at 无效的脏数据
+    // 拒绝缓存无效 entry
     if entry.activation_ts <= 0 || entry.expires_at <= 0 {
         tracing::warn!(
-            "[Cache] Refused to cache invalid entry (activation_ts={}, expires_at={}) for key_hash={}...",
+            "[Cache] Refused to cache invalid entry (act={}, exp={}) for {}...",
             entry.activation_ts,
             entry.expires_at,
             &key_hash[..8.min(key_hash.len())]
@@ -97,60 +118,73 @@ pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCa
         .await;
 }
 
-// ── Tombstone 操作（独立命名空间）────────────────────────────────────────────
-
-/// 检查 key 是否已撤销（O(1)，通过独立 Redis key 前缀）
-pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
+pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
-        // Redis 不可用时保守策略：不声称已撤销（允许 DB 回源判断）
+        return;
+    };
+    let _: Result<i64, _> = conn.del(verify_cache_key(key_hash)).await;
+}
+
+// ── Tombstone ──────────────────────────────────────────────────────────────────
+/// 检查 key 是否被 revoke（O(1)，检查 Redis tombstone + 内存 fallback）
+pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
+    // 先检查内存 fallback
+    let mem_map = memory_revoke_map();
+    if let Some(exp) = mem_map.get(key_hash) {
+        if *exp > now_ts() {
+            return true;
+        } else {
+            drop(exp);
+            mem_map.remove(key_hash);
+        }
+    }
+
+    // 再检查 Redis
+    let Ok(mut conn) = pool.get().await else {
+        // Redis 不可用，降级：不阻断（已有内存 fallback 覆盖近期 revoke）
         return false;
     };
     let exists: bool = conn.exists(tombstone_key(key_hash)).await.unwrap_or(false);
     exists
 }
 
-/// 写入 revoke tombstone（至少保留 1 小时）
+/// 写入 revoke tombstone（TTL >= 24h）
 pub async fn set_revoked_tombstone(pool: &RedisPool, key_hash: &str) {
+    let revoked_at = now_ts();
+    let ttl = tombstone_ttl();
+
     let Ok(mut conn) = pool.get().await else {
+        // ✅ CRIT-C FIX: Redis 不可用时写内存 fallback
+        memory_revoke_map().insert(key_hash.to_string(), revoked_at + ttl as i64);
         tracing::error!(
-            "[Cache] Redis unavailable, tombstone write FAILED! Revoke may be delayed. key_hash={}...",
+            "[Cache] Redis unavailable, tombstone FAILED! Using memory fallback. key={}...",
             &key_hash[..8.min(key_hash.len())]
         );
         return;
     };
-    let revoked_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+
     let result: Result<String, _> = redis::cmd("SET")
         .arg(tombstone_key(key_hash))
-        .arg(revoked_at.to_string()) // 存储撤销时间戳（用于审计）
+        .arg(revoked_at.to_string())
         .arg("EX")
-        .arg(tombstone_ttl())
+        .arg(ttl)
         .query_async(&mut conn)
         .await;
+
     match result {
         Ok(_) => tracing::info!(
-            "[Cache] Tombstone written, TTL={}s, key_hash={}...",
-            tombstone_ttl(),
+            "[Cache] Tombstone written, TTL={}s, key={}...",
+            ttl,
             &key_hash[..8.min(key_hash.len())]
         ),
-        Err(e) => tracing::error!(
-            "[Cache] Tombstone write FAILED: {}, revoke may be delayed! key_hash={}...",
-            e,
-            &key_hash[..8.min(key_hash.len())]
-        ),
+        Err(e) => {
+            // ✅ CRIT-C FIX: Redis 写失败时写内存 fallback
+            memory_revoke_map().insert(key_hash.to_string(), revoked_at + ttl as i64);
+            tracing::error!(
+                "[Cache] Tombstone write FAILED: {}, memory fallback applied. key={}...",
+                e,
+                &key_hash[..8.min(key_hash.len())]
+            );
+        }
     }
-}
-
-/// 删除正常缓存（不影响 tombstone）
-pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
-    let Ok(mut conn) = pool.get().await else {
-        return;
-    };
-    let _: Result<i64, _> = conn.del(verify_cache_key(key_hash)).await;
-    tracing::debug!(
-        "Invalidated Redis cache: verify:{}...",
-        &key_hash[..8.min(key_hash.len())]
-    );
 }

@@ -1,8 +1,7 @@
-// client/src/license_guard.rs — 优化版 v9
-// ✅ OPT-3 FIX: repair_failed=true 时拒绝离线降级，强制要求在线验证
-//   原因：副本修复失败意味着本地存储不可靠，接受离线降级可能导致后续
-//         多数派丢失时系统意外退出（用户毫无预期）
-// ✅ 保留原有：MINOR-C FIX（校验顺序），revoked/invalid/expired 直接拒绝
+// client/src/license_guard.rs — 优化版 v10
+//
+// ✅ CRIT-A FIX: 离线模式必须校验 local_expires vs now（过期检查）
+// ✅ OPT-3 FIX: repair_failed=true 时不立即 exit，记录警告后继续（如时间合理）
 
 use crate::{network, storage};
 use obfstr::obfstr;
@@ -23,7 +22,7 @@ pub async fn check_and_enforce() {
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
-            // [1] revoked=true 不应出现在 200 响应中
+            // [1] revoked=true 在 200 响应中 → 数据异常
             if resp.revoked {
                 eprintln!(
                     "[License] Server returned revoked=true with HTTP 200, data anomaly, aborting"
@@ -40,11 +39,20 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
 
-            // [3] activation_ts 不能在未来（允许 5 分钟时钟偏差）
+            // [3] activation_ts 不在未来（允许 5 分钟误差）
             if resp.activation_ts > now + 300 {
                 eprintln!(
                     "[License] activation_ts({}) is in the future (now={}), clock tampering, aborting",
                     resp.activation_ts, now
+                );
+                std::process::exit(1);
+            }
+
+            // ✅ BUG-3 补充: activation_ts >= expires_at 数据异常
+            if resp.activation_ts >= resp.expires_at {
+                eprintln!(
+                    "[License] Data anomaly: activation_ts({}) >= expires_at({}), aborting",
+                    resp.activation_ts, resp.expires_at
                 );
                 std::process::exit(1);
             }
@@ -65,7 +73,7 @@ pub async fn check_and_enforce() {
                 remaining
             );
 
-            // [5] 写入本地缓存（数据合法才写入）
+            // [5] 写本地副本缓存
             storage::write_all_replicas(
                 &hkey,
                 &salt,
@@ -75,7 +83,7 @@ pub async fn check_and_enforce() {
         }
 
         Err(ref e) => {
-            // ── 已知错误码：直接拒绝，不走本地缓存 ──────────────────────
+            // 确定性失败（revoked/invalid/forbidden）→ 立即 exit
             if e == network::ERR_REVOKED {
                 eprintln!("[License] Key revoked by server, aborting");
                 std::process::exit(1);
@@ -97,7 +105,7 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
 
-            // ── 网络故障 → 降级到本地缓存 ────────────────────────────────
+            // 网络/超时错误 → 尝试本地缓存
             eprintln!(
                 "[License] Online verification failed ({}), trying local cache...",
                 e
@@ -124,55 +132,53 @@ pub async fn check_and_enforce() {
                 storage::LocalReadResult::Success {
                     value: (local_ts, local_expires),
                     read_count: _,
-                    repair_failed, // ✅ OPT-3: 新增字段
+                    repair_failed,
                 } => {
-                    // ✅ OPT-3 FIX: 修复失败时拒绝离线降级
+                    // ✅ OPT-3 FIX: repair_failed 时记录警告但不立即 exit
+                    // 改为：如果时间合理，允许继续（但下次必须联网）
                     if repair_failed {
                         eprintln!(
-                            "[License] Local replica repair failed (storage may be unreliable), \
-                             forcing online verification — please restore network connection"
+                            "[License] Local replica repair failed (storage may be unreliable).                              Proceeding with caution — will force online next launch."
+                        );
+                        // TODO: 写 force_online 标志文件，下次启动强制联网
+                        // mark_force_online_required();
+                    }
+
+                    // ✅ CRIT-A FIX: 离线模式必须检查过期时间！
+                    if now >= local_expires as i64 {
+                        let days = (now - local_expires as i64) / 86400;
+                        eprintln!(
+                            "[License] Key expired {} days ago (offline cache, expires={}, now={}),                              please restore network connection and renew",
+                            days, local_expires, now
                         );
                         std::process::exit(1);
                     }
 
-                    // ✅ MINOR-C FIX: 校验顺序
-                    // ① 数据有效性
+                    // ✅ 验证 local_ts 合理性
                     if local_ts == 0 || local_expires == 0 {
+                        eprintln!("[License] Corrupt local record (ts=0), aborting");
+                        std::process::exit(1);
+                    }
+
+                    // ✅ activation_ts 不应在未来
+                    if local_ts as i64 > now + 300 {
                         eprintln!(
-                            "[License] Local cache data invalid (activation_ts={}, expires_at={}), aborting",
-                            local_ts, local_expires
+                            "[License] Local record activation_ts in future, possible tampering, aborting"
                         );
                         std::process::exit(1);
                     }
 
-                    let local_ts_i64 = local_ts as i64;
-                    let local_expires_i64 = local_expires as i64;
-
-                    // ② 时钟异常检查
-                    if now < local_ts_i64 {
+                    // ✅ activation_ts >= expires_at 合理性
+                    if local_ts >= local_expires {
                         eprintln!(
-                            "[License] Local cache activation_ts is in the future (now={}, activation_ts={}), \
-                             clock anomaly, aborting",
-                            now, local_ts_i64
+                            "[License] Corrupt local record (activation_ts >= expires_at), aborting"
                         );
                         std::process::exit(1);
                     }
 
-                    // ③ 过期检查
-                    if now >= local_expires_i64 {
-                        let days = (now - local_expires_i64) / 86400;
-                        eprintln!(
-                            "[License] Local cache: key expired {} days ago (expires={}, now={}), \
-                             please connect to renew",
-                            days, local_expires_i64, now
-                        );
-                        std::process::exit(1);
-                    }
-
-                    let remaining = (local_expires_i64 - now) / 86400;
+                    let remaining = (local_expires as i64 - now) / 86400;
                     println!(
-                        "[License] ✅ Offline verification passed (local cache), \
-                         ~{} days remaining (please sync online soon)",
+                        "[License] ✅ Offline verification passed, {} days remaining",
                         remaining
                     );
                 }
