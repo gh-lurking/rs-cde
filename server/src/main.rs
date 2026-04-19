@@ -1,11 +1,10 @@
-// server/src/main.rs
-// m-01 FIX: 默认绑定地址改为 127.0.0.1
-// m-03 FIX: 添加优雅关停支持
-
+// server/src/main.rs — 优化版 v2
+// ✅ OPT-MAJOR-4: 注册 nonce_fallback 模块
 mod auth;
 mod cache;
 mod db;
 mod handlers;
+mod nonce_fallback; // ✅ 新增：内存 nonce 降级模块
 
 use axum::{
     Extension, Router,
@@ -19,20 +18,21 @@ use tower_http::trace::TraceLayer;
 async fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let database_url = std::env::var("DATABASE_URL").expect("请配置 DATABASE_URL 环境变量");
+    let database_url = std::env::var("DATABASE_URL").expect("Please set up the DATABASE_URL env");
     let pg_pool = db::init_pool(&database_url)
         .await
-        .expect("PostgreSQL 连接/建表失败");
+        .expect("PostgreSQL Connection Failure");
     let pg_pool = Arc::new(pg_pool);
-    tracing::info!("✅ PostgreSQL 连接池就绪");
+    tracing::info!("✅ PostgreSQL Connection Pool is ready");
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
-    let redis_pool = cache::init_redis_pool(&redis_url).expect("Redis 连接池初始化失败");
+    let redis_pool =
+        cache::init_redis_pool(&redis_url).expect("Redis Connection Pool Initialization Failure");
     let redis_pool = Arc::new(redis_pool);
-    tracing::info!("✅ Redis 连接池就绪 (deadpool-redis)");
+    tracing::info!("✅ Redis Connection Pool is ready (deadpool-redis)");
 
-    let admin_token = std::env::var("ADMIN_TOKEN").expect("请配置 ADMIN_TOKEN 环境变量");
+    let admin_token = std::env::var("ADMIN_TOKEN").expect("Please set up the ADMIN_TOKEN env");
     let admin_token = Arc::new(admin_token);
 
     let app = Router::new()
@@ -44,18 +44,16 @@ async fn main() {
         .route("/admin/extend", post(handlers::extend_license))
         .route("/admin/add-key", post(handlers::add_key))
         .route("/admin/batch-init", post(handlers::batch_init))
-        .layer(DefaultBodyLimit::max(65536)) // BUG-06 FIX: 限制请求体最大 64KB
+        .layer(DefaultBodyLimit::max(65536))
         .layer(Extension(pg_pool))
         .layer(Extension(redis_pool))
         .layer(Extension(admin_token))
         .layer(TraceLayer::new_for_http());
 
-    // m-01 FIX: 默认绑定 127.0.0.1 而非 0.0.0.0
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    tracing::info!("License Server 监听于 {}", bind_addr);
+    tracing::info!("License Server is running on {}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
-    // m-03 FIX: 优雅关停
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

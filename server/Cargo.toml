@@ -5,41 +5,39 @@ edition = "2024"
 
 [dependencies]
 # ── Web 框架 ──────────────────────────────────────────────────────────────────
-axum        = "0.7"
-tokio       = { version = "1", features = ["full"] }
-tower-http  = { version = "0.5", features = ["trace"] }
-# ── PostgreSQL 连接池（sqlx 已包含 PgPoolOptions）────────────────────────────
-# ✅ 要点: 启用 macros 使 query! 宏可用
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace"] }
+
+# ── PostgreSQL 连接池 ──────────────────────────────────────────────────────────
 sqlx = { version = "0.7", features = [
     "postgres",
     "runtime-tokio-rustls",
-    "macros",            # ✅ 启用: query! 宏可用
+    "macros",
 ] }
-# ── ✅ 要点: Redis 连接池 + 异步操作 ──────────────────────────────────────────
-# redis: 底层异步命令库
-redis = { version = "0.25", features = [
-    "tokio-comp",        # tokio 兼容层
-    "connection-manager", # 连接管理器
-] }
-# deadpool-redis: 生产级 Redis 连接池
+
+# ── Redis ───────────────────────────────────────────────────────────────────────
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 deadpool-redis = { version = "0.15", features = ["rt_tokio_1"] }
 
-# UUID 用于生成唯一 License Key
+# ✅ OPT-MAJOR-4: 内存 nonce 降级（DashMap 线程安全哈希表）
+dashmap = "5"
+
+# UUID
 uuid = { version = "1", features = ["v4"] }
 
 # 序列化
-serde      = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
 # 追踪
-tracing             = "0.1"
-tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 sha2 = "0.10.8"
-hex  = "0.4"
+hex = "0.4"
 hmac = "0.12.1"
 
-# BUG-C FIX: 内存降级 nonce 存储需要 Lazy
-# once_cell = "1"
 
 [profile.release]
 opt-level = 3

@@ -1,10 +1,8 @@
-// client/src/license_guard.rs — 优化版 v4
+// client/src/license_guard.rs — 优化版 v5
 //
-// ✅ FIX CRIT-1: 移除 Ok(resp) 中多余的 resp.revoked 检查
-//                服务端 revoked 通过 Err(ERR-REVOKED) 路径处理，Ok 分支不会携带 revoked=true
-// ✅ FIX MAJOR-1: 修正状态检查顺序（activation_ts==0 先于 expires_at）
-//                 防止 activation_ts=0 且 expires_at=0 时误报「已过期 xxx 天」
-// ✅ FIX CRIT-3: 识别 ERR-FORBIDDEN:* 通用业务拒绝前缀
+// ✅ OPT-MINOR-3: 移除 Ok(resp) 分支中的冗余双重条件检查（dead code 消除）
+// ✅ 保留所有原有修复（FIX CRIT-1/MAJOR-1/CRIT-3）
+// ✅ 新增：写缓存前卫语句仅保留一次，逻辑更清晰
 
 use crate::{network, storage};
 use obfstr::obfstr;
@@ -26,12 +24,11 @@ pub async fn check_and_enforce() {
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
-            // ✅ FIX MAJOR-1: 正确顺序：activation_ts==0 先于 expires_at
-            // 注意：服务端 verify() 在 revoked/not-activated/expired 时返回非 2xx，
-            //       所以这里的 Ok(resp) 理论上只有「正常已激活未过期」状态。
-            //       但做防御性检查，顺序必须正确。
+            // 服务端 verify() 在 revoked/not-activated/expired 时返回非 2xx，
+            // 所以 Ok(resp) 只有「正常已激活未过期」状态。
+            // ✅ OPT-MINOR-3: 只做一次检查，移除冗余的写缓存前二次检查
 
-            // 未激活（activation_ts=0 时 expires_at 可能也是 0，不能先判 expires_at）
+            // 未激活（activation_ts=0 先于 expires_at，防 expires_at=0 误报）
             if resp.activation_ts == 0 {
                 eprintln!("[License] Key 尚未激活，请先完成激活");
                 std::process::exit(1);
@@ -44,28 +41,19 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
 
-            // ✅ FIX CRIT-1: 不再检查 resp.revoked
             // 服务端在 revoked=true 时返回 403+ERR-REVOKED → Err(ERR-REVOKED) → exit(1)
-            // Ok 分支到达这里时 revoked 必然为 false（服务端保证）
+            // Ok 分支到达这里时 revoked 必然为 false（服务端保证），无需检查
 
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] ✅ 在线校验通过，剩余 {} 天", remaining);
 
-            // 同步最新数据到本地三份副本（仅在状态合法时写入）
-            if resp.activation_ts > 0 && resp.expires_at > now {
-                storage::write_all_replicas(
-                    &hkey,
-                    &salt,
-                    resp.activation_ts as u64,
-                    resp.expires_at as u64,
-                );
-            } else {
-                tracing::warn!(
-                    "[License] 服务端返回异常时间戳，跳过本地缓存写入                      activation_ts={} expires_at={}",
-                    resp.activation_ts,
-                    resp.expires_at
-                );
-            }
+            // ✅ OPT-MINOR-3: 直接写入（前置检查已保证状态合法，移除重复的 if 条件）
+            storage::write_all_replicas(
+                &hkey,
+                &salt,
+                resp.activation_ts as u64,
+                resp.expires_at as u64,
+            );
         }
 
         Err(ref e) => {
@@ -87,7 +75,7 @@ pub async fn check_and_enforce() {
                 eprintln!("[License] 许可证已过期（服务端确认），立即退出");
                 std::process::exit(1);
             }
-            // ✅ FIX CRIT-3: 识别 ERR-FORBIDDEN:* 通用业务拒绝
+            // ERR-FORBIDDEN:* 通用业务拒绝
             if e.starts_with("ERR-FORBIDDEN:") {
                 eprintln!("[License] 服务端业务拒绝 ({})，立即退出", e);
                 std::process::exit(1);
