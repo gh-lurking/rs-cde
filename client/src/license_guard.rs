@@ -1,19 +1,23 @@
-// client/src/license_guard.rs — 优化版 v3
-// [FIX-1] ERR_EXPIRED 作为业务拒绝处理，立即退出，不走离线缓存
-// CRIT-3 FIX: 业务拒绝错误码触发立即退出
-// MINOR-1 FIX: 本地副本读取延迟到在线校验失败后（lazy evaluation）
+// client/src/license_guard.rs — 优化版 v4
+//
+// ✅ FIX CRIT-1: 移除 Ok(resp) 中多余的 resp.revoked 检查
+//                服务端 revoked 通过 Err(ERR-REVOKED) 路径处理，Ok 分支不会携带 revoked=true
+// ✅ FIX MAJOR-1: 修正状态检查顺序（activation_ts==0 先于 expires_at）
+//                 防止 activation_ts=0 且 expires_at=0 时误报「已过期 xxx 天」
+// ✅ FIX CRIT-3: 识别 ERR-FORBIDDEN:* 通用业务拒绝前缀
+
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub async fn check_and_enforce() {
     let hkey = std::env::var("HKEY").unwrap_or_else(|_| {
-        eprintln!("[License] 未找到 HKEY 环境变量，请激活");
+        eprintln!("[License] No HKEY provided");
         std::process::exit(1);
     });
 
     let salt = obfstr!("PROG_ACTIVATION_SALT_V1_SECRET").to_owned();
-    let server_url = obfstr!("http://localhost:1000").to_owned();
+    let server_url = obfstr!("http://localhost:8080").to_owned();
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -22,29 +26,32 @@ pub async fn check_and_enforce() {
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
-            // 服务端已撤销
-            if resp.revoked {
-                eprintln!("[License] 许可证已被吊销，请联系支持");
+            // ✅ FIX MAJOR-1: 正确顺序：activation_ts==0 先于 expires_at
+            // 注意：服务端 verify() 在 revoked/not-activated/expired 时返回非 2xx，
+            //       所以这里的 Ok(resp) 理论上只有「正常已激活未过期」状态。
+            //       但做防御性检查，顺序必须正确。
+
+            // 未激活（activation_ts=0 时 expires_at 可能也是 0，不能先判 expires_at）
+            if resp.activation_ts == 0 {
+                eprintln!("[License] Key 尚未激活，请先完成激活");
                 std::process::exit(1);
             }
 
-            // 服务端已过期
+            // 已过期（activation_ts>0 时 expires_at 才有意义）
             if now >= resp.expires_at {
                 let days = (now - resp.expires_at) / 86400;
                 eprintln!("[License] 许可证已过期 {} 天，请联系支持", days);
                 std::process::exit(1);
             }
 
-            // 未激活
-            if resp.activation_ts == 0 {
-                eprintln!("[License] Key 尚未激活，请先完成激活");
-                std::process::exit(1);
-            }
+            // ✅ FIX CRIT-1: 不再检查 resp.revoked
+            // 服务端在 revoked=true 时返回 403+ERR-REVOKED → Err(ERR-REVOKED) → exit(1)
+            // Ok 分支到达这里时 revoked 必然为 false（服务端保证）
 
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] ✅ 在线校验通过，剩余 {} 天", remaining);
 
-            // 同步最新数据到本地三份副本
+            // 同步最新数据到本地三份副本（仅在状态合法时写入）
             if resp.activation_ts > 0 && resp.expires_at > now {
                 storage::write_all_replicas(
                     &hkey,
@@ -54,7 +61,7 @@ pub async fn check_and_enforce() {
                 );
             } else {
                 tracing::warn!(
-                    "[License] 服务端返回异常时间戳，跳过本地缓存写入 activation_ts={} expires_at={}",
+                    "[License] 服务端返回异常时间戳，跳过本地缓存写入                      activation_ts={} expires_at={}",
                     resp.activation_ts,
                     resp.expires_at
                 );
@@ -62,7 +69,8 @@ pub async fn check_and_enforce() {
         }
 
         Err(ref e) => {
-            // CRIT-3 FIX: 业务明确拒绝 → 立即退出，不走离线缓存
+            // ── 业务明确拒绝 → 立即退出，不走离线缓存 ──────────────────────
+
             if e == network::ERR_REVOKED {
                 eprintln!("[License] 许可证已被吊销（服务端确认），立即退出");
                 std::process::exit(1);
@@ -75,13 +83,17 @@ pub async fn check_and_enforce() {
                 eprintln!("[License] License Key 尚未激活（服务端确认），立即退出");
                 std::process::exit(1);
             }
-            // [FIX-1] 新增: 过期也是业务拒绝，不走离线缓存
             if e == network::ERR_EXPIRED {
                 eprintln!("[License] 许可证已过期（服务端确认），立即退出");
                 std::process::exit(1);
             }
+            // ✅ FIX CRIT-3: 识别 ERR-FORBIDDEN:* 通用业务拒绝
+            if e.starts_with("ERR-FORBIDDEN:") {
+                eprintln!("[License] 服务端业务拒绝 ({})，立即退出", e);
+                std::process::exit(1);
+            }
 
-            // 真正的网络错误 → 降级到本地缓存
+            // ── 真正的网络错误 → 降级到本地缓存 ────────────────────────────
             eprintln!("[License] 在线校验失败（{}），使用本地缓存校验", e);
 
             let local_result = storage::read_local_record(&hkey, &salt);

@@ -1,27 +1,27 @@
-// client/src/network.rs — 优化版 v4
-// [FIX-1] 新增 ERR_EXPIRED 常量 + parse_server_error 处理
-//   原Bug: 服务端返回 ERR-EXPIRED (402) 时，客户端不识别此错误码，
-//   将其当作网络错误降级到离线缓存，若客户端时钟落后则可能绕过过期校验。
-// M-04 FIX: 用 loop + retried flag 替代 async_recursion
-// CRIT-3 FIX: 明确区分业务拒绝错误码与网络错误
-// MAJOR-3 FIX: 时钟重试严格限制为一次
+// client/src/network.rs — 优化版 v5
+//
+// ✅ FIX CRIT-3: parse_server_error 识别 HTTP 410 (ERR-EXPIRED) / 403 (ERR-NOT-ACTIVATED)
+// ✅ FIX MINOR-2: 签名消息加入 SERVER_ID，防跨服务重放
+// 保留: loop + retried flag（防无限重试），时钟偏差超阈值拒绝修正
 
 use hmac::{Hmac, Mac};
+use obfstr::obfstr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
+
 /// 时钟偏差安全阈值（±600s = ±10分钟）
 const MAX_CLOCK_OFFSET_SECS: i64 = 600;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-/// 业务拒绝错误前缀
+/// 业务拒绝错误码（与 license_guard.rs 对应）
 pub const ERR_REVOKED: &str = "ERR-REVOKED";
 pub const ERR_INVALID_KEY: &str = "ERR-INVALID-KEY";
 pub const ERR_NOT_ACTIVATED: &str = "ERR-NOT-ACTIVATED";
-pub const ERR_EXPIRED: &str = "ERR-EXPIRED"; // [FIX-1] 新增过期错误码
+pub const ERR_EXPIRED: &str = "ERR-EXPIRED";
 
 #[derive(Serialize)]
 struct VerifyRequest {
@@ -63,59 +63,84 @@ pub fn hash_key(hkey: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
+/// ✅ FIX MINOR-2: 签名消息加入 SERVER_ID，防跨服务重放
+/// server_url 用于标识目标服务，需与服务端 SERVER_ID 环境变量一致
+fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> String {
+    // 使用 SERVER_ID 环境变量，若未设置则 fallback 到 server_url
+    let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| server_url.to_string());
     let mut mac = HmacSha256::new_from_slice(hkey.as_bytes()).unwrap();
+    // 消息格式: server_id|key_hash|timestamp（与服务端 verify_hmac_signature 对齐）
+    mac.update(server_id.as_bytes());
+    mac.update(b"|");
     mac.update(key_hash.as_bytes());
     mac.update(b"|");
     mac.update(ts.to_string().as_bytes());
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-/// 解析非 2xx 响应，明确区分业务错误与网络错误
+/// ✅ FIX CRIT-3: 识别 410 Gone (ERR-EXPIRED) 和 403 (ERR-NOT-ACTIVATED/ERR-REVOKED)
+/// 明确区分业务拒绝错误与网络错误，防止过期/未激活被当作网络错误降级
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
-    match err_code {
-        "ERR-REVOKED" | "key revoked" => return ERR_REVOKED.to_string(),
-        "ERR-INVALID-KEY" | "invalid key" => return ERR_INVALID_KEY.to_string(),
-        "ERR-NOT-ACTIVATED" | "not activated" => return ERR_NOT_ACTIVATED.to_string(),
-        "ERR-EXPIRED" | "expired" => return ERR_EXPIRED.to_string(), // [FIX-1] 新增
+
+    // 先按 HTTP 状态码快速判断（防 body 被截断）
+    match status.as_u16() {
+        // 410 Gone → 明确表示已过期（FIX CRIT-3）
+        410 => return ERR_EXPIRED.to_string(),
+        // 403 Forbidden → 可能是 revoked / invalid key / not activated
+        403 => match err_code {
+            "ERR-REVOKED" | "key revoked" => return ERR_REVOKED.to_string(),
+            "ERR-INVALID-KEY" | "invalid key" => return ERR_INVALID_KEY.to_string(),
+            "ERR-NOT-ACTIVATED" | "not activated" => return ERR_NOT_ACTIVATED.to_string(),
+            _ => {
+                // 未知 403：保守处理，返回明确的业务拒绝字符串
+                return format!("ERR-FORBIDDEN:{}", err_code);
+            }
+        },
         _ => {}
     }
+
+    // 兜底：按 error 字段字符串匹配（兼容旧版服务端）
+    match err_code {
+        "ERR-REVOKED" => return ERR_REVOKED.to_string(),
+        "ERR-INVALID-KEY" => return ERR_INVALID_KEY.to_string(),
+        "ERR-NOT-ACTIVATED" => return ERR_NOT_ACTIVATED.to_string(),
+        "ERR-EXPIRED" => return ERR_EXPIRED.to_string(),
+        _ => {}
+    }
+
     if err_code == "ERR-TIME-RECORD" {
         if let Some(st) = body["server_time"].as_i64() {
             return format!("ERR-TIME-RECORD:server_time={}", st);
         }
     }
+
     format!("HTTP {} {}", status.as_u16(), err_code)
 }
 
 async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<VerifyResponse, String> {
     let ts = now_secs() + ts_offset;
     let key_hash = hash_key(hkey);
-    let signature = sign_request(hkey, &key_hash, ts);
-
+    // ✅ FIX MINOR-2: 传入 server_url 参与签名
+    let signature = sign_request(hkey, &key_hash, ts, server_url);
     let req = VerifyRequest {
         key_hash,
         timestamp: ts,
         signature,
     };
-
     let url = format!("{}/verify", server_url);
     let client = get_http_client();
-
     let resp = client
         .post(&url)
         .json(&req)
         .send()
         .await
         .map_err(|e| e.to_string())?;
-
     let status = resp.status();
     let body: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("JSON decode error: {e}"))?;
-
     if status.is_success() {
         serde_json::from_value(body).map_err(|e| e.to_string())
     } else {
@@ -123,8 +148,7 @@ async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<Verif
     }
 }
 
-/// 用 loop + retried flag 替代 async_recursion
-/// 时钟重试严格限制一次，防无限重试
+/// 在线验证，时钟重试严格限制一次，防无限重试
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let mut ts_offset = 0i64;
     let mut retried = false;

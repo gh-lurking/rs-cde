@@ -39,7 +39,7 @@ async fn main() {
         .route("/activate", post(handlers::activate))
         .route("/verify", post(handlers::verify))
         .route("/health", get(handlers::health))
-        .route("/admin/licenses", post(handlers::list_licenses))
+        .route("/admin/licenses", get(handlers::list_licenses))
         .route("/admin/revoke", post(handlers::revoke_license))
         .route("/admin/extend", post(handlers::extend_license))
         .route("/admin/add-key", post(handlers::add_key))

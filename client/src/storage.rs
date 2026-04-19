@@ -1,7 +1,9 @@
-// client/src/storage.rs — 优化版 v3
-// C-02 FIX: 修复 import 路径，使用 aes_gcm::aead::{Aead, KeyInit, OsRng}
-// C-03 FIX: 确保导入 KeyInit trait
-// M-01 FIX: 使用 HKDF-SHA256 替代 SHA256 截断进行密钥派生
+// client/src/storage.rs — 优化版 v4
+//
+// ✅ FIX MAJOR-2: 单副本时返回 Insufficient（不再自愈）
+//                 单副本无法区分正常丢失与篡改，必须在线校验后才能信任
+// 保留: AES-128-GCM + HKDF-SHA256 + OsRng nonce + 多数投票 + 2/3自愈
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     Aes128Gcm, Key, Nonce,
     aead::{Aead, KeyInit, OsRng},
@@ -10,7 +12,6 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
-use aes_gcm::aead::rand_core::RngCore;
 
 pub enum LocalReadResult {
     Success {
@@ -25,8 +26,7 @@ pub enum LocalReadResult {
     },
 }
 
-/// M-01 FIX: 使用 HKDF-SHA256 派生加密密钥（替代原始 SHA256 截断）
-/// info = b"aes-key" 固定标签，确保与 path 派生使用不同上下文
+/// HKDF-SHA256 派生加密密钥（16 字节，用于 AES-128-GCM）
 fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), hkey.as_bytes());
     let mut okm = [0u8; 16];
@@ -82,7 +82,7 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     let data = fs::read(path).ok()?;
     if data.len() != 44 {
         return None;
-    }
+    } // 12 nonce + 32 ciphertext(16 plain + 16 GCM tag)
     let stored_nonce = &data[..12];
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
@@ -96,42 +96,29 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     Some((act, exp))
 }
 
-/// 单副本时尝试自愈，0 副本才 Insufficient
+/// ✅ FIX MAJOR-2: 单副本 → Insufficient（不再自愈）
+/// 0副本 → Insufficient
+/// 1副本 → Insufficient（无法区分正常丢失 vs 篡改，需在线校验）
+/// 2-3副本 → 多数投票，修复少数异常副本
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::new();
-
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
         if let Some(pair) = read_slot(&path, &key) {
             values.push(pair);
         }
     }
-
     let read_count = values.len();
 
-    if read_count == 0 {
-        return LocalReadResult::Insufficient { read_count: 0 };
-    }
-
-    if read_count == 1 {
-        let only_val = values[0];
-        tracing::warn!("[Storage] 仅找到 1/3 个副本，尝试自愈其余副本");
-        for slot in 0..3u8 {
-            let path = derive_path(hkey, salt, slot);
-            let existing = read_slot(&path, &key);
-            if existing != Some(only_val) {
-                if let Err(e) = write_slot(&path, &key, only_val.0, only_val.1) {
-                    tracing::warn!("[Storage] 自愈副本 {} 失败: {}", slot, e);
-                } else {
-                    tracing::info!("[Storage] 已自愈副本 {}", slot);
-                }
-            }
+    // ✅ FIX MAJOR-2: 0副本 或 1副本 → Insufficient，要求在线校验
+    if read_count <= 1 {
+        if read_count == 1 {
+            tracing::warn!(
+                "[Storage] 仅找到 1/3 个副本，无法区分正常丢失 vs 篡改，                 需在线校验后重写。退出以强制在线校验。"
+            );
         }
-        return LocalReadResult::Success {
-            value: only_val,
-            read_count: 1,
-        };
+        return LocalReadResult::Insufficient { read_count };
     }
 
     // read_count >= 2：多数投票
@@ -146,7 +133,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
     if best_count * 2 > read_count {
-        // 修复不一致的副本
+        // 修复不一致的少数副本
         if best_count < read_count {
             for slot in 0..3u8 {
                 let path = derive_path(hkey, salt, slot);
@@ -168,10 +155,12 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             read_count,
         }
     } else {
+        // 无多数共识（如 1:1 分裂）→ Tampered
         LocalReadResult::Tampered { read_count }
     }
 }
 
+/// 在线校验成功后，写入全部三个副本
 pub fn write_all_replicas(hkey: &str, salt: &str, activation: u64, expires: u64) {
     let key = derive_key(hkey, salt);
     for slot in 0..3u8 {
