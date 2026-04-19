@@ -1,7 +1,6 @@
 // server/src/db.rs — 优化版 v5
 // ✅ MINOR-1 FIX: extend_license SQL 加 AND activation_ts > 0（未激活密钥不允许延期）
 // ✅ MINOR-2 FIX: batch_init_keys 返回 (rows_affected, Vec<String>) 包含 key 列表
-
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,22 +64,20 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .max_lifetime(Duration::from_secs(1800))
         .connect(database_url)
         .await?;
-
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key          TEXT NOT NULL,
-            key_hash     TEXT PRIMARY KEY,
+            key TEXT NOT NULL,
+            key_hash TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at   BIGINT NOT NULL DEFAULT 0,
-            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   BIGINT NOT NULL,
-            last_check   BIGINT,
-            note         TEXT NOT NULL DEFAULT ''
+            expires_at BIGINT NOT NULL DEFAULT 0,
+            revoked BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at BIGINT NOT NULL,
+            last_check BIGINT,
+            note TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
     .await?;
-
     tracing::info!(
         "PostgreSQL pool ready: max={} min={} acquire=5s idle=600s lifetime=1800s",
         max_conn,
@@ -209,7 +206,6 @@ pub async fn batch_init_keys(
     let now = now_db();
     let mut keys = Vec::with_capacity(count as usize);
     let mut rows_affected = 0u64;
-
     for _ in 0..count {
         let hkey = generate_hkey();
         let key_hash = hash_key(&hkey);

@@ -1,32 +1,28 @@
 // client/src/storage.rs — 优化版 v6
-// ✅ MAJOR-4 FIX: read_count < 2 => Insufficient（原始 bug 是 < 1）
-// 注意：read_count=1 时无法做多数投票，Insufficient 让上层决策（不直接 exit）
-// ✅ 说明: 3 副本 AES-128-GCM 加密存储，HKDF-SHA256 派生密钥，OsRng nonce
-
-use aes_gcm::aead::rand_core::RngCore;
+// ✅ MAJOR-4 FIX: read_count < 2 时返回 Insufficient（原始 bug 是 < 1）
+// ✅ 三副本多数投票（2/3），read_count=1 时单票通过的漏洞已修复
 use aes_gcm::{
-    Aes128Gcm, Key, Nonce,
-    aead::{Aead, KeyInit, OsRng},
+    AeadCore, Aes128Gcm, Key, KeyInit, Nonce,
+    aead::{Aead, OsRng},
+    aead::rand_core::RngCore,
 };
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
 
 pub enum LocalReadResult {
+    /// 可读副本不足（<2个），无法执行多数投票
+    Insufficient { read_count: usize },
+    /// 可读副本 >=2 但无多数共识（均不同），怀疑被篡改
+    Tampered { read_count: usize },
+    /// 多数投票通过，value=(activation_ts, expires_at)
     Success {
         value: (u64, u64),
         read_count: usize,
     },
-    Tampered {
-        read_count: usize,
-    },
-    Insufficient {
-        read_count: usize,
-    },
 }
 
-/// HKDF-SHA256 派生 16 字节 AES-128-GCM 密钥
 fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), hkey.as_bytes());
     let mut okm = [0u8; 16];
@@ -37,6 +33,7 @@ fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
 
 fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
     let mut h = Sha256::new();
+    use sha2::Digest;
     h.update(salt.as_bytes());
     h.update(hkey.as_bytes());
     let d = h.finalize();
@@ -97,7 +94,7 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     Some((act, exp))
 }
 
-/// ✅ MAJOR-4 FIX: read_count < 2 => Insufficient（无法做多数投票）
+/// ✅ MAJOR-4 FIX: read_count < 2 时返回 Insufficient（无法做多数投票）
 ///
 /// 多数投票规则（read_count >= 2）:
 /// - 2个副本，2:0 => best_count=2, 2*2=4 > 2 => Success ✓
@@ -116,12 +113,11 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     }
     let read_count = values.len();
 
-    // ✅ MAJOR-4 FIX: read_count < 2 时无法做多数投票，返回 Insufficient
+    // ✅ MAJOR-4 FIX: read_count < 2 时无法多数投票，直接返回 Insufficient
     if read_count < 2 {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // read_count >= 2：执行多数投票
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(entry) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -130,6 +126,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
+
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
     if best_count * 2 > read_count {

@@ -161,8 +161,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                             tracing::warn!("[License] 客户端时钟偏差 {}s，建议同步 NTP", offset);
                         }
                         ts_offset = offset;
-                        retried = true;
-                        // 继续 loop，使用 ts_offset 重试
+                        retried = true; // 继续 loop，使用 ts_offset 重试
                     }
                     Err(_) => {
                         // ✅ 解析失败，返回原始错误，不无限重试

@@ -1,7 +1,6 @@
 // server/src/cache.rs — 优化版 v5
 // ✅ MAJOR-3 FIX: tombstone 使用 tombstone_ttl()（min 1h）而非 verify_cache_ttl()（30s）
 // ✅ 说明: tombstone key 字段为空字符串，handlers 中 cache hit 分支应优先检查 revoked 字段
-
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -31,7 +30,7 @@ fn tombstone_ttl() -> u64 {
     std::cmp::max(base * 10, 3600)
 }
 
-pub fn init_redis_pool(redis_url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
+pub fn init_redis_pool(redis_url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolError> {
     let max_size: usize = std::env::var("REDIS_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -65,23 +64,16 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
     // ✅ 防御：不缓存 revoked 的 entry（应用 set_revoked_tombstone）
     // 不缓存 activation_ts=0 或 expires_at=0 的脏数据
-    if entry.revoked || entry.activation_ts <= 0 || entry.expires_at <= 0 || entry.key.is_empty() {
-        tracing::warn!(
-            "[Cache] 拒绝缓存异常 entry (revoked={}, activation_ts={}, expires_at={}, key_empty={})",
-            entry.revoked,
-            entry.activation_ts,
-            entry.expires_at,
-            entry.key.is_empty()
-        );
+    if entry.revoked || entry.activation_ts <= 0 || entry.expires_at <= 0 {
         return;
     }
-    let Ok(mut conn) = pool.get().await else {
-        return;
-    };
     let Ok(json) = serde_json::to_string(entry) else {
         return;
     };
-    let _: Result<String, _> = redis::cmd("SET")
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+    let _: Result<Option<String>, _> = redis::cmd("SET")
         .arg(cache_key(key_hash))
         .arg(&json)
         .arg("EX")
@@ -136,7 +128,7 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let _: Result<u64, _> = conn.del(cache_key(key_hash)).await;
+    let _: Result<(), _> = conn.del(cache_key(key_hash)).await;
     tracing::debug!(
         "Invalidated Redis Cache: verify:{}",
         &key_hash[..8.min(key_hash.len())]

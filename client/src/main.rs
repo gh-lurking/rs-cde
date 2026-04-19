@@ -25,7 +25,7 @@ async fn loc_detection() {
     // 复用同一 HTTP Client（已有连接池，避免重复创建）
     let client: Client = geo_check::build_http_client();
 
-    // ── 检测 1: 公网 IP + CN CIDR 匹配 ──────────────────────────────────────
+    // ── 检测 1: 公网 IP + CN CIDR 匹配 ────────────────────────────────────
     println!("[1] DETECTION ONE ...");
     match geo_check::check_public_ip_cidr(client.clone()).await {
         Ok(true) => {

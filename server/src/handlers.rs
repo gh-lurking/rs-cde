@@ -14,6 +14,7 @@ use axum::{
 };
 use cache::{RedisPool, VerifyCacheEntry};
 use db::DbPool;
+
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +24,6 @@ use uuid::Uuid;
 
 // ✅ OPT: 缓存 SERVER_ID，避免每次验签读环境变量
 static SERVER_ID: OnceLock<String> = OnceLock::new();
-
 fn get_server_id() -> &'static str {
     SERVER_ID.get_or_init(|| std::env::var("SERVER_ID").unwrap_or_default())
 }
@@ -48,7 +48,6 @@ fn validate_key_hash(key_hash: &str) -> bool {
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
-    // ✅ OPT: 使用缓存的 SERVER_ID
     let server_id = get_server_id();
     let mut mac = match HmacSha256::new_from_slice(key.as_bytes()) {
         Ok(m) => m,
@@ -135,7 +134,7 @@ async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> boo
     matches!(result, Ok(Some(_)))
 }
 
-// ── POST /activate ────────────────────────────────────────────────────────────
+// ── POST /activate ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct ActivateReq {
@@ -216,12 +215,15 @@ pub async fn activate(
     if record.activation_ts != 0 {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "ERR-ALREADY-ACTIVATED",
+            Json(serde_json::json!({
+                "error": "ERR-ALREADY-ACTIVATED",
                 "activation_ts": record.activation_ts,
-                "expires_at": record.expires_at})),
+                "expires_at": record.expires_at
+            })),
         )
             .into_response();
     }
+
     // ✅ CRIT-3 FIX: expires_at 必须 > 0（admin 设置时已保证，但防御性校验）
     if record.expires_at == 0 {
         tracing::error!(
@@ -255,14 +257,11 @@ pub async fn activate(
             )
                 .into_response()
         }
-        Ok(false) => {
-            // 另一个请求先激活了（race condition，正常）
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "ERR-ALREADY-ACTIVATED"})),
-            )
-                .into_response()
-        }
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "ERR-ALREADY-ACTIVATED"})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -271,7 +270,7 @@ pub async fn activate(
     }
 }
 
-// ── POST /verify ──────────────────────────────────────────────────────────────
+// ── POST /verify ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct VerifyReq {
@@ -324,12 +323,11 @@ pub async fn verify(
         }
 
         // Step B: tombstone key 为空串 => 缓存数据损坏，回源 DB
-        // （正常 entry 的 key 是密钥明文，不为空）
         if cached_entry.key.is_empty() {
             tracing::warn!("[Verify] cache entry key 为空但 revoked=false，数据异常，回源 DB");
             // fall through to DB lookup
         } else {
-            // Step C: HMAC 验签（使用缓存的明文 key）
+            // Step C: HMAC 验签
             if !verify_hmac_signature(
                 &cached_entry.key,
                 &req.key_hash,
@@ -354,16 +352,15 @@ pub async fn verify(
 
             // Step E: ✅ CRIT-3 FIX: 校验 activation_ts > 0 && expires_at > 0
             if cached_entry.activation_ts <= 0 || cached_entry.expires_at <= 0 {
-                tracing::warn!(
-                    "[Verify] 缓存了未激活记录 (activation_ts={}, expires_at={})，回源 DB",
+                tracing::error!(
+                    "[Verify] 缓存中存在 activation_ts={} 或 expires_at={} 的脏数据，清除并回源",
                     cached_entry.activation_ts,
                     cached_entry.expires_at
                 );
-                // 主动清除脏缓存，回源 DB
                 cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
-                // fall through
+                // fall through to DB
             } else if now >= cached_entry.expires_at {
-                // Step F: 过期检查（此时 expires_at > 0 已保证）
+                // Step F: 过期检查
                 let days = (now - cached_entry.expires_at) / 86400;
                 return (
                     StatusCode::GONE,
@@ -492,18 +489,18 @@ pub async fn verify(
         .into_response()
 }
 
-// ── GET /health ───────────────────────────────────────────────────────────────
+// ── GET /health ──────────────────────────────────────────────────────────────
 
 pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
-// ── Admin handlers ─────────────────────────────────────────────────────────────
+// ── Admin handlers ────────────────────────────────────────────────────────────
 
 fn require_admin(
     token: &Arc<String>,
     provided: &str,
-) -> Result<(), (StatusCode, axum::Json<serde_json::Value>)> {
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if !auth::verify_admin_token(provided, token) {
         Err((
             StatusCode::UNAUTHORIZED,
@@ -598,7 +595,7 @@ pub async fn extend_license(
         )
             .into_response();
     }
-    if req.extra_days <= 0 || req.extra_days > 3650 {
+    if req.extra_days < 1 || req.extra_days > 3650 {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "extra_days must be 1-3650"})),
@@ -608,7 +605,6 @@ pub async fn extend_license(
     let extra_secs = req.extra_days * 86400;
     match db::extend_license(&pool, &req.key_hash, extra_secs).await {
         Ok(Some(new_expires_at)) => {
-            // 延期后使缓存失效，让下次 verify 回源
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             (
                 StatusCode::OK,
@@ -658,13 +654,13 @@ pub async fn add_key(
     if req.expires_at <= now {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "expires_at is in the past"})),
+            Json(serde_json::json!({"error": "expires_at must be in the future"})),
         )
             .into_response();
     }
+    let note = req.note.as_deref().unwrap_or("");
     let hkey = generate_hkey();
     let key_hash = hash_key(&hkey);
-    let note = req.note.as_deref().unwrap_or("");
     match db::add_key(&pool, &hkey, &key_hash, req.expires_at, note).await {
         Ok(true) => (
             StatusCode::OK,
@@ -711,10 +707,18 @@ pub async fn batch_init(
         )
             .into_response();
     }
-    if req.expires_at <= now_secs() {
+    if req.expires_at <= 0 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "expires_at is in the past"})),
+            Json(serde_json::json!({"error": "expires_at must be > 0"})),
+        )
+            .into_response();
+    }
+    let now = now_secs();
+    if req.expires_at <= now {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "expires_at must be in the future"})),
         )
             .into_response();
     }
