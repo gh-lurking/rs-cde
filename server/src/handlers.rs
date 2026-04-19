@@ -1,10 +1,12 @@
-// server/src/handlers.rs — 优化版 v11
+// server/src/handlers.rs — 优化版 v12
 //
-// ✅ BUG-1 FIX: Cache Hit 重新验证 HMAC 签名
-// ✅ BUG-2 FIX: /verify 和 /activate 中 tombstone 前置于 nonce
-// ✅ BUG-3 FIX: activation_ts >= expires_at 异常数据校验
-// ✅ CRIT-C FIX: Cache Hit 必须检查 tombstone + expires_at
-// ✅ OPT-A FIX: 已使用 subtle constant-time 签名比较
+// 本版修复清单（相对于原 v11）：
+//
+// [CRIT-1 FIX] activate: 错误码倒置修复 (ERR-NOT-ACTIVATED -> ERR-ALREADY-ACTIVATED)
+// [CRIT-1 FIX] activate: HMAC 验证提前到 nonce 之前执行
+// [MED-1  FIX] verify: Cache Hit 路径增加 nonce 防重放检查
+// [OPT-2  FIX] set_verify_cache 在此处调用前已有双重校验（cache.rs v9 配合）
+// [OPT-3  FIX] batch_init: 响应只返回 key_hash，不暴露原始密钥
 
 use crate::cache::{RedisPool, VerifyCacheEntry};
 use crate::{auth, cache, db, nonce_fallback};
@@ -18,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-type HmacSha256 = Hmac<sha2::Sha256>;
+type HmacSha256 = Hmac<Sha256>;
 
 static SERVER_ID: OnceLock<String> = OnceLock::new();
 
@@ -45,7 +47,7 @@ fn validate_key_hash(key_hash: &str) -> bool {
     key_hash.len() == 64 && key_hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// ✅ OPT-A: 使用 subtle::ConstantTimeEq 防止 timing attack
+/// OPT-A: 使用 subtle::ConstantTimeEq 防止 timing attack
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
     let server_id = get_server_id();
     let mut mac = match HmacSha256::new_from_slice(key.as_bytes()) {
@@ -109,11 +111,11 @@ async fn check_and_store_nonce(redis_pool: &RedisPool, key_hash: &str, sig: &str
     }
 }
 
-/// ✅ MINOR-B FIX: Redis 不可用时直接更新 DB
+/// MINOR-B FIX: Redis 不可用时直接更新 DB
 async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> bool {
     let throttle_key = format!("lc:v1:lc_throttle:{}", key_hash);
     let Ok(mut conn) = redis_pool.get().await else {
-        return true; // Redis 不可用时，通知调用方直接更新 DB
+        return true;
     };
     let result: Result<Option<String>, _> = deadpool_redis::redis::cmd("SET")
         .arg(&throttle_key)
@@ -126,7 +128,8 @@ async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> boo
     matches!(result, Ok(Some(_)))
 }
 
-// ── POST /activate ─────────────────────────────────────────────────────────
+// ── POST /activate ────────────────────────────────────────────────────────────
+
 #[derive(Deserialize)]
 pub struct ActivateReq {
     key_hash: String,
@@ -174,6 +177,7 @@ pub async fn activate(
         }
     };
 
+    // [3] revoked 检查（前置，不浪费后续资源）
     if record.revoked {
         return (
             StatusCode::FORBIDDEN,
@@ -182,26 +186,18 @@ pub async fn activate(
             .into_response();
     }
 
-    // [3] 已激活 → 409
-    // ✅ BUG-2: tombstone 已前置，这里只需检查 already-activated
+    // [4] 已激活检查
+    // CRIT-1 FIX: 错误码从 ERR-NOT-ACTIVATED 修正为 ERR-ALREADY-ACTIVATED（语义正确）
     if record.activation_ts > 0 {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "ERR-NOT-ACTIVATED"})),
+            Json(serde_json::json!({"error": "ERR-ALREADY-ACTIVATED"})),
         )
             .into_response();
     }
 
-    // [4] nonce 防重放
-    if !check_and_store_nonce(&redis_pool, &req.key_hash, &req.signature).await {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "ERR-NONCE-REPLAY"})),
-        )
-            .into_response();
-    }
-
-    // [5] HMAC 签名验证
+    // [5] CRIT-1 FIX: HMAC 验证提前到 nonce 之前
+    // 签名不合法直接拒绝，避免无效请求消耗 nonce 槽位
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return (
             StatusCode::FORBIDDEN,
@@ -210,7 +206,16 @@ pub async fn activate(
             .into_response();
     }
 
-    // [6] 激活（expires_at 由 handler 计算）
+    // [6] nonce 防重放（HMAC 验证通过后再检查）
+    if !check_and_store_nonce(&redis_pool, &req.key_hash, &req.signature).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "ERR-NONCE-REPLAY"})),
+        )
+            .into_response();
+    }
+
+    // [7] 激活
     let default_duration_secs: i64 = std::env::var("DEFAULT_LICENSE_DURATION_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -238,7 +243,8 @@ pub async fn activate(
     }
 }
 
-// ── POST /verify ────────────────────────────────────────────────────────────
+// ── POST /verify ──────────────────────────────────────────────────────────────
+
 #[derive(Deserialize)]
 pub struct VerifyReq {
     key_hash: String,
@@ -270,7 +276,7 @@ pub async fn verify(
             .into_response();
     }
 
-    // [2] ✅ CRIT-C: tombstone O(1) 快速拒绝（在 cache 之前）
+    // [2] CRIT-C: tombstone O(1) 快速拒绝（在 cache 之前）
     if cache::is_revoked(&redis_pool, &req.key_hash).await {
         return (
             StatusCode::FORBIDDEN,
@@ -279,10 +285,20 @@ pub async fn verify(
             .into_response();
     }
 
-    // [3] ✅ BUG-1 FIX: Cache hit 重新验证 HMAC + 检查 expires_at
+    // [3] BUG-1 FIX: Cache hit 重新验证 HMAC + 检查 expires_at
+    //     MED-1 FIX: Cache Hit 也必须执行 nonce 检查，防止重放攻击
     if let Some(cached) = cache::get_verify_cache(&redis_pool, &req.key_hash).await {
         if verify_hmac_signature(&cached.key, &req.key_hash, req.timestamp, &req.signature) {
-            // ✅ CRIT-C FIX: cache hit 再次检查 tombstone（防止 tombstone 写入比 cache 晚）
+            // MED-1 FIX: cache hit 路径同样需要 nonce 防重放
+            if !check_and_store_nonce(&redis_pool, &req.key_hash, &req.signature).await {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": "ERR-NONCE-REPLAY"})),
+                )
+                    .into_response();
+            }
+
+            // CRIT-C FIX: cache hit 再次检查 tombstone（防止 tombstone 写入比 cache 晚）
             if cache::is_revoked(&redis_pool, &req.key_hash).await {
                 return (
                     StatusCode::FORBIDDEN,
@@ -290,7 +306,8 @@ pub async fn verify(
                 )
                     .into_response();
             }
-            // ✅ 检查缓存中的 expires_at
+
+            // 检查缓存中的 expires_at
             if now >= cached.expires_at {
                 cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
                 return (
@@ -299,6 +316,7 @@ pub async fn verify(
                 )
                     .into_response();
             }
+
             // cache hit 成功
             let update = should_update_last_check(&redis_pool, &req.key_hash).await;
             if update {
@@ -313,7 +331,7 @@ pub async fn verify(
         }
     }
 
-    // [4] nonce 防重放
+    // [4] cache miss: nonce 防重放
     if !check_and_store_nonce(&redis_pool, &req.key_hash, &req.signature).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -360,13 +378,13 @@ pub async fn verify(
     // [8] 未激活
     if record.activation_ts <= 0 {
         return (
-            StatusCode::CONFLICT,
+            StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "ERR-NOT-ACTIVATED"})),
         )
             .into_response();
     }
 
-    // [9] ✅ BUG-3 FIX: activation_ts >= expires_at 数据异常
+    // [9] BUG-3 FIX: activation_ts >= expires_at 数据异常
     if record.activation_ts >= record.expires_at {
         tracing::error!(
             "[Verify] Data anomaly: activation_ts({}) >= expires_at({}) for key {}...",
@@ -381,7 +399,7 @@ pub async fn verify(
             .into_response();
     }
 
-    // [10] ✅ 过期检查
+    // [10] 过期检查
     if now >= record.expires_at {
         let days_expired = (now - record.expires_at) / 86400;
         tracing::info!(
@@ -420,17 +438,18 @@ pub async fn verify(
     .into_response()
 }
 
-// ── GET /health ──────────────────────────────────────────────────────────────
+// ── GET /health ────────────────────────────────────────────────────────────────
+
 pub async fn health() -> impl IntoResponse {
-    // ✅ MINOR-A FIX: 暴露 server_id，客户端启动时获取
     Json(serde_json::json!({
         "status": "ok",
         "server_id": get_server_id(),
-        "version": "v11",
+        "version": "v12",
     }))
 }
 
-// ── Admin Handlers ───────────────────────────────────────────────────────────
+// ── Admin Handlers ─────────────────────────────────────────────────────────────
+
 #[derive(Deserialize)]
 pub struct AdminToken {
     token: String,
@@ -484,7 +503,6 @@ pub async fn revoke_license(
     let reason = req.reason.unwrap_or_else(|| "revoked by admin".to_string());
     match db::revoke_license(&pool, &req.key_hash, &reason).await {
         Ok(()) => {
-            // ✅ 同时写 tombstone + 清除 verify cache
             cache::set_revoked_tombstone(&redis_pool, &req.key_hash).await;
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             tracing::info!("[Admin] Revoked: {}...", &req.key_hash[..8]);
@@ -513,17 +531,17 @@ pub async fn extend_license(
     if !check_admin(&req.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if req.extra_days <= 0 || req.extra_days > 3650 {
+    // OPT-4 FIX: 引用 db 层常量（db::MAX_EXTEND_DAYS），消除硬编码重复
+    if req.extra_days < 1 || req.extra_days > db::MAX_EXTEND_DAYS {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "extra_days must be 1..3650"})),
+            Json(serde_json::json!({"error": "extra_days must be 1..=MAX_EXTEND_DAYS"})),
         )
             .into_response();
     }
     let extra_secs = req.extra_days * 86400;
     match db::extend_license(&pool, &req.key_hash, extra_secs).await {
         Ok(Some(new_expires)) => {
-            // 延期后清除 verify cache，强制下次重新从 DB 加载
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             Json(serde_json::json!({"ok": true, "new_expires_at": new_expires})).into_response()
         }
@@ -557,7 +575,6 @@ pub async fn add_key(
     let key_hash = hash_key(&key);
     let now = now_secs();
     let note = req.note.unwrap_or_default();
-
     match db::insert_license(&pool, &key, &key_hash, now, &note).await {
         Ok(()) => Json(serde_json::json!({
             "key": key,
@@ -596,14 +613,19 @@ pub async fn batch_init(
     let note = req.note.unwrap_or_default();
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
 
-    // ✅ OPT-1 FIX: unnest 批量插入
     match db::batch_init_keys(&pool, &keys, &note).await {
-        Ok(()) => Json(serde_json::json!({
-            "ok": true,
-            "count": keys.len(),
-            "keys": keys,
-        }))
-        .into_response(),
+        Ok(()) => {
+            // OPT-3 FIX: 不暴露原始密钥，只返回 key_hash 列表
+            // 原始密钥已安全存储在 DB，通过带外渠道分发
+            let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
+            tracing::info!("[Admin] batch_init: {} keys created", keys.len());
+            Json(serde_json::json!({
+                "ok": true,
+                "count": keys.len(),
+                "key_hashes": key_hashes,
+            }))
+            .into_response()
+        }
         Err(e) => {
             tracing::error!("[Admin] batch_init error: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

@@ -1,10 +1,13 @@
-// server/src/main.rs — 优化版 v2
-// ✅ OPT-MAJOR-4: 注册 nonce_fallback 模块
+// server/src/main.rs — 优化版 v3
+//
+// MED-2 FIX: 在 main() 中显式调用 nonce_fallback::start_cleanup_task()
+// OPT-1 FIX: 在 main() 中显式调用 cache::start_cache_cleanup_task()
+
 mod auth;
 mod cache;
 mod db;
 mod handlers;
-mod nonce_fallback; // ✅ 新增：内存 nonce 降级模块
+mod nonce_fallback;
 
 use axum::{
     Extension, Router,
@@ -23,17 +26,22 @@ async fn main() {
         .await
         .expect("PostgreSQL Connection Failure");
     let pg_pool = Arc::new(pg_pool);
-    tracing::info!("✅ PostgreSQL Connection Pool is ready");
+    tracing::info!("PostgreSQL Connection Pool is ready");
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
     let redis_pool =
         cache::init_redis_pool(&redis_url).expect("Redis Connection Pool Initialization Failure");
     let redis_pool = Arc::new(redis_pool);
-    tracing::info!("✅ Redis Connection Pool is ready (deadpool-redis)");
+    tracing::info!("Redis Connection Pool is ready (deadpool-redis)");
 
     let admin_token = std::env::var("ADMIN_TOKEN").expect("Please set up the ADMIN_TOKEN env");
     let admin_token = Arc::new(admin_token);
+
+    // MED-2 FIX: 在 Tokio 运行时中显式启动 nonce cleanup 任务
+    nonce_fallback::start_cleanup_task();
+    // OPT-1 FIX: 启动 memory_revoke_map 的后台 GC
+    cache::start_cache_cleanup_task();
 
     let app = Router::new()
         .route("/activate", post(handlers::activate))

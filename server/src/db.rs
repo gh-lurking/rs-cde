@@ -1,8 +1,7 @@
-// server/src/db.rs — 优化版 v8
+// server/src/db.rs — 优化版 v9
 //
-// ✅ OPT-1 FIX: batch_init_keys 使用 unnest() 批量 INSERT
-// ✅ OPT-5 FIX: expires_at 部分索引（WHERE revoked=FALSE AND activation_ts>0）
-// ✅ LOGIC-A: extend_license 使用 GREATEST(expires_at, now) + extra_secs
+// OPT-4 FIX: MAX_EXTEND_DAYS / MAX_EXTEND_SECS 定义为 pub 常量，handler 层引用
+//            extend_license 内截断改为警告级别日志，不再静默
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -11,6 +10,10 @@ use uuid::Uuid;
 
 pub type DbPool = PgPool;
 
+/// OPT-4 FIX: 续期上限常量，handler 层引用此值，消除硬编码重复
+pub const MAX_EXTEND_DAYS: i64 = 3650;
+const MAX_EXTEND_SECS: i64 = MAX_EXTEND_DAYS * 86400;
+
 fn now_db() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -18,21 +21,9 @@ fn now_db() -> i64 {
         .as_secs() as i64
 }
 
-fn generate_hkey() -> String {
-    let uid = Uuid::new_v4().simple().to_string().to_uppercase();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &uid[12..16],
-        &uid[0..4],
-        &uid[4..8],
-        &uid[8..12],
-        &uid[16..20]
-    )
-}
-
 fn hash_key(key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
     h.update(key.as_bytes());
     hex::encode(h.finalize())
 }
@@ -58,7 +49,6 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-
     let pool = PgPoolOptions::new()
         .max_connections(max_conn)
         .min_connections(min_conn)
@@ -70,14 +60,14 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key          TEXT NOT NULL,
-            key_hash     TEXT PRIMARY KEY,
+            key TEXT NOT NULL,
+            key_hash TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at   BIGINT NOT NULL DEFAULT 0,
-            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   BIGINT NOT NULL,
-            last_check   BIGINT,
-            note         TEXT NOT NULL DEFAULT ''
+            expires_at BIGINT NOT NULL DEFAULT 0,
+            revoked BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at BIGINT NOT NULL,
+            last_check BIGINT,
+            note TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
@@ -87,10 +77,9 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .execute(&pool)
         .await?;
 
-    // ✅ OPT-5 FIX: 部分索引，仅覆盖有效且已激活的 key
+    // OPT-5 FIX: 部分索引，仅覆盖有效且已激活的 key
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires
-         ON licenses (expires_at)
+        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires ON licenses (expires_at)
          WHERE revoked = FALSE AND activation_ts > 0",
     )
     .execute(&pool)
@@ -178,22 +167,33 @@ pub async fn revoke_license(
     Ok(())
 }
 
-/// ✅ LOGIC-A: GREATEST(expires_at, now) + extra_secs
-/// 已过期的 key 从当前时间续期；未过期的从原到期时间续期
+/// OPT-4 FIX: 使用 pub 常量 MAX_EXTEND_DAYS/MAX_EXTEND_SECS
+/// 截断时输出警告日志，不再静默
+/// LOGIC-A: GREATEST(expires_at, now) + extra_secs
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
     extra_secs: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
     let now = now_db();
-    // 最大续期 10年
-    let extra_secs = extra_secs.min(315_360_000);
+    // 权威截断（带警告）
+    let extra_secs = if extra_secs > MAX_EXTEND_SECS {
+        tracing::warn!(
+            "[DB] extend_license: extra_secs({}) exceeds max({}), capping",
+            extra_secs,
+            MAX_EXTEND_SECS
+        );
+        MAX_EXTEND_SECS
+    } else {
+        extra_secs
+    };
+
     let row: Option<(i64,)> = sqlx::query_as(
         "UPDATE licenses
          SET expires_at = GREATEST(expires_at, $1) + $2
          WHERE key_hash = $3
            AND revoked = FALSE
-           AND activation_ts > 0  -- 未激活的 key 不允许续期
+           AND activation_ts > 0
          RETURNING expires_at",
     )
     .bind(now)
@@ -213,7 +213,7 @@ pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx
     .await
 }
 
-/// ✅ OPT-1 FIX: 使用 unnest() 批量 INSERT，O(1) DB trips
+/// OPT-1 FIX: 使用 unnest() 批量 INSERT，O(1) DB trips
 pub async fn batch_init_keys(
     pool: &DbPool,
     keys: &[String],

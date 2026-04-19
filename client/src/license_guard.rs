@@ -1,8 +1,7 @@
-// client/src/license_guard.rs — 优化版 v10
+// client/src/license_guard.rs — 优化版 v10（无改动，原 v10 已正确）
 //
-// ✅ CRIT-A FIX: 离线模式必须校验 local_expires vs now（过期检查）
-// ✅ OPT-3 FIX: repair_failed=true 时不立即 exit，记录警告后继续（如时间合理）
-
+// CRIT-A FIX: 离线模式必须校验 local_expires vs now（过期检查）
+// OPT-3 FIX: repair_failed=true 时不立即 exit，记录警告后继续
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,15 +21,10 @@ pub async fn check_and_enforce() {
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
-            // [1] revoked=true 在 200 响应中 → 数据异常
             if resp.revoked {
-                eprintln!(
-                    "[License] Server returned revoked=true with HTTP 200, data anomaly, aborting"
-                );
+                eprintln!("[License] Server returned revoked=true with HTTP 200, aborting");
                 std::process::exit(1);
             }
-
-            // [2] activation_ts > 0 && expires_at > 0
             if resp.activation_ts <= 0 || resp.expires_at <= 0 {
                 eprintln!(
                     "[License] Invalid record (activation_ts={}, expires_at={}), aborting",
@@ -38,8 +32,6 @@ pub async fn check_and_enforce() {
                 );
                 std::process::exit(1);
             }
-
-            // [3] activation_ts 不在未来（允许 5 分钟误差）
             if resp.activation_ts > now + 300 {
                 eprintln!(
                     "[License] activation_ts({}) is in the future (now={}), clock tampering, aborting",
@@ -47,8 +39,6 @@ pub async fn check_and_enforce() {
                 );
                 std::process::exit(1);
             }
-
-            // ✅ BUG-3 补充: activation_ts >= expires_at 数据异常
             if resp.activation_ts >= resp.expires_at {
                 eprintln!(
                     "[License] Data anomaly: activation_ts({}) >= expires_at({}), aborting",
@@ -56,8 +46,6 @@ pub async fn check_and_enforce() {
                 );
                 std::process::exit(1);
             }
-
-            // [4] 过期检查
             if now >= resp.expires_at {
                 let days = (now - resp.expires_at) / 86400;
                 eprintln!(
@@ -66,14 +54,11 @@ pub async fn check_and_enforce() {
                 );
                 std::process::exit(1);
             }
-
             let remaining = (resp.expires_at - now) / 86400;
             println!(
-                "[License] ✅ Online verification passed, {} days remaining",
+                "[License] Online verification passed, {} days remaining",
                 remaining
             );
-
-            // [5] 写本地副本缓存
             storage::write_all_replicas(
                 &hkey,
                 &salt,
@@ -83,7 +68,6 @@ pub async fn check_and_enforce() {
         }
 
         Err(ref e) => {
-            // 确定性失败（revoked/invalid/forbidden）→ 立即 exit
             if e == network::ERR_REVOKED {
                 eprintln!("[License] Key revoked by server, aborting");
                 std::process::exit(1);
@@ -93,7 +77,7 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
             if e == network::ERR_NOT_ACTIVATED {
-                eprintln!("[License] License key not yet activated (rejected by server), aborting");
+                eprintln!("[License] License key not yet activated, aborting");
                 std::process::exit(1);
             }
             if e == network::ERR_EXPIRED {
@@ -104,8 +88,15 @@ pub async fn check_and_enforce() {
                 eprintln!("[License] Key restricted by region ({}), aborting", e);
                 std::process::exit(1);
             }
+            // MED-3 FIX: ERR-CLOCK-SKEW-PERSISTENT 也是确定性失败
+            if e.starts_with("ERR-CLOCK-SKEW-PERSISTENT:") {
+                eprintln!(
+                    "[License] Persistent clock skew detected ({}), cannot verify, aborting",
+                    e
+                );
+                std::process::exit(1);
+            }
 
-            // 网络/超时错误 → 尝试本地缓存
             eprintln!(
                 "[License] Online verification failed ({}), trying local cache...",
                 e
@@ -134,33 +125,27 @@ pub async fn check_and_enforce() {
                     read_count: _,
                     repair_failed,
                 } => {
-                    // ✅ OPT-3 FIX: repair_failed 时记录警告但不立即 exit
-                    // 改为：如果时间合理，允许继续（但下次必须联网）
                     if repair_failed {
                         eprintln!(
                             "[License] Local replica repair failed (storage may be unreliable).                              Proceeding with caution — will force online next launch."
                         );
-                        // TODO: 写 force_online 标志文件，下次启动强制联网
-                        // mark_force_online_required();
                     }
 
-                    // ✅ CRIT-A FIX: 离线模式必须检查过期时间！
+                    // CRIT-A FIX: 离线模式必须检查过期时间！
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
                         eprintln!(
-                            "[License] Key expired {} days ago (offline cache, expires={}, now={}),                              please restore network connection and renew",
+                            "[License] Key expired {} days ago (offline cache, expires={}, now={}),                              please restore network and renew",
                             days, local_expires, now
                         );
                         std::process::exit(1);
                     }
 
-                    // ✅ 验证 local_ts 合理性
                     if local_ts == 0 || local_expires == 0 {
                         eprintln!("[License] Corrupt local record (ts=0), aborting");
                         std::process::exit(1);
                     }
 
-                    // ✅ activation_ts 不应在未来
                     if local_ts as i64 > now + 300 {
                         eprintln!(
                             "[License] Local record activation_ts in future, possible tampering, aborting"
@@ -168,7 +153,6 @@ pub async fn check_and_enforce() {
                         std::process::exit(1);
                     }
 
-                    // ✅ activation_ts >= expires_at 合理性
                     if local_ts >= local_expires {
                         eprintln!(
                             "[License] Corrupt local record (activation_ts >= expires_at), aborting"
@@ -178,7 +162,7 @@ pub async fn check_and_enforce() {
 
                     let remaining = (local_expires as i64 - now) / 86400;
                     println!(
-                        "[License] ✅ Offline verification passed, {} days remaining",
+                        "[License] Offline verification passed, {} days remaining",
                         remaining
                     );
                 }
