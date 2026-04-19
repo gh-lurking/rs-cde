@@ -1,8 +1,7 @@
-// client/src/storage.rs — 优化版 v5 (Bug确认+修复版)
-//
-// ✅ MAJOR-4 确认: read_count < 2 → Insufficient（非 < 1）
-//   单副本无法区分正常丢失 vs 篡改，必须要求在线校验
-// ✅ 保留: AES-128-GCM + HKDF-SHA256 + OsRng nonce + 多数投票 + 2/3自愈
+// client/src/storage.rs — 优化版 v6
+// ✅ MAJOR-4 FIX: read_count < 2 => Insufficient（原始 bug 是 < 1）
+// 注意：read_count=1 时无法做多数投票，Insufficient 让上层决策（不直接 exit）
+// ✅ 说明: 3 副本 AES-128-GCM 加密存储，HKDF-SHA256 派生密钥，OsRng nonce
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
@@ -27,7 +26,7 @@ pub enum LocalReadResult {
     },
 }
 
-/// HKDF-SHA256 派生加密密钥（16 字节，用于 AES-128-GCM）
+/// HKDF-SHA256 派生 16 字节 AES-128-GCM 密钥
 fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), hkey.as_bytes());
     let mut okm = [0u8; 16];
@@ -81,8 +80,9 @@ fn write_slot(
 
 fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     let data = fs::read(path).ok()?;
+    // 12 nonce + 32 ciphertext(16 plain + 16 GCM tag)
     if data.len() != 44 {
-        return None; // 12 nonce + 32 ciphertext(16 plain + 16 GCM tag)
+        return None;
     }
     let stored_nonce = &data[..12];
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
@@ -97,14 +97,14 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     Some((act, exp))
 }
 
-/// ✅ MAJOR-4 确认: read_count < 2 → Insufficient
+/// ✅ MAJOR-4 FIX: read_count < 2 => Insufficient（无法做多数投票）
 ///
-/// 多数投票行为说明（read_count >= 2 时）：
-/// - 2副本一致: best_count=2, 2*2=4 > 2 → Success ✓
-/// - 2副本不一致: best_count=1, 1*2=2 > 2 false → Tampered ✓
-/// - 3副本全一致: best_count=3, 3*2=6 > 3 → Success ✓
-/// - 3副本2:1: best_count=2, 2*2=4 > 3 → Success（修复少数副本）✓
-/// - 3副本1:1:1: best_count=1, 1*2=2 > 3 false → Tampered ✓
+/// 多数投票规则（read_count >= 2）:
+/// - 2个副本，2:0 => best_count=2, 2*2=4 > 2 => Success ✓
+/// - 2个副本，1:1 => best_count=1, 1*2=2 > 2 false => Tampered ✓
+/// - 3个副本，3:0 => best_count=3, 3*2=6 > 3 => Success ✓
+/// - 3个副本，2:1 => best_count=2, 2*2=4 > 3 => Success（自动修复少数副本）✓
+/// - 3个副本，1:1:1 => best_count=1, 1*2=2 > 3 false => Tampered ✓
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::new();
@@ -116,12 +116,12 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     }
     let read_count = values.len();
 
-    // ✅ MAJOR-4: 明确 < 2（非 < 1），单副本不可信
+    // ✅ MAJOR-4 FIX: read_count < 2 时无法做多数投票，返回 Insufficient
     if read_count < 2 {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // read_count >= 2：多数投票
+    // read_count >= 2：执行多数投票
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(entry) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -133,7 +133,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
     if best_count * 2 > read_count {
-        // 有多数共识（> 50%），修复少数不一致副本
+        // 有多数（>50%），修复少数损坏副本
         if best_count < read_count {
             for slot in 0..3u8 {
                 let path = derive_path(hkey, salt, slot);
@@ -155,12 +155,12 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             read_count,
         }
     } else {
-        // 无多数共识（如 2副本不一致 或 1:1:1）→ Tampered
+        // 无多数（如 1:1 或 1:1:1），真正的篡改
         LocalReadResult::Tampered { read_count }
     }
 }
 
-/// 在线校验成功后，写入全部三个副本
+/// 写入所有 3 个副本
 pub fn write_all_replicas(hkey: &str, salt: &str, activation: u64, expires: u64) {
     let key = derive_key(hkey, salt);
     for slot in 0..3u8 {

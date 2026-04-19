@@ -1,6 +1,6 @@
-// client/src/main.rs — 程序入口
-// BUG-06 FIX: license_guard::check_and_enforce() 现在是 async fn，需要 .await
-// BUG-10 FIX: 两种检测都失败时退出，不静默放行
+// client/src/main.rs — 优化版
+// ✅ BUG-06 FIX: license_guard::check_and_enforce() 是 async fn，需 .await
+// ✅ BUG-10 FIX: 地理检测两层降级，网络不可用时退出而非忽略
 
 use reqwest::Client;
 use std::process;
@@ -14,7 +14,7 @@ mod storage;
 async fn main() {
     loc_detection().await;
 
-    // BUG-06 FIX: check_and_enforce 现在是 async fn，必须 .await
+    // ✅ BUG-06 FIX: check_and_enforce 是 async fn，必须 .await
     license_guard::check_and_enforce().await;
     println!("✅ Your license is valid");
 
@@ -22,10 +22,10 @@ async fn main() {
 }
 
 async fn loc_detection() {
-    // 所有策略共用同一 HTTP Client（连接池复用）
+    // 复用同一 HTTP Client（已有连接池，避免重复创建）
     let client: Client = geo_check::build_http_client();
 
-    // ── 策略 1: 公网 IP 获取 + CN CIDR 匹配 ────────────────────────────────
+    // ── 检测 1: 公网 IP + CN CIDR 匹配 ──────────────────────────────────────
     println!("[1] DETECTION ONE ...");
     match geo_check::check_public_ip_cidr(client.clone()).await {
         Ok(true) => {
@@ -38,7 +38,7 @@ async fn loc_detection() {
             fallback_to_cf_detection(client).await;
         }
     }
-    println!("🎉 LOC DETECTION PASSED");
+    println!("🌍 LOC DETECTION PASSED");
 }
 
 async fn fallback_to_cf_detection(client: Client) {
@@ -51,7 +51,7 @@ async fn fallback_to_cf_detection(client: Client) {
         Ok(false) => {
             println!("✅ Your country (region) is supported.");
         }
-        // BUG-10 FIX: 两种检测都失败时退出，而不是静默放行
+        // ✅ BUG-10 FIX: 两层检测都失败时，不忽略错误，退出
         Err(e) => {
             eprintln!(
                 "❌ Network unavailable: {}, Please check your internet connection",
@@ -64,5 +64,5 @@ async fn fallback_to_cf_detection(client: Client) {
 
 async fn run_client() {
     println!("🚀 Run the client now ...");
-    // TODO: 在此处填写业务代码
+    // TODO: 在此处添加实际业务逻辑
 }

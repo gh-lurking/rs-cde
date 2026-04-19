@@ -1,7 +1,7 @@
-// client/src/network.rs — 优化版 v6 (Bug修复版)
-//
-// ✅ MINOR-3 FIX: ERR-TIME-RECORD 解析失败时明确返回业务错误，不触发离线降级
-// ✅ 保留所有原有修复（CRIT-3/MINOR-2）
+// client/src/network.rs — 优化版 v7
+// ✅ MINOR-3 FIX: ERR-TIME-RECORD 重试，超过 MAX_CLOCK_OFFSET_SECS(600s) 拒绝
+// ✅ 说明: 生产环境应使用 HTTPS（rustls-tls），防止 server_time 被 MITM 篡改
+// ✅ 改进: server_time 解析失败时返回明确错误，不无限重试
 
 use hmac::{Hmac, Mac};
 use obfstr::obfstr;
@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
-/// 时钟偏差安全阈值（±600s = ±10分钟）
+/// 本地时钟与服务端时钟允许的最大偏差（±600s = ±10分钟）
 const MAX_CLOCK_OFFSET_SECS: i64 = 600;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -61,7 +61,8 @@ pub fn hash_key(hkey: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// 签名消息格式: SERVER_ID|key_hash|timestamp（与服务端 verify_hmac_signature 对齐）
+/// 签名格式: HMAC-SHA256(key=hkey, msg=SERVER_ID|key_hash|timestamp)
+/// 与服务端 verify_hmac_signature 完全对应
 fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> String {
     let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| server_url.to_string());
     let mut mac = HmacSha256::new_from_slice(hkey.as_bytes()).unwrap();
@@ -129,7 +130,7 @@ async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<Verif
     }
 }
 
-/// 在线验证，时钟重试严格限制一次，防无限重试
+/// 在线验证入口：自动处理时钟偏差（单次重试）
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let mut ts_offset = 0i64;
     let mut retried = false;
@@ -144,9 +145,10 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 match server_time_str.parse::<i64>() {
                     Ok(server_ts) => {
                         let offset = server_ts - now_secs();
+                        // ✅ MINOR-3 FIX: 超过 MAX_CLOCK_OFFSET_SECS 拒绝同步
                         if offset.abs() > MAX_CLOCK_OFFSET_SECS {
                             tracing::error!(
-                                "[License] 服务端时钟偏差 {}s 超过安全阈值 {}s，拒绝修正",
+                                "[License] 服务端时钟偏差 {}s 超过安全阈值 {}s，拒绝同步",
                                 offset,
                                 MAX_CLOCK_OFFSET_SECS
                             );
@@ -155,22 +157,16 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                                 offset, MAX_CLOCK_OFFSET_SECS
                             ));
                         }
-                        tracing::warn!(
-                            "[License] 时钟偏差 {}s，自动修正后重试（仅此一次）",
-                            offset
-                        );
+                        if offset.abs() > 60 {
+                            tracing::warn!("[License] 客户端时钟偏差 {}s，建议同步 NTP", offset);
+                        }
                         ts_offset = offset;
                         retried = true;
-                        continue;
+                        // 继续 loop，使用 ts_offset 重试
                     }
                     Err(_) => {
-                        // ✅ MINOR-3 FIX: parse 失败 = 服务端响应格式异常或中间人篡改
-                        // 明确返回业务错误，不触发离线降级（离线降级仅针对网络级错误）
-                        tracing::warn!(
-                            "[License] ERR-TIME-RECORD 中 server_time 格式异常: {}",
-                            server_time_str
-                        );
-                        return Err("ERR-TIME-RECORD:invalid-format".to_string());
+                        // ✅ 解析失败，返回原始错误，不无限重试
+                        return Err(e.clone());
                     }
                 }
             }

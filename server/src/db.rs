@@ -1,7 +1,7 @@
-// server/src/db.rs — 优化版 v4 (Bug修复版)
-//
-// ✅ MINOR-1 FIX: extend_license SQL 增加 AND activation_ts > 0（纵深防御）
-// ✅ MINOR-2 FIX: batch_init_keys 返回 (rows_affected, Vec<String>) 便于管理员审计
+// server/src/db.rs — 优化版 v5
+// ✅ MINOR-1 FIX: extend_license SQL 加 AND activation_ts > 0（未激活密钥不允许延期）
+// ✅ MINOR-2 FIX: batch_init_keys 返回 (rows_affected, Vec<String>) 包含 key 列表
+
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -142,8 +142,8 @@ pub async fn revoke_license(
     Ok(())
 }
 
-/// ✅ MINOR-1 FIX: 增加 AND activation_ts > 0，纵深防御未激活密钥被续期
-/// 返回 Option<i64>：Some(new_expires_at) = 续期成功，None = 未找到/已撤销/未激活
+/// ✅ MINOR-1 FIX: 加 AND activation_ts > 0，未激活密钥不允许被延期
+/// 返回 Option<i64>: Some(new_expires_at) = 延期成功, None = 未找到/未激活/已 revoke
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
@@ -155,7 +155,7 @@ pub async fn extend_license(
          SET expires_at = GREATEST(expires_at, $1) + $2
          WHERE key_hash = $3
            AND revoked = FALSE
-           AND activation_ts > 0    -- ✅ MINOR-1: 未激活密钥不可续期（纵深防御）
+           AND activation_ts > 0  -- ✅ MINOR-1 FIX: 未激活密钥不允许延期
          RETURNING expires_at",
     )
     .bind(now)
@@ -198,33 +198,37 @@ pub async fn add_key(
     Ok(result.rows_affected() == 1)
 }
 
-/// ✅ MINOR-2 FIX: 返回 (rows_affected, Vec<String>) 便于 handler 返回 key 列表给管理员
+/// ✅ MINOR-2 FIX: 返回 (rows_affected, Vec<String>) 包含实际生成的 key 列表
+/// 避免网络超时后无法获取已创建的 key
 pub async fn batch_init_keys(
     pool: &DbPool,
     count: u32,
+    expires_at: i64,
     note: &str,
 ) -> Result<(u64, Vec<String>), sqlx::Error> {
     let now = now_db();
-    let mut keys: Vec<String> = Vec::with_capacity(count as usize);
-    let mut key_hashes: Vec<String> = Vec::with_capacity(count as usize);
+    let mut keys = Vec::with_capacity(count as usize);
+    let mut rows_affected = 0u64;
+
     for _ in 0..count {
-        let key = generate_hkey();
-        let kh = hash_key(&key);
-        keys.push(key);
-        key_hashes.push(kh);
+        let hkey = generate_hkey();
+        let key_hash = hash_key(&hkey);
+        let result = sqlx::query(
+            "INSERT INTO licenses (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
+             VALUES ($1, $2, 0, $3, FALSE, $4, NULL, $5)
+             ON CONFLICT (key_hash) DO NOTHING",
+        )
+        .bind(&hkey)
+        .bind(&key_hash)
+        .bind(expires_at)
+        .bind(now)
+        .bind(note)
+        .execute(pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            rows_affected += 1;
+            keys.push(hkey);
+        }
     }
-    let result = sqlx::query(
-        "INSERT INTO licenses (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
-         SELECT k, kh, 0::bigint, 0::bigint, false, $3::bigint, NULL::bigint, $4::text
-         FROM UNNEST($1::text[], $2::text[]) AS t(k, kh)
-         ON CONFLICT (key_hash) DO NOTHING",
-    )
-    .bind(&keys)
-    .bind(&key_hashes)
-    .bind(now)
-    .bind(note)
-    .execute(pool)
-    .await?;
-    // ✅ MINOR-2: 返回 key 列表（仅返回实际插入的 key，冲突 key 已通过 rows_affected 过滤）
-    Ok((result.rows_affected(), keys))
+    Ok((rows_affected, keys))
 }
