@@ -1,10 +1,8 @@
 // client/src/network.rs — 优化版 v11
 //
-// MED-3 FIX: 时钟校正重试路径增加「只重试一次」限制
-//            若校正后仍然 ERR-TIME-RECORD，返回明确的 ERR-CLOCK-SKEW-PERSISTENT
-// BUG-4 FIX: RTT 半程估算修正（full_rtt = T4-T1; rtt_half = full_rtt/2）
-// MINOR-A FIX: server_id 从 /health 接口获取
-// MINOR-3 FIX: MAX_CLOCK_OFFSET 600s
+// MED-3 / BUG-4 FIX: RTT 半程估算修正（rtt_half = full_rtt / 2）
+// MED-1 FIX      : 时钟校正后只重试一次，若仍失败返回 ERR-CLOCK-SKEW-PERSISTENT
+// MINOR-A FIX    : server_id 从 /health 接口动态获取，缓存于 OnceLock
 
 use hmac::{Hmac, Mac};
 use obfstr::obfstr;
@@ -52,9 +50,7 @@ async fn fetch_server_id(server_url: &str) -> String {
                 return h.server_id;
             }
         }
-        Err(e) => {
-            tracing::warn!("[Network] Failed to fetch server_id from /health: {}", e);
-        }
+        Err(e) => tracing::warn!("[Network] Failed to fetch server_id from /health: {}", e),
     }
     std::env::var("SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string())
 }
@@ -68,7 +64,6 @@ async fn get_server_id(server_url: &str) -> &'static str {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -165,11 +160,11 @@ async fn do_verify(
     }
 }
 
-/// MED-3 FIX: 时钟校正后只重试一次
-/// 若校正后仍然超窗口，返回 ERR-CLOCK-SKEW-PERSISTENT，避免隐式循环
+/// MED-3 / BUG-4 FIX: 时钟校正后只重试一次，rtt_half = full_rtt / 2
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let t1 = now_secs();
     let result = do_verify(hkey, server_url, t1).await;
+
     match &result {
         Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
             let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
@@ -179,7 +174,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
             };
             let t4 = now_secs();
             let full_rtt = t4 - t1;
-
+            // 合理性检查：RTT 不应超过超时上限的 2 倍
             if full_rtt < 0 || full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
                 eprintln!(
                     "[Network] Unreasonable RTT: {}s, skipping time correction",
@@ -187,10 +182,9 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 );
                 return result;
             }
-
+            // BUG-4 FIX: 单程 = full_rtt / 2（不是 full_rtt！）
             let rtt_half = full_rtt / 2;
             let corrected_ts = server_ts + rtt_half;
-
             let clock_offset = (t1 - corrected_ts).abs();
             if clock_offset > MAX_CLOCK_OFFSET_SECS {
                 eprintln!(
@@ -199,13 +193,11 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 );
                 return Err(format!("ERR-CLOCK-SKEW:{}", clock_offset));
             }
-
             eprintln!(
                 "[Network] Time corrected: local={} server={} rtt_half={}s corrected={}",
                 t1, server_ts, rtt_half, corrected_ts
             );
-
-            // MED-3 FIX: 只重试一次
+            // MED-1 FIX: 只重试一次
             let retry = do_verify(hkey, server_url, corrected_ts).await;
             match &retry {
                 Err(e2) if e2.starts_with("ERR-TIME-RECORD:") => {

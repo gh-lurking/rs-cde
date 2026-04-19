@@ -1,9 +1,10 @@
 // client/src/storage.rs — 优化版 v10
 //
-// OPT-5 FIX: 补充缺失的 MAX_LICENSE_PERIOD 常量定义（之前编译失败！）
-// OPT-3 FIX: LocalReadResult::Success 新增 repair_failed: bool
+// OPT-5 FIX  : 补充缺失的 MAX_LICENSE_PERIOD 常量定义（之前编译失败！）
+// OPT-3 FIX  : LocalReadResult::Success 新增 repair_failed: bool
 // MAJOR-A FIX: N=2:0 误判修复（已正确 best_count*2 > read_count）
-// MAJOR-B FIX: best_val 值域合理性验证（防止被篡改的大值通过投票）
+// MAJOR-B FIX: best_val 值域合理性验证（防止篡改的大值通过投票）
+
 use aes_gcm::{
     Aes128Gcm, Key, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -16,16 +17,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// OPT-5 FIX: 补充缺失的常量定义！
 /// 本地缓存记录的合理期限上限：20 年（单位：秒）
-/// 超过此值视为数据异常（防止被篡改的超大 expires_at 通过投票）
 const MAX_LICENSE_PERIOD: u64 = 20 * 365 * 86400; // 630_720_000 秒
 
 /// 本地副本读取结果
 pub enum LocalReadResult {
-    /// 可用副本数不足（< 2），无法仲裁
+    /// 可用副本数不足（< 2）
     Insufficient { read_count: usize },
-    /// 数据被篡改（无多数一致值）或值域异常
+    /// 多数票仲裁失败（篡改）
     Tampered { read_count: usize },
-    /// 读取成功，value = (activation_ts, expires_at)
+    /// 仲裁成功
     Success {
         value: (u64, u64),
         read_count: usize,
@@ -101,7 +101,7 @@ fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     Some((act, exp))
 }
 
-/// 写入3个副本（激活/验证成功后调用）
+/// 写入 3 个副本（激活/验证成功后调用）
 pub fn write_all_replicas(hkey: &str, salt: &str, activation_ts: u64, expires_at: u64) {
     let key = derive_key(hkey, salt);
     for slot in 0..3u8 {
@@ -124,12 +124,12 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     }
     let read_count = values.len();
 
-    // MAJOR-A FIX: 先检查 read_count
+    // MAJOR-A FIX: 先检查 read_count（至少 2 个才能仲裁）
     if read_count < 2 {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // 统计各值出现次数
+    // 投票计数
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(entry) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -138,22 +138,20 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
-
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
+    // MAJOR-A FIX: 严格过半数（best_count * 2 > read_count）
     if best_count * 2 <= read_count {
         return LocalReadResult::Tampered { read_count };
     }
 
-    // MAJOR-B FIX: 值域合理性验证
+    let (act_ts, exp_ts) = best_val;
     let now_u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    let (act_ts, exp_ts) = best_val;
-
-    // activation_ts 不应在未来（允许 5 分钟误差）
+    // MAJOR-B FIX: 值域合理性验证
     if act_ts > now_u64 + 300 {
         tracing::warn!(
             "[Storage] Sanity check failed: activation_ts({}) in future (now={})",
@@ -162,9 +160,15 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         );
         return LocalReadResult::Tampered { read_count };
     }
-
-    // OPT-5 FIX: MAX_LICENSE_PERIOD 现在已正确定义，编译可以通过
-    if exp_ts <= act_ts || exp_ts.saturating_sub(act_ts) > MAX_LICENSE_PERIOD {
+    // OPT-5 FIX: MAX_LICENSE_PERIOD 现在已正确定义
+    if exp_ts == 0 || exp_ts > now_u64 + MAX_LICENSE_PERIOD {
+        tracing::warn!(
+            "[Storage] Sanity check failed: exp_ts({}) out of range",
+            exp_ts
+        );
+        return LocalReadResult::Tampered { read_count };
+    }
+    if act_ts == 0 || exp_ts <= act_ts {
         tracing::warn!(
             "[Storage] Sanity check failed: act={} exp={} diff={}",
             act_ts,

@@ -1,7 +1,8 @@
-// client/src/license_guard.rs — 优化版 v10（无改动，原 v10 已正确）
+// client/src/license_guard.rs — 优化版 v10
 //
-// CRIT-A FIX: 离线模式必须校验 local_expires vs now（过期检查）
-// OPT-3 FIX: repair_failed=true 时不立即 exit，记录警告后继续
+// CRIT-2 FIX: 离线模式必须校验 local_expires vs now（过期检查，且放在最前面）
+// OPT-3 FIX : repair_failed=true 时不立即 exit，记录警告后继续
+
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,6 +69,7 @@ pub async fn check_and_enforce() {
         }
 
         Err(ref e) => {
+            // 确定性失败：直接退出，不走离线路径
             if e == network::ERR_REVOKED {
                 eprintln!("[License] Key revoked by server, aborting");
                 std::process::exit(1);
@@ -129,9 +131,11 @@ pub async fn check_and_enforce() {
                         eprintln!(
                             "[License] Local replica repair failed (storage may be unreliable).                              Proceeding with caution — will force online next launch."
                         );
+                        // OPT-3 FIX: repair_failed 不立即 exit，记录警告后继续
                     }
 
-                    // CRIT-A FIX: 离线模式必须检查过期时间！
+                    // CRIT-2 FIX: 离线模式必须首先检查过期时间！
+                    // 此检查必须在其他合法性校验之前，否则过期密钥可通过后续检查
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
                         eprintln!(
