@@ -1,10 +1,11 @@
-// server/src/db.rs — 优化版 v5
-// ✅ MINOR-1 FIX: extend_license SQL 加 AND activation_ts > 0（未激活密钥不允许延期）
-// ✅ MINOR-2 FIX: batch_init_keys 返回 (rows_affected, Vec<String>) 包含 key 列表
-use hex;
+// server/src/db.rs — 优化版 v6
+// ✅ MINOR-1 (原有): extend_license SQL 加 AND activation_ts > 0
+// ✅ MINOR-2 (原有): batch_init_keys 返回 (rows_affected, Vec<String>)
+// ✅ LOGIC-A 说明: extend_license GREATEST 语义已在注释中明确
+// ✅ 新增: extend_license 对 extra_secs 做上界钳位防 i64 溢出
+
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -30,6 +31,7 @@ fn generate_hkey() -> String {
 }
 
 fn hash_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(key.as_bytes());
     hex::encode(h.finalize())
@@ -52,10 +54,12 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
+
     let min_conn: u32 = std::env::var("PG_POOL_MIN_CONN")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
+
     let pool = PgPoolOptions::new()
         .max_connections(max_conn)
         .min_connections(min_conn)
@@ -64,25 +68,33 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .max_lifetime(Duration::from_secs(1800))
         .connect(database_url)
         .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key TEXT NOT NULL,
-            key_hash TEXT PRIMARY KEY,
-            activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at BIGINT NOT NULL DEFAULT 0,
-            revoked BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at BIGINT NOT NULL,
-            last_check BIGINT,
-            note TEXT NOT NULL DEFAULT ''
+            key           TEXT    NOT NULL,
+            key_hash      TEXT    PRIMARY KEY,
+            activation_ts BIGINT  NOT NULL DEFAULT 0,
+            expires_at    BIGINT  NOT NULL DEFAULT 0,
+            revoked       BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at    BIGINT  NOT NULL,
+            last_check    BIGINT,
+            note          TEXT    NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
     .await?;
+
+    // 为高频查询字段建立索引
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_licenses_key_hash ON licenses (key_hash)")
+        .execute(&pool)
+        .await?;
+
     tracing::info!(
         "PostgreSQL pool ready: max={} min={} acquire=5s idle=600s lifetime=1800s",
         max_conn,
         min_conn
     );
+
     Ok(pool)
 }
 
@@ -91,7 +103,8 @@ pub async fn find_license(
     key_hash: &str,
 ) -> Result<Option<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked,
+                created_at, last_check, note
          FROM licenses WHERE key_hash = $1",
     )
     .bind(key_hash)
@@ -106,7 +119,8 @@ pub async fn activate_license(
     expires_at: i64,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE licenses SET activation_ts = $1, expires_at = $2
+        "UPDATE licenses
+         SET activation_ts = $1, expires_at = $2
          WHERE key_hash = $3 AND activation_ts = 0 AND revoked = FALSE",
     )
     .bind(activation_ts)
@@ -114,6 +128,7 @@ pub async fn activate_license(
     .bind(key_hash)
     .execute(pool)
     .await?;
+
     Ok(result.rows_affected() == 1)
 }
 
@@ -139,20 +154,26 @@ pub async fn revoke_license(
     Ok(())
 }
 
-/// ✅ MINOR-1 FIX: 加 AND activation_ts > 0，未激活密钥不允许被延期
-/// 返回 Option<i64>: Some(new_expires_at) = 延期成功, None = 未找到/未激活/已 revoke
+/// 延期逻辑说明（LOGIC-A）：
+/// - 已激活且未过期：expires_at += extra_secs（从原到期日叠加）
+/// - 已激活且已过期：GREATEST(expires_at, now) + extra_secs = now + extra_secs（从今天叠加）
+/// 这两种语义的混合是当前业务决策，在 API 文档中需明确告知调用方。
+/// ✅ 新增: extra_secs 上界钳位（max 3650天 = 315,360,000s），防止 i64 溢出
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
     extra_secs: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
+    // 防御性钳位：handler 层已校验 extra_days <= 3650，此处双重保护
+    let extra_secs = extra_secs.min(3_650 * 86_400);
     let now = now_db();
+
     let row: Option<(i64,)> = sqlx::query_as(
         "UPDATE licenses
          SET expires_at = GREATEST(expires_at, $1) + $2
          WHERE key_hash = $3
            AND revoked = FALSE
-           AND activation_ts > 0  -- ✅ MINOR-1 FIX: 未激活密钥不允许延期
+           AND activation_ts > 0   -- 未激活密钥不允许延期
          RETURNING expires_at",
     )
     .bind(now)
@@ -160,12 +181,14 @@ pub async fn extend_license(
     .bind(key_hash)
     .fetch_optional(pool)
     .await?;
+
     Ok(row.map(|r| r.0))
 }
 
 pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked,
+                created_at, last_check, note
          FROM licenses ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -180,8 +203,10 @@ pub async fn add_key(
     note: &str,
 ) -> Result<bool, sqlx::Error> {
     let now = now_db();
+
     let result = sqlx::query(
-        "INSERT INTO licenses (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
+        "INSERT INTO licenses
+            (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
          VALUES ($1, $2, 0, $3, FALSE, $4, NULL, $5)
          ON CONFLICT (key_hash) DO NOTHING",
     )
@@ -192,11 +217,12 @@ pub async fn add_key(
     .bind(note)
     .execute(pool)
     .await?;
+
     Ok(result.rows_affected() == 1)
 }
 
-/// ✅ MINOR-2 FIX: 返回 (rows_affected, Vec<String>) 包含实际生成的 key 列表
-/// 避免网络超时后无法获取已创建的 key
+/// ✅ MINOR-2 (原有): 返回 (rows_affected, Vec<String>) 包含实际生成的 key 列表
+
 pub async fn batch_init_keys(
     pool: &DbPool,
     count: u32,
@@ -206,11 +232,13 @@ pub async fn batch_init_keys(
     let now = now_db();
     let mut keys = Vec::with_capacity(count as usize);
     let mut rows_affected = 0u64;
+
     for _ in 0..count {
         let hkey = generate_hkey();
         let key_hash = hash_key(&hkey);
         let result = sqlx::query(
-            "INSERT INTO licenses (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
+            "INSERT INTO licenses
+                (key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note)
              VALUES ($1, $2, 0, $3, FALSE, $4, NULL, $5)
              ON CONFLICT (key_hash) DO NOTHING",
         )
@@ -221,10 +249,12 @@ pub async fn batch_init_keys(
         .bind(note)
         .execute(pool)
         .await?;
+
         if result.rows_affected() == 1 {
             rows_affected += 1;
             keys.push(hkey);
         }
     }
+
     Ok((rows_affected, keys))
 }

@@ -1,7 +1,6 @@
 // client/src/main.rs — 优化版
 // ✅ BUG-06 FIX: license_guard::check_and_enforce() 是 async fn，需 .await
 // ✅ BUG-10 FIX: 地理检测两层降级，网络不可用时退出而非忽略
-
 use reqwest::Client;
 use std::process;
 mod cn_cidr;
@@ -14,7 +13,6 @@ mod storage;
 async fn main() {
     loc_detection().await;
 
-    // ✅ BUG-06 FIX: check_and_enforce 是 async fn，必须 .await
     license_guard::check_and_enforce().await;
     println!("✅ Your license is valid");
 

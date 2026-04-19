@@ -51,7 +51,7 @@ async fn main() {
         .layer(TraceLayer::new_for_http());
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    tracing::info!("License Server is running on {}", bind_addr);
+    tracing::info!("Server is running on {}", bind_addr);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
     axum::serve(listener, app)

@@ -1,7 +1,7 @@
-// client/src/network.rs — 优化版 v7
-// ✅ MINOR-3 FIX: ERR-TIME-RECORD 重试，超过 MAX_CLOCK_OFFSET_SECS(600s) 拒绝
-// ✅ 说明: 生产环境应使用 HTTPS（rustls-tls），防止 server_time 被 MITM 篡改
-// ✅ 改进: server_time 解析失败时返回明确错误，不无限重试
+// client/src/network.rs — 优化版 v8
+// ✅ MINOR-A FIX: SERVER_ID 默认值改为 "license-server-v1"，与服务端对齐
+// ✅ MINOR-C FIX: 时钟修正重试补偿网络延迟（记录请求发出时间，计算实际 RTT）
+// ✅ 原有: MINOR-3 (MAX_CLOCK_OFFSET_SECS 600s 限制), ERR-TIME-RECORD 解析失败不无限重试
 
 use hmac::{Hmac, Mac};
 use obfstr::obfstr;
@@ -11,7 +11,6 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<sha2::Sha256>;
-
 /// 本地时钟与服务端时钟允许的最大偏差（±600s = ±10分钟）
 const MAX_CLOCK_OFFSET_SECS: i64 = 600;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -62,9 +61,9 @@ pub fn hash_key(hkey: &str) -> String {
 }
 
 /// 签名格式: HMAC-SHA256(key=hkey, msg=SERVER_ID|key_hash|timestamp)
-/// 与服务端 verify_hmac_signature 完全对应
-fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> String {
-    let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| server_url.to_string());
+/// ✅ MINOR-A FIX: 默认值 "license-server-v1" 与服务端 get_server_id() 对齐
+fn sign_request(hkey: &str, key_hash: &str, ts: i64, _server_url: &str) -> String {
+    let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string()); // ← 与服务端默认值一致
     let mut mac = HmacSha256::new_from_slice(hkey.as_bytes()).unwrap();
     mac.update(server_id.as_bytes());
     mac.update(b"|");
@@ -76,6 +75,7 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> String
 
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
+
     match status.as_u16() {
         410 => return ERR_EXPIRED.to_string(),
         403 => match err_code {
@@ -86,6 +86,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         },
         _ => {}
     }
+
     match err_code {
         "ERR-REVOKED" => return ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" => return ERR_INVALID_KEY.to_string(),
@@ -93,23 +94,29 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         "ERR-EXPIRED" => return ERR_EXPIRED.to_string(),
         _ => {}
     }
+
     if err_code == "ERR-TIME-RECORD" {
         if let Some(st) = body["server_time"].as_i64() {
             return format!("ERR-TIME-RECORD:server_time={}", st);
         }
     }
+
     format!("HTTP {} {}", status.as_u16(), err_code)
 }
 
-async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<VerifyResponse, String> {
-    let ts = now_secs() + ts_offset;
+async fn do_verify(
+    hkey: &str,
+    server_url: &str,
+    ts_override: i64, // ✅ 直接传入已修正的时间戳
+) -> Result<VerifyResponse, String> {
     let key_hash = hash_key(hkey);
-    let signature = sign_request(hkey, &key_hash, ts, server_url);
+    let signature = sign_request(hkey, &key_hash, ts_override, server_url);
     let req = VerifyRequest {
         key_hash,
-        timestamp: ts,
+        timestamp: ts_override,
         signature,
     };
+
     let url = format!("{}/verify", server_url);
     let client = get_http_client();
     let resp = client
@@ -118,11 +125,13 @@ async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<Verif
         .send()
         .await
         .map_err(|e| e.to_string())?;
+
     let status = resp.status();
     let body: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("JSON decode error: {e}"))?;
+
     if status.is_success() {
         serde_json::from_value(body).map_err(|e| e.to_string())
     } else {
@@ -130,46 +139,50 @@ async fn do_verify(hkey: &str, server_url: &str, ts_offset: i64) -> Result<Verif
     }
 }
 
-/// 在线验证入口：自动处理时钟偏差（单次重试）
+/// 在线验证入口：自动处理时钟偏差（单次重试，补偿网络 RTT）
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
-    let mut ts_offset = 0i64;
-    let mut retried = false;
-    loop {
-        let result = do_verify(hkey, server_url, ts_offset).await;
-        if retried {
-            return result;
-        }
-        match &result {
-            Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
-                let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
-                match server_time_str.parse::<i64>() {
-                    Ok(server_ts) => {
-                        let offset = server_ts - now_secs();
-                        // ✅ MINOR-3 FIX: 超过 MAX_CLOCK_OFFSET_SECS 拒绝同步
-                        if offset.abs() > MAX_CLOCK_OFFSET_SECS {
-                            tracing::error!(
-                                "[License] 服务端时钟偏差 {}s 超过安全阈值 {}s，拒绝同步",
-                                offset,
-                                MAX_CLOCK_OFFSET_SECS
-                            );
-                            return Err(format!(
-                                "server clock offset {}s exceeds safe threshold {}s",
-                                offset, MAX_CLOCK_OFFSET_SECS
-                            ));
-                        }
-                        if offset.abs() > 60 {
-                            tracing::warn!("[License] 客户端时钟偏差 {}s，建议同步 NTP", offset);
-                        }
-                        ts_offset = offset;
-                        retried = true; // 继续 loop，使用 ts_offset 重试
-                    }
-                    Err(_) => {
-                        // ✅ 解析失败，返回原始错误，不无限重试
-                        return Err(e.clone());
-                    }
-                }
+    let local_ts = now_secs();
+    let result = do_verify(hkey, server_url, local_ts).await;
+
+    match &result {
+        Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
+            let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
+            let server_ts = match server_time_str.parse::<i64>() {
+                Ok(ts) => ts,
+
+                Err(_) => return Err(e.clone()), // 解析失败，不重试
+            };
+
+            // ✅ MINOR-C FIX: 补偿 RTT（假设请求/响应各占一半往返延迟）
+            // 用 "当前时间 - 发出请求时时间" 近似 RTT
+            let rtt_half = (now_secs() - local_ts).max(0);
+            let corrected_ts = server_ts + rtt_half;
+            let offset = corrected_ts - now_secs();
+
+            // 超过安全阈值，拒绝同步
+            if offset.abs() > MAX_CLOCK_OFFSET_SECS {
+                tracing::error!(
+                    "[License] Server clock offset {}s exceeds safe threshold {}s, refusing sync",
+                    offset,
+                    MAX_CLOCK_OFFSET_SECS
+                );
+
+                return Err(format!(
+                    "server clock offset {}s exceeds safe threshold {}s",
+                    offset, MAX_CLOCK_OFFSET_SECS
+                ));
             }
-            _ => return result,
+
+            if offset.abs() > 60 {
+                tracing::warn!(
+                    "[License] Client clock skew {}s detected, consider NTP sync",
+                    offset
+                );
+            }
+
+            // 重试（仅一次）
+            do_verify(hkey, server_url, corrected_ts).await
         }
+        _ => result,
     }
 }

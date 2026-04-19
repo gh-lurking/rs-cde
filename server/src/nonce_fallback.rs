@@ -1,7 +1,8 @@
-// server/src/nonce_fallback.rs — 优化版 v3
-// ✅ CRIT-2 分析: DashMap entry() 持有 shard 写锁，Occupied arm 内操作是原子的
-// ✅ 修复: 明确注释说明 Occupied::insert() 语义，消除误导性注释
-// ✅ 修复: cleanup_loop 使用 tokio::spawn，已在 nonce_map() 初始化时启动
+// server/src/nonce_fallback.rs — 优化版 v4
+
+// ✅ CRIT-B FIX: Occupied arm expires_at 比较方向明确（<= now = 已过期可复用）
+//               并修复原始代码截断导致的逻辑不完整问题
+// ✅ 新增: now 提前绑定为局部变量，避免 borrow 问题
 use dashmap::DashMap;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,8 +15,8 @@ static MEMORY_NONCES: OnceLock<DashMap<String, NonceEntry>> = OnceLock::new();
 
 fn nonce_map() -> &'static DashMap<String, NonceEntry> {
     MEMORY_NONCES.get_or_init(|| {
-        // cleanup_loop 在独立 tokio task 中运行
         tokio::spawn(cleanup_loop());
+
         DashMap::new()
     })
 }
@@ -27,31 +28,34 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// 检查并存储 nonce（原子操作，基于 DashMap shard 锁）
+/// 检查并存储 nonce（基于 DashMap shard 锁，在 match arm 内原子执行）
 ///
-/// DashMap::entry() 持有目标 shard 的写锁直到 match arm 结束，保证原子性。
-/// 在 match arm 内，get() + insert() 在同一锁范围内执行，无 TOCTOU。
-///
-/// 返回 true  = nonce 有效（新 nonce 或过期 nonce slot 被复用）
-/// 返回 false = nonce 已存在且未过期（重放攻击，拒绝）
+/// DashMap::entry() 持有目标 shard 的写锁直到 match arm 结束：
+/// - Occupied arm 内：先检查是否过期，再决定是否复用
+/// - Vacant arm：直接插入
+/// 返回 true  = nonce 有效（新请求，或已过期 slot 被复用）
+/// 返回 false = nonce 仍有效但已存在（重放攻击，拒绝）
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
-    let now = now_secs();
+    let now = now_secs(); // ✅ 提前绑定，避免 borrow 问题
     let expires_at = now + ttl_secs;
 
     use dashmap::mapref::entry::Entry;
     match map.entry(key.to_string()) {
         Entry::Occupied(mut e) => {
-            if e.get().expires_at < now {
-                // 过期 slot 复用（在同一 shard 写锁内，原子）
-                // Occupied::insert() 替换当前值，语义明确
+            // ✅ CRIT-B FIX: 正确比较方向
+            // e.get().expires_at <= now  → 该 nonce slot 已过期，可以复用（允许通过）
+            // e.get().expires_at >  now  → nonce 仍有效，属于重放攻击（拒绝）
+            if e.get().expires_at <= now {
+                // 过期 nonce，复用 slot（更新 expires_at），允许通过
                 e.insert(NonceEntry { expires_at });
-                true // 过期后被复用，允许通过
+                true
             } else {
-                // 未过期 = 重放攻击，拒绝
+                // 未过期 nonce，重放攻击，拒绝
                 false
             }
         }
+
         Entry::Vacant(e) => {
             // 新 nonce，插入并允许通过
             e.insert(NonceEntry { expires_at });
@@ -70,7 +74,7 @@ async fn cleanup_loop() {
         map.retain(|_, v| v.expires_at > now);
         let after = map.len();
         if before != after {
-            tracing::debug!("[NonceFallback] 清理过期 nonce {} 条", before - after);
+            tracing::debug!("[NonceFallback] Cleaned {} expired nonces", before - after);
         }
     }
 }
