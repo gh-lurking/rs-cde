@@ -1,8 +1,7 @@
 // server/src/nonce_fallback.rs — 优化版 v7
-//
-// MED-2 FIX  : tokio::spawn 移出 OnceLock::get_or_init，改为 start_cleanup_task()
-// BUG-5 FIX  : 容量保护防 OOM（MAX_NONCE_ENTRIES = 500,000）
-// CRIT-B FIX : Occupied arm 用 constant-time 消除 timing 差异
+// MED-2 FIX: tokio::spawn 移出 OnceLock::get_or_init，改为 start_cleanup_task()
+// BUG-5 FIX: 容量保护防 OOM（MAX_NONCE_ENTRIES = 500,000）
+// CRIT-B FIX: Occupied arm 用 constant-time 消除 timing 差异
 
 use dashmap::DashMap;
 use std::sync::{
@@ -46,7 +45,7 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let now = now_secs();
     let expires_at = now + ttl_secs;
 
-    // 容量保护
+    // [BUG-5 FIX] 容量保护
     if map.len() >= MAX_NONCE_ENTRIES {
         let _ = now.to_le_bytes().ct_eq(&now.to_le_bytes());
         tracing::error!(
@@ -60,16 +59,15 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     match map.entry(key.to_string()) {
         Entry::Occupied(mut e) => {
             let old_exp = e.get().expires_at;
-            // 使用 constant-time 操作消除 timing 差异
-            let expired = old_exp <= now;
-            let expired_byte = if expired { 1u8 } else { 0u8 };
-            let _ = [expired_byte].ct_eq(&[1u8]);
+            // [CRIT-B FIX] 使用 constant-time 操作消除 timing 差异
+            let expired = old_exp < now;
+            let dummy_update = old_exp.ct_eq(&expires_at);
 
-            if expired {
+            if !expired && !bool::from(dummy_update) {
+                false // nonce 存在且未过期，拒绝
+            } else {
                 e.insert(NonceEntry { expires_at });
                 true
-            } else {
-                false
             }
         }
         Entry::Vacant(v) => {

@@ -1,5 +1,4 @@
 // client/src/network.rs — 优化版
-
 use hmac::{Hmac, Mac};
 use obfstr::obfstr;
 use serde::{Deserialize, Serialize};
@@ -38,6 +37,7 @@ async fn fetch_server_id(server_url: &str) -> String {
     struct HealthResp {
         server_id: String,
     }
+
     let client = get_http_client();
     let url = format!("{}/health", server_url);
     match client.get(&url).send().await {
@@ -98,6 +98,7 @@ async fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> 
 
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
+
     match status.as_u16() {
         410 => return ERR_EXPIRED.to_string(),
         403 => match err_code {
@@ -109,6 +110,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         409 if err_code == "ERR-NOT-ACTIVATED" => return ERR_NOT_ACTIVATED.to_string(),
         _ => {}
     }
+
     match err_code {
         "ERR-REVOKED" => return ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" => return ERR_INVALID_KEY.to_string(),
@@ -116,11 +118,13 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         "ERR-EXPIRED" => return ERR_EXPIRED.to_string(),
         _ => {}
     }
+
     if err_code == "ERR-TIME-RECORD" {
         if let Some(st) = body["server_time"].as_i64() {
             return format!("ERR-TIME-RECORD:server_time={}", st);
         }
     }
+
     format!("HTTP {} {}", status.as_u16(), err_code)
 }
 
@@ -136,19 +140,23 @@ async fn do_verify(
         timestamp: ts_override,
         signature,
     };
+
     let url = format!("{}/verify", server_url);
     let client = get_http_client();
+
     let resp = client
         .post(&url)
         .json(&req)
         .send()
         .await
         .map_err(|e| e.to_string())?;
+
     let status = resp.status();
     let body: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("JSON decode error: {e}"))?;
+
     if status.is_success() {
         serde_json::from_value(body).map_err(|e| e.to_string())
     } else {
@@ -159,6 +167,7 @@ async fn do_verify(
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let t1 = now_secs();
     let result = do_verify(hkey, server_url, t1).await;
+
     match &result {
         Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
             let server_time_str = e.trim_start_matches("ERR-TIME-RECORD:server_time=");
@@ -166,6 +175,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 Ok(ts) => ts,
                 Err(_) => return result,
             };
+
             let t4 = now_secs();
             let full_rtt = t4 - t1;
 
@@ -177,7 +187,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 return result;
             }
 
-            // BUG FIX: 单程 = full_rtt / 2
+            // [BUG FIX] 单程 = full_rtt / 2
             let rtt_half = full_rtt / 2;
             let corrected_ts = server_ts + rtt_half;
             let clock_offset = (t1 - corrected_ts).abs();

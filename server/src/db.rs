@@ -1,16 +1,12 @@
 // server/src/db.rs — 优化版 v9
-//
-// OPT-4 FIX: MAX_EXTEND_DAYS / MAX_EXTEND_SECS 定义为 pub 常量，handler 层引用
+// OPT-4 FIX: MAX_EXTEND_DAYS / MAX_EXTEND_SECS 定义为 pub 常量
 // OPT-1 FIX: batch_init_keys 使用 unnest() 一次 DB trip 完成批量插入
-
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-// use uuid::Uuid;
 
 pub type DbPool = PgPool;
-
-/// OPT-4 FIX: 续期上限常量，handler 层引用此值，消除硬编码重复
+/// [OPT-4 FIX] 续期上限常量，handler 层引用此值
 pub const MAX_EXTEND_DAYS: i64 = 3650;
 const MAX_EXTEND_SECS: i64 = MAX_EXTEND_DAYS * 86400;
 
@@ -40,7 +36,7 @@ pub struct LicenseRecord {
     pub note: String,
 }
 
-pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
+pub async fn init_pool(database_url: &str) -> Result<DbPool, Box<dyn std::error::Error>> {
     let max_conn: u32 = std::env::var("PG_POOL_MAX_CONN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -61,14 +57,14 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key          TEXT    NOT NULL,
-            key_hash     TEXT    PRIMARY KEY,
+            key TEXT NOT NULL,
+            key_hash TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at   BIGINT NOT NULL DEFAULT 0,
-            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   BIGINT NOT NULL,
-            last_check   BIGINT,
-            note         TEXT    NOT NULL DEFAULT ''
+            expires_at BIGINT NOT NULL DEFAULT 0,
+            revoked BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at BIGINT NOT NULL,
+            last_check BIGINT,
+            note TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
@@ -78,7 +74,6 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .execute(&pool)
         .await?;
 
-    // 部分索引，仅覆盖有效且已激活的 key
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires ON licenses (expires_at)
          WHERE revoked = FALSE AND activation_ts > 0",
@@ -135,7 +130,8 @@ pub async fn activate_license(
     expires_at: i64,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE licenses SET activation_ts = $1, expires_at = $2
+        "UPDATE licenses
+         SET activation_ts = $1, expires_at = $2
          WHERE key_hash = $3 AND activation_ts = 0 AND revoked = FALSE",
     )
     .bind(activation_ts)
@@ -168,8 +164,8 @@ pub async fn revoke_license(
     Ok(())
 }
 
-/// OPT-4 FIX: 使用 pub 常量，截断时输出警告日志
-/// LOGIC-A: GREATEST(expires_at, now) + extra_secs（防止对已过期 key 续期时从负数开始）
+/// [OPT-4 FIX] 使用 pub 常量，截断时输出警告日志
+/// [LOGIC-A] GREATEST(expires_at, now) + extra_secs（防止对已过期 key 续期时从负数开始）
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
@@ -186,6 +182,7 @@ pub async fn extend_license(
     } else {
         extra_secs
     };
+
     let row: Option<(i64,)> = sqlx::query_as(
         "UPDATE licenses
          SET expires_at = GREATEST(expires_at, $1) + $2
@@ -209,7 +206,7 @@ pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx
     .await
 }
 
-/// OPT-1 FIX: 使用 unnest() 批量 INSERT，O(1) DB trips
+/// [OPT-1 FIX] 使用 unnest() 批量 INSERT，O(1) DB trips
 pub async fn batch_init_keys(
     pool: &DbPool,
     keys: &[String],
@@ -218,10 +215,12 @@ pub async fn batch_init_keys(
     if keys.is_empty() {
         return Ok(());
     }
+
     let now = now_db();
     let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
     let created_ats = vec![now; keys.len()];
     let notes = vec![note.to_string(); keys.len()];
+
     sqlx::query(
         "INSERT INTO licenses (key, key_hash, created_at, note)
          SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[])
@@ -233,6 +232,7 @@ pub async fn batch_init_keys(
     .bind(&notes)
     .execute(pool)
     .await?;
+
     tracing::info!("[DB] batch_init_keys: {} keys inserted", keys.len());
     Ok(())
 }
