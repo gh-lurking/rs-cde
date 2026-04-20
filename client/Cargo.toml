@@ -1,7 +1,7 @@
 [package]
 name = "tester"
 version = "0.2.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 # AES-128-GCM 认证加密
@@ -38,7 +38,6 @@ anyhow = "1"
 tracing = "0.1"
 
 # subtle = "2"
-
 # M-04 FIX: 移除 async-recursion，改用 loop + flag
 
 [profile.release]

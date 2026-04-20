@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
+// use uuid::Uuid;
 
 pub type DbPool = PgPool;
 

@@ -1,8 +1,5 @@
-// client/src/license_guard.rs — 优化版 v10
-//
-// CRIT-2 FIX: 离线模式必须校验 local_expires vs now（过期检查，且放在最前面）
-// OPT-3 FIX : repair_failed=true 时不立即 exit，记录警告后继续
-
+// client/src/license_guard.rs — 优化版
+// CRITICAL FIX: 离线模式必须校验 local_expires vs now（过期检查，且放在最前面）
 use crate::{network, storage};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,7 +87,6 @@ pub async fn check_and_enforce() {
                 eprintln!("[License] Key restricted by region ({}), aborting", e);
                 std::process::exit(1);
             }
-            // MED-3 FIX: ERR-CLOCK-SKEW-PERSISTENT 也是确定性失败
             if e.starts_with("ERR-CLOCK-SKEW-PERSISTENT:") {
                 eprintln!(
                     "[License] Persistent clock skew detected ({}), cannot verify, aborting",
@@ -129,17 +125,17 @@ pub async fn check_and_enforce() {
                 } => {
                     if repair_failed {
                         eprintln!(
-                            "[License] Local replica repair failed (storage may be unreliable).                              Proceeding with caution — will force online next launch."
+                            "[License] Local replica repair failed (storage may be unreliable). \
+                             Proceeding with caution — will force online next launch."
                         );
-                        // OPT-3 FIX: repair_failed 不立即 exit，记录警告后继续
                     }
 
-                    // CRIT-2 FIX: 离线模式必须首先检查过期时间！
-                    // 此检查必须在其他合法性校验之前，否则过期密钥可通过后续检查
+                    // CRITICAL FIX: 离线模式必须首先检查过期时间！
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
                         eprintln!(
-                            "[License] Key expired {} days ago (offline cache, expires={}, now={}),                              please restore network and renew",
+                            "[License] Key expired {} days ago (offline cache, expires={}, now={}), \
+                             please restore network and renew",
                             days, local_expires, now
                         );
                         std::process::exit(1);
