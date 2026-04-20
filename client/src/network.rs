@@ -1,14 +1,14 @@
 // client/src/network.rs — 增强时间校验版
-// ✅ BUG-03 FIX: validate_system_time 使用真实 HTTPS 时间校验
+// 关键修复：validate_system_time 使用真实 HTTPS 时间校验
+
 use hmac::{Hmac, Mac};
-use obfstr::obfstr;
+// use obfstr::obfstr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<sha2::Sha256>;
-
+type HmacSha256 = Hmac<Sha256>;
 const MAX_CLOCK_OFFSET_SECS: i64 = 600;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -41,7 +41,6 @@ async fn fetch_server_id(server_url: &str) -> String {
 
     let client = get_http_client();
     let url = format!("{}/health", server_url);
-
     match client.get(&url).send().await {
         Ok(resp) => {
             if let Ok(h) = resp.json::<HealthResp>().await {
@@ -50,7 +49,6 @@ async fn fetch_server_id(server_url: &str) -> String {
         }
         Err(e) => tracing::warn!("[Network] Failed to fetch server_id: {}", e),
     }
-
     std::env::var("SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string())
 }
 
@@ -101,7 +99,6 @@ async fn sign_request(hkey: &str, key_hash: &str, ts: i64, server_url: &str) -> 
 
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
-
     match status.as_u16() {
         410 => return ERR_EXPIRED.to_string(),
         403 => match err_code {
@@ -137,7 +134,6 @@ async fn do_verify(
 ) -> Result<VerifyResponse, String> {
     let key_hash = hash_key(hkey);
     let signature = sign_request(hkey, &key_hash, ts_override, server_url).await;
-
     let req = VerifyRequest {
         key_hash,
         timestamp: ts_override,
@@ -146,7 +142,6 @@ async fn do_verify(
 
     let url = format!("{}/verify", server_url);
     let client = get_http_client();
-
     let resp = client
         .post(&url)
         .json(&req)
@@ -181,7 +176,6 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
 
             let t4 = now_secs();
             let full_rtt = t4 - t1;
-
             if full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
                 eprintln!("[Network] Unreasonable RTT: {}s", full_rtt);
                 return result;
@@ -213,7 +207,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
     }
 }
 
-/// ✅ BUG-03 FIX: 增强的系统时间校验
+/// 增强的系统时间校验
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -253,7 +247,6 @@ pub async fn validate_system_time() -> Result<(), String> {
                         let offset = local_now as i64 - server_time as i64;
                         total_offset += offset;
                         valid_checks += 1;
-
                         tracing::info!("[Time] Source: {}, offset: {}s", url, offset);
                     }
                 }
@@ -267,7 +260,6 @@ pub async fn validate_system_time() -> Result<(), String> {
     }
 
     let avg_offset = total_offset / valid_checks as i64;
-
     if avg_offset.abs() > 3600 {
         return Err(format!(
             "System time deviation too large: {}s (avg from {} sources)",
@@ -283,10 +275,8 @@ pub async fn validate_system_time() -> Result<(), String> {
 }
 
 /// 解析 HTTP Date header 为 Unix 时间戳
+/// 支持格式: "Mon, 01 Jan 2024 00:00:00 GMT"
 fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
-    // 支持常见格式: "Mon, 01 Jan 2024 00:00:00 GMT"
-    // 简化实现，使用 time parsing
-
     let months = [
         ("Jan", 1),
         ("Feb", 2),
@@ -307,12 +297,26 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
         return None;
     }
 
-    let day: u32 = parts[1].parse().ok()?;
-    let month = months.iter().find(|(m, _)| *m == parts[2])?.1;
-    let year: i32 = parts[3].parse().ok()?;
+    // 格式: Mon, 01 Jan 2024 00:00:00 GMT
+    // 或:   01 Jan 2024 00:00:00 GMT (无前缀)
+    let date_part_idx = if parts[0].ends_with(',') { 1 } else { 0 };
 
-    let time_parts: Vec<&str> = parts[4].split(':').collect();
-    if time_parts.len() < 3 {
+    if parts.len() < date_part_idx + 4 {
+        return None;
+    }
+
+    let day: u32 = parts[date_part_idx].parse().ok()?;
+    let month_name = parts[date_part_idx + 1];
+    let year: i32 = parts[date_part_idx + 2].parse().ok()?;
+    let time_part = parts[date_part_idx + 3];
+
+    let month = months
+        .iter()
+        .find(|(m, _)| *m == month_name)
+        .map(|(_, n)| *n)?;
+
+    let time_parts: Vec<&str> = time_part.split(':').collect();
+    if time_parts.len() != 3 {
         return None;
     }
 
@@ -320,33 +324,39 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let minute: u32 = time_parts[1].parse().ok()?;
     let second: u32 = time_parts[2].parse().ok()?;
 
-    // 简化计算，假设在合理范围内
-    // 实际项目中应使用 chrono 或 time crate
-    let days_since_epoch = calculate_days_since_epoch(year, month, day);
-    let timestamp =
+    // 计算从 1970-01-01 到目标日期的天数
+    let days_since_epoch = days_since_1970(year, month, day);
+
+    let total_seconds =
         days_since_epoch * 86400 + hour as u64 * 3600 + minute as u64 * 60 + second as u64;
 
-    Some(timestamp)
+    Some(total_seconds)
 }
 
-fn calculate_days_since_epoch(year: i32, month: u32, day: u32) -> u64 {
-    // 简化的日期计算
-    let mut y = year - 1970;
-    let mut days = y as u64 * 365;
+/// 计算从 1970-01-01 到指定日期的天数
+fn days_since_1970(year: i32, month: u32, day: u32) -> u64 {
+    let mut days = 0i64;
 
-    // 添加闰年
-    days += ((year - 1) / 4 - 1969 / 4) as u64;
-    days -= ((year - 1) / 100 - 1969 / 100) as u64;
-    days += ((year - 1) / 400 - 1969 / 400) as u64;
-
-    // 月份天数
-    let month_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    days += month_days[(month - 1) as usize] as u64;
-
-    // 如果是闰年且在2月之后
-    if month > 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
-        days += 1;
+    // 计算完整年份的天数
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
     }
 
-    days + day as u64 - 1
+    // 计算当年月份的天数
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += month_days[(m - 1) as usize] as i64;
+        if m == 2 && is_leap_year(year) {
+            days += 1;
+        }
+    }
+
+    // 加上当月的天数
+    days += (day - 1) as i64;
+
+    days as u64
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }

@@ -1,7 +1,5 @@
 // client/src/storage.rs — 最终版
-// ✅ OPT-5 FIX: MAX_LICENSE_PERIOD 常量已定义
-// ✅ MAJOR-A FIX: N=2:0 误判修复
-// ✅ MAJOR-B FIX: best_val 值域合理性验证
+// 本地加密存储和仲裁读取
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -45,20 +43,16 @@ fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
     h.update(salt.as_bytes());
     h.update(hkey.as_bytes());
     let d = h.finalize();
-
     let dir_name = format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3]);
     let files = ["index.db", "cache.bin", "meta.dat"];
-
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".to_string());
-
     let bases = [
         format!("{}/.cache/.sys/{}", home, dir_name),
         format!("{}/.local/share/.sys/{}", home, dir_name),
         format!("{}/.config/.sys/{}", home, dir_name),
     ];
-
     PathBuf::from(&bases[slot as usize % 3]).join(files[slot as usize % 3])
 }
 
@@ -140,7 +134,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // 统计投票
+    // 统计各值出现次数
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(entry) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -157,6 +151,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         return LocalReadResult::Tampered { read_count };
     }
 
+    // 合理性验证
     let now_u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -164,28 +159,26 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
 
     let (act_ts, exp_ts) = best_val;
 
-    // 值域验证
+    // 防止伪造的未来时间戳
     if act_ts > now_u64 + 300 {
         return LocalReadResult::Tampered { read_count };
     }
-
     if exp_ts == 0 || exp_ts > now_u64 + MAX_LICENSE_PERIOD {
         return LocalReadResult::Tampered { read_count };
     }
-
     if act_ts == 0 || exp_ts <= act_ts {
         return LocalReadResult::Tampered { read_count };
     }
 
-    // 修复不一致的副本
+    // 修复不同步的副本
     let mut repair_failed = false;
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
-        let needs_repair = match read_slot(&path, &key) {
+        let current = read_slot(&path, &key);
+        let needs_repair = match current {
             Some(v) => v != best_val,
             None => true,
         };
-
         if needs_repair {
             if let Err(e) = write_slot(&path, &key, best_val.0, best_val.1) {
                 tracing::warn!("[Storage] Replica {} repair failed: {}", slot, e);

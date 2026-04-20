@@ -1,8 +1,8 @@
 // server/src/handlers.rs — 修复 batch_init 版
-// ✅ BUG-02 FIX: batch_init 返回原始密钥
-// ✅ CRIT-1 FIX: activate: HMAC 提前到 nonce 前
-// ✅ CRIT-2 FIX: verify: Cache Hit 路径增加 nonce 防重放检查
-// ✅ CRIT-3 FIX: verify: Cache Hit 路径增加 tombstone 二次确认
+// 关键修复：
+// 1. HMAC 提前到 nonce 前检查
+// 2. Cache Hit 路径增加 nonce 防重放检查
+// 3. Cache Hit 路径增加 tombstone 二次确认
 
 use crate::cache::{RedisPool, VerifyCacheEntry};
 use crate::{auth, cache, db, nonce_fallback};
@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-type HmacSha256 = Hmac<sha2::Sha256>;
+type HmacSha256 = Hmac<Sha256>;
 
 static SERVER_ID: OnceLock<String> = OnceLock::new();
 
@@ -54,7 +54,6 @@ fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -
     mac.update(key_hash.as_bytes());
     mac.update(b"|");
     mac.update(timestamp.to_string().as_bytes());
-
     let expected_bytes = mac.finalize().into_bytes();
     let expected_hex = hex::encode(&expected_bytes);
 
@@ -89,6 +88,7 @@ fn nonce_ttl() -> i64 {
 
 async fn check_and_store_nonce(redis_pool: &RedisPool, key_hash: &str, sig: &str) -> bool {
     let key = format!("nonce:{}:{}", key_hash, sig);
+
     match redis_pool.get().await {
         Ok(mut conn) => {
             let result: Result<Option<String>, _> = deadpool_redis::redis::cmd("SET")
@@ -113,6 +113,7 @@ async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> boo
     let Ok(mut conn) = redis_pool.get().await else {
         return true;
     };
+
     let result: Result<Option<String>, _> = deadpool_redis::redis::cmd("SET")
         .arg(&throttle_key)
         .arg("1")
@@ -121,10 +122,12 @@ async fn should_update_last_check(redis_pool: &RedisPool, key_hash: &str) -> boo
         .arg("NX")
         .query_async(&mut conn)
         .await;
+
     matches!(result, Ok(Some(_)))
 }
 
-// POST /activate
+// POST /activate ─────────────────────────────────────────────────────
+
 #[derive(Deserialize)]
 pub struct ActivateReq {
     key_hash: String,
@@ -234,7 +237,8 @@ pub async fn activate(
     }
 }
 
-// POST /verify
+// POST /verify ───────────────────────────────────────────────────────
+
 #[derive(Deserialize)]
 pub struct VerifyReq {
     key_hash: String,
@@ -278,7 +282,7 @@ pub async fn verify(
 
     // 缓存命中路径
     if let Some(cached) = cache::get_verify_cache(&redis_pool, &req.key_hash).await {
-        // ✅ FIX: 验证缓存的 key_hash 是否一致
+        // 验证缓存的 key_hash 是否一致
         let cached_key_hash = hash_key(&cached.key);
         if cached_key_hash != req.key_hash {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
@@ -292,6 +296,7 @@ pub async fn verify(
                 )
                     .into_response();
             }
+
             // 缓存命中路径增加 tombstone 二次确认
             if cache::is_revoked(&redis_pool, &req.key_hash).await {
                 return (
@@ -300,6 +305,7 @@ pub async fn verify(
                 )
                     .into_response();
             }
+
             // 检查过期
             if now >= cached.expires_at {
                 cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
@@ -312,10 +318,12 @@ pub async fn verify(
                 )
                     .into_response();
             }
+
             // 节流更新 last_check
             if should_update_last_check(&redis_pool, &req.key_hash).await {
                 let _ = db::update_last_check(&pool, &req.key_hash, now).await;
             }
+
             return Json(serde_json::json!({
                 "activation_ts": cached.activation_ts,
                 "expires_at": cached.expires_at,
@@ -422,7 +430,8 @@ pub async fn verify(
     .into_response()
 }
 
-// GET /health
+// GET /health ────────────────────────────────────────────────────────
+
 pub async fn health() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
@@ -431,15 +440,7 @@ pub async fn health() -> impl IntoResponse {
     }))
 }
 
-// Admin handlers
-#[derive(Deserialize)]
-pub struct AdminToken {
-    token: String,
-}
-
-fn check_admin(provided: &str, expected: &Arc<String>) -> bool {
-    auth::verify_admin_token(provided, expected)
-}
+// Admin handlers ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -451,9 +452,10 @@ pub async fn list_licenses(
     Extension(admin_token): Extension<Arc<String>>,
     Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
-    if !check_admin(&q.token, &admin_token) {
+    if !auth::verify_admin_token(&q.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+
     match db::list_all_licenses(&pool).await {
         Ok(licenses) => Json(serde_json::json!({"licenses": licenses})).into_response(),
         Err(e) => {
@@ -476,13 +478,16 @@ pub async fn revoke_license(
     Extension(admin_token): Extension<Arc<String>>,
     Json(req): Json<RevokeReq>,
 ) -> impl IntoResponse {
-    if !check_admin(&req.token, &admin_token) {
+    if !auth::verify_admin_token(&req.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+
     if !validate_key_hash(&req.key_hash) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+
     let reason = req.reason.unwrap_or_else(|| "revoked by admin".to_string());
+
     match db::revoke_license(&pool, &req.key_hash, &reason).await {
         Ok(()) => {
             cache::set_revoked_tombstone(&redis_pool, &req.key_hash).await;
@@ -510,17 +515,20 @@ pub async fn extend_license(
     Extension(admin_token): Extension<Arc<String>>,
     Json(req): Json<ExtendReq>,
 ) -> impl IntoResponse {
-    if !check_admin(&req.token, &admin_token) {
+    if !auth::verify_admin_token(&req.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if req.extra_days < 1 || req.extra_days > db::MAX_EXTEND_DAYS {
+
+    if req.extra_days <= 0 || req.extra_days > db::MAX_EXTEND_DAYS {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "extra_days out of range"})),
         )
             .into_response();
     }
+
     let extra_secs = req.extra_days * 86400;
+
     match db::extend_license(&pool, &req.key_hash, extra_secs).await {
         Ok(Some(new_expires)) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
@@ -555,13 +563,15 @@ pub async fn add_key(
     Extension(admin_token): Extension<Arc<String>>,
     Json(req): Json<AddKeyReq>,
 ) -> impl IntoResponse {
-    if !check_admin(&req.token, &admin_token) {
+    if !auth::verify_admin_token(&req.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+
     let key = generate_hkey();
     let key_hash = hash_key(&key);
     let now = now_secs();
     let note = req.note.unwrap_or_default();
+
     match db::insert_license(&pool, &key, &key_hash, now, &note).await {
         Ok(()) => Json(serde_json::json!({"key": key, "key_hash": key_hash})).into_response(),
         Err(e) => {
@@ -578,15 +588,15 @@ pub struct BatchInitReq {
     note: Option<String>,
 }
 
-/// ✅ BUG-02 FIX: batch_init 返回原始密钥，供管理员分发
 pub async fn batch_init(
     Extension(pool): Extension<Arc<db::DbPool>>,
     Extension(admin_token): Extension<Arc<String>>,
     Json(req): Json<BatchInitReq>,
 ) -> impl IntoResponse {
-    if !check_admin(&req.token, &admin_token) {
+    if !auth::verify_admin_token(&req.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+
     if req.count == 0 || req.count > 10_000 {
         return (
             StatusCode::BAD_REQUEST,
@@ -594,12 +604,12 @@ pub async fn batch_init(
         )
             .into_response();
     }
+
     let note = req.note.unwrap_or_default();
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
 
     match db::batch_init_keys(&pool, &keys, &note).await {
         Ok(()) => {
-            // ✅ FIX: 返回原始密钥和对应的 hash（供管理员分发）
             let results: Vec<_> = keys
                 .iter()
                 .map(|k| {
@@ -613,7 +623,7 @@ pub async fn batch_init(
             Json(serde_json::json!({
                 "ok": true,
                 "count": keys.len(),
-                "keys": results,  // ✅ 包含原始密钥
+                "keys": results,
             }))
             .into_response()
         }

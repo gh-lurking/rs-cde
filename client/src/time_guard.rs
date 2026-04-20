@@ -1,13 +1,13 @@
-// client/src/time_guard.rs — 新增模块
-// ✅ BUG-04 FIX: 运行时时间监控，防止运行过程中修改系统时间
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::OnceLock;
+// client/src/time_guard.rs — 运行时时间监控模块
+// 修复：运行时时间监控，防止运行过程中修改系统时间
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+// use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static LAST_VALID_TIME: AtomicI64 = AtomicI64::new(0);
 static EXPIRY_TIME: AtomicI64 = AtomicI64::new(0);
-static MONITOR_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// 设置密钥过期时间（供 license_guard 调用）
 pub fn set_expiry_time(expires_at: i64) {

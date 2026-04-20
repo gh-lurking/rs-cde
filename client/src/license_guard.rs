@@ -1,6 +1,7 @@
 // client/src/license_guard.rs — 最终优化版
-// ✅ CRITICAL FIX: 离线模式必须校验 local_expires vs now
-// ✅ NEW: 集成时间监控
+// 关键修复：
+// 1. 离线模式必须校验 local_expires vs now
+// 2. 集成时间监控
 
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
@@ -57,7 +58,7 @@ pub async fn check_and_enforce() {
                 resp.expires_at as u64,
             );
 
-            // ✅ NEW: 设置时间监控基准
+            // 设置时间监控基准
             time_guard::set_expiry_time(resp.expires_at);
         }
 
@@ -111,7 +112,7 @@ pub async fn check_and_enforce() {
                         eprintln!("[License] Local replica repair failed, proceeding with caution");
                     }
 
-                    // ✅ CRITICAL: 离线模式首先检查过期时间
+                    // 关键修复：离线模式首先检查过期时间
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
                         eprintln!("[License] Key expired {} days ago (offline cache)", days);
@@ -139,7 +140,7 @@ pub async fn check_and_enforce() {
                         remaining
                     );
 
-                    // ✅ NEW: 设置时间监控基准
+                    // 设置时间监控基准
                     time_guard::set_expiry_time(local_expires as i64);
                 }
             }
