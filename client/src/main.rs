@@ -1,6 +1,7 @@
 // client/src/main.rs — 优化版
 // ✅ BUG-06 FIX: license_guard::check_and_enforce() 是 async fn，需 .await
 // ✅ BUG-10 FIX: 地理检测两层降级，网络不可用时退出而非忽略
+
 use reqwest::Client;
 use std::process;
 mod cn_cidr;
@@ -8,6 +9,7 @@ mod geo_check;
 mod license_guard;
 mod network;
 mod storage;
+mod time_guard;
 
 #[tokio::main]
 async fn main() {
@@ -20,6 +22,8 @@ async fn main() {
     }
 
     license_guard::check_and_enforce().await;
+    // ✅ NEW: 启动运行时时间监控
+    time_guard::start_monitor();
     println!("✅ Your license is valid");
 
     run_client().await;

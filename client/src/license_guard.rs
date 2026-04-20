@@ -1,7 +1,8 @@
-// client/src/license_guard.rs — 优化版
-// CRITICAL FIX: 离线模式必须校验 local_expires vs now（过期检查放在最前面）
+// client/src/license_guard.rs — 最终优化版
+// ✅ CRITICAL FIX: 离线模式必须校验 local_expires vs now
+// ✅ NEW: 集成时间监控
 
-use crate::{network, storage};
+use crate::{network, storage, time_guard};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,101 +22,83 @@ pub async fn check_and_enforce() {
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
             if resp.revoked {
-                eprintln!("[License] Server returned revoked=true with HTTP 200, aborting");
+                eprintln!("[License] Server returned revoked=true");
                 std::process::exit(1);
             }
             if resp.activation_ts <= 0 || resp.expires_at <= 0 {
-                eprintln!(
-                    "[License] Invalid record (activation_ts={}, expires_at={}), aborting",
-                    resp.activation_ts, resp.expires_at
-                );
+                eprintln!("[License] Invalid record");
                 std::process::exit(1);
             }
             if resp.activation_ts > now + 300 {
-                eprintln!(
-                    "[License] activation_ts({}) is in the future (now={}), clock tampering, aborting",
-                    resp.activation_ts, now
-                );
+                eprintln!("[License] activation_ts in the future, clock tampering");
                 std::process::exit(1);
             }
             if resp.activation_ts >= resp.expires_at {
-                eprintln!(
-                    "[License] Data anomaly: activation_ts({}) >= expires_at({}), aborting",
-                    resp.activation_ts, resp.expires_at
-                );
+                eprintln!("[License] Data anomaly: activation_ts >= expires_at");
                 std::process::exit(1);
             }
             if now >= resp.expires_at {
                 let days = (now - resp.expires_at) / 86400;
-                eprintln!(
-                    "[License] Key expired {} days ago (expires={}, now={}), please renew",
-                    days, resp.expires_at, now
-                );
+                eprintln!("[License] Key expired {} days ago", days);
                 std::process::exit(1);
             }
+
             let remaining = (resp.expires_at - now) / 86400;
             println!(
                 "[License] Online verification passed, {} days remaining",
                 remaining
             );
+
+            // 写入本地缓存
             storage::write_all_replicas(
                 &hkey,
                 &salt,
                 resp.activation_ts as u64,
                 resp.expires_at as u64,
             );
+
+            // ✅ NEW: 设置时间监控基准
+            time_guard::set_expiry_time(resp.expires_at);
         }
 
         Err(ref e) => {
-            // 确定性失败：直接退出，不走离线路径
+            // 确定性失败：直接退出
             if e == network::ERR_REVOKED {
-                eprintln!("[License] Key revoked by server, aborting");
+                eprintln!("[License] Key revoked by server");
                 std::process::exit(1);
             }
             if e == network::ERR_INVALID_KEY {
-                eprintln!("[License] Invalid license key (rejected by server), aborting");
+                eprintln!("[License] Invalid license key");
                 std::process::exit(1);
             }
             if e == network::ERR_NOT_ACTIVATED {
-                eprintln!("[License] License key not yet activated, aborting");
+                eprintln!("[License] License key not yet activated");
                 std::process::exit(1);
             }
             if e == network::ERR_EXPIRED {
-                eprintln!("[License] Key expired (rejected by server), aborting");
+                eprintln!("[License] Key expired");
                 std::process::exit(1);
             }
             if e.starts_with("ERR-FORBIDDEN:") {
-                eprintln!("[License] Key restricted by region ({}), aborting", e);
+                eprintln!("[License] Key restricted by region");
                 std::process::exit(1);
             }
             if e.starts_with("ERR-CLOCK-SKEW-PERSISTENT:") {
-                eprintln!(
-                    "[License] Persistent clock skew detected ({}), cannot verify, aborting",
-                    e
-                );
+                eprintln!("[License] Persistent clock skew detected");
                 std::process::exit(1);
             }
 
-            eprintln!(
-                "[License] Online verification failed ({}), trying local cache...",
-                e
-            );
+            eprintln!("[License] Online verification failed, trying local cache...");
 
             let local_result = storage::read_local_record(&hkey, &salt);
             match local_result {
                 storage::LocalReadResult::Insufficient { read_count } => {
-                    eprintln!(
-                        "[License] Insufficient local replicas ({}/3), cannot verify offline, aborting",
-                        read_count
-                    );
+                    eprintln!("[License] Insufficient local replicas ({}/3)", read_count);
                     std::process::exit(1);
                 }
 
                 storage::LocalReadResult::Tampered { read_count } => {
-                    eprintln!(
-                        "[License] Local replicas tampered ({}/3 inconsistent), aborting",
-                        read_count
-                    );
+                    eprintln!("[License] Local replicas tampered ({}/3)", read_count);
                     std::process::exit(1);
                 }
 
@@ -125,37 +108,28 @@ pub async fn check_and_enforce() {
                     repair_failed,
                 } => {
                     if repair_failed {
-                        eprintln!(
-                            "[License] Local replica repair failed (storage may be unreliable).                              Proceeding with caution — will force online next launch."
-                        );
+                        eprintln!("[License] Local replica repair failed, proceeding with caution");
                     }
 
-                    // [CRITICAL FIX] 离线模式必须首先检查过期时间！
+                    // ✅ CRITICAL: 离线模式首先检查过期时间
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
-                        eprintln!(
-                            "[License] Key expired {} days ago (offline cache, expires={}, now={}),                              please restore network and renew",
-                            days, local_expires, now
-                        );
+                        eprintln!("[License] Key expired {} days ago (offline cache)", days);
                         std::process::exit(1);
                     }
 
                     if local_ts == 0 || local_expires == 0 {
-                        eprintln!("[License] Corrupt local record (ts=0), aborting");
+                        eprintln!("[License] Corrupt local record");
                         std::process::exit(1);
                     }
 
                     if local_ts as i64 > now + 300 {
-                        eprintln!(
-                            "[License] Local record activation_ts in future, possible tampering, aborting"
-                        );
+                        eprintln!("[License] Local record activation_ts in future");
                         std::process::exit(1);
                     }
 
                     if local_ts >= local_expires {
-                        eprintln!(
-                            "[License] Corrupt local record (activation_ts >= expires_at), aborting"
-                        );
+                        eprintln!("[License] Corrupt local record");
                         std::process::exit(1);
                     }
 
@@ -164,6 +138,9 @@ pub async fn check_and_enforce() {
                         "[License] Offline verification passed, {} days remaining",
                         remaining
                     );
+
+                    // ✅ NEW: 设置时间监控基准
+                    time_guard::set_expiry_time(local_expires as i64);
                 }
             }
         }

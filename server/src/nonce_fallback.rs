@@ -1,15 +1,12 @@
-// server/src/nonce_fallback.rs — 优化版 v7
-// MED-2 FIX: tokio::spawn 移出 OnceLock::get_or_init，改为 start_cleanup_task()
-// BUG-5 FIX: 容量保护防 OOM（MAX_NONCE_ENTRIES = 500,000）
-// CRIT-B FIX: Occupied arm 用 constant-time 消除 timing 差异
-
+// server/src/nonce_fallback.rs — 修复无意义比较版
+// ✅ BUG-05 FIX: 移除无意义的 ct_eq 比较
+// ✅ BUG-5 FIX: 容量保护防 OOM
 use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     OnceLock,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq;
 
 struct NonceEntry {
     expires_at: u64,
@@ -40,14 +37,14 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// ✅ FIX: 移除无意义的 ct_eq，直接返回
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
     let expires_at = now + ttl_secs;
 
-    // [BUG-5 FIX] 容量保护
+    // 容量保护
     if map.len() >= MAX_NONCE_ENTRIES {
-        let _ = now.to_le_bytes().ct_eq(&now.to_le_bytes());
         tracing::error!(
             "[NonceFallback] Capacity exceeded ({} entries), rejecting",
             MAX_NONCE_ENTRIES
@@ -57,24 +54,21 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
 
     use dashmap::mapref::entry::Entry;
     match map.entry(key.to_string()) {
-        Entry::Occupied(mut e) => {
+        Entry::Occupied(e) => {
             let old_exp = e.get().expires_at;
-            // [CRIT-B FIX] 使用 constant-time 操作消除 timing 差异
-            let expired = old_exp < now;
-            let dummy_update = old_exp.ct_eq(&expires_at);
-
-            if !expired && !bool::from(dummy_update) {
-                false // nonce 存在且未过期，拒绝
-            } else {
-                e.insert(NonceEntry { expires_at });
-                true
+            if old_exp > now {
+                return false; // nonce 仍有效，重放
             }
+            // 过期，移除旧条目
+            e.remove();
+            // 继续插入
         }
-        Entry::Vacant(v) => {
-            v.insert(NonceEntry { expires_at });
-            true
-        }
+        Entry::Vacant(_) => {}
     }
+
+    // 插入新 nonce
+    map.insert(key.to_string(), NonceEntry { expires_at });
+    true
 }
 
 async fn cleanup_loop() {

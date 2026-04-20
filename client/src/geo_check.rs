@@ -1,6 +1,7 @@
 // src/geo_check.rs
 //
-// 三种检测策略的实现
+// 两种检测策略的实现
+
 use reqwest::{Client, ClientBuilder};
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -69,15 +70,23 @@ pub async fn check_public_ip_cidr(client: Client) -> Result<bool, String> {
 }
 
 /// CIDR 匹配：将 IPv4 转为 u32，按 prefix_len 掩码比较
+/// ✅ BUG-FIX: 修复 CIDR 匹配的位运算溢出
 pub fn is_cn_ip(ip: &Ipv4Addr) -> bool {
     let ip_u32 = u32::from(*ip);
-
     for &(base, prefix_len) in CN_CIDR_LIST {
+        // 显式处理边界情况
         if prefix_len == 0 {
-            return true; // 0.0.0.0/0 全匹配（正常不会出现）
+            return true; // 0.0.0.0/0 匹配所有
         }
-        let mask = !0u32 << (32 - prefix_len);
-        if ip_u32 & mask == base & mask {
+
+        let mask = if prefix_len >= 32 {
+            u32::MAX // 全 1 掩码
+        } else {
+            // 安全的位移操作 (1..=31)
+            !0u32.checked_shl(32 - prefix_len as u32).unwrap_or(0)
+        };
+
+        if (ip_u32 & mask) == (base & mask) {
             return true;
         }
     }
