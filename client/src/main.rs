@@ -13,6 +13,12 @@ mod storage;
 async fn main() {
     loc_detection().await;
 
+    // [新增] 启动时检查系统时间合理性
+    if let Err(e) = network::validate_system_time().await {
+        eprintln!("❌ System time validation failed: {e}");
+        process::exit(1);
+    }
+
     license_guard::check_and_enforce().await;
     println!("✅ Your license is valid");
 
@@ -30,7 +36,9 @@ async fn loc_detection() {
             eprintln!("❌ Your country (region) is not supported. Please contact the support team");
             process::exit(1);
         }
-        Ok(false) => println!("✅ Your country (region) is supported."),
+        Ok(false) => {
+            println!("✅ Your country (region) is supported.")
+        }
         Err(e) => {
             eprintln!("Failure with DETECTION ONE: {e}");
             fallback_to_cf_detection(client).await;
@@ -49,7 +57,7 @@ async fn fallback_to_cf_detection(client: Client) {
         Ok(false) => {
             println!("✅ Your country (region) is supported.");
         }
-        // ✅ BUG-10 FIX: 两层检测都失败时，不忽略错误，退出
+        // ✅ BUG-10 FIX: 两层检测都失败时，不忽略错误，须退出
         Err(e) => {
             eprintln!(
                 "❌ Network unavailable: {}, Please check your internet connection",
