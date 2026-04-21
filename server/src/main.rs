@@ -1,7 +1,8 @@
-// server/src/main.rs — 优化版 v3
+// server/src/main.rs -- 优化版 v5
 //
-// MED-2 FIX: 在 main() 中显式调用 nonce_fallback::start_cleanup_task()
-// OPT-1 FIX: 在 main() 中显式调用 cache::start_cache_cleanup_task()
+// MED-2 FIX : 启动 nonce_fallback::start_cleanup_task()
+// OPT-1 FIX : 启动 cache::start_cache_cleanup_task()
+// NEW       : 优雅关闭同时监听 SIGTERM（生产容器友好）
 
 mod auth;
 mod cache;
@@ -19,9 +20,11 @@ use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
+        .init();
 
-    let database_url = std::env::var("DATABASE_URL").expect("Please set up the DATABASE_URL env");
+    let database_url = std::env::var("DATABASE_URL").expect("Please set DATABASE_URL env");
     let pg_pool = db::init_pool(&database_url)
         .await
         .expect("PostgreSQL Connection Failure");
@@ -30,17 +33,16 @@ async fn main() {
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
-    let redis_pool =
-        cache::init_redis_pool(&redis_url).expect("Redis Connection Pool Initialization Failure");
+    let redis_pool = cache::init_redis_pool(&redis_url).expect("Redis Pool Init Failure");
     let redis_pool = Arc::new(redis_pool);
-    tracing::info!("Redis Connection Pool is ready (deadpool-redis)");
+    tracing::info!("Redis Connection Pool is ready");
 
-    let admin_token = std::env::var("ADMIN_TOKEN").expect("Please set up the ADMIN_TOKEN env");
+    let admin_token = std::env::var("ADMIN_TOKEN").expect("Please set ADMIN_TOKEN env");
     let admin_token = Arc::new(admin_token);
 
-    // MED-2 FIX: 在 Tokio 运行时中显式启动 nonce cleanup 任务
+    // MED-2 FIX: 后台 cleanup 任务
     nonce_fallback::start_cleanup_task();
-    // OPT-1 FIX: 启动 memory_revoke_map 的后台 GC
+    // OPT-1 FIX: 启动 memory_revoke_map GC
     cache::start_cache_cleanup_task();
 
     let app = Router::new()
@@ -59,7 +61,8 @@ async fn main() {
         .layer(TraceLayer::new_for_http());
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    tracing::info!("Server is running on {}", bind_addr);
+    tracing::info!("Server running on {}", bind_addr);
+
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
     axum::serve(listener, app)
@@ -68,9 +71,28 @@ async fn main() {
         .unwrap();
 }
 
+// NEW: 同时监听 Ctrl-C 和 SIGTERM
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C handler");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
     tracing::info!("Graceful shutdown");
 }

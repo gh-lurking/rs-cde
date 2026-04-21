@@ -53,7 +53,7 @@ async fn loc_detection() {
 
 async fn fallback_to_cf_detection(client: Client) {
     println!("[2] FALLBACK TO DETECTION TWO ...");
-    match geo_check::check_cloudflare_trace(client.clone()).await {
+    match geo_check::check_cloudflare_trace(client).await {
         Ok(true) => {
             eprintln!("❌ Your country (region) is not supported. Please contact the support team");
             process::exit(1);
