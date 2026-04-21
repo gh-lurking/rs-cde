@@ -1,14 +1,16 @@
-// server/src/cache.rs — 优化版 v4
+// server/src/cache.rs — 优化版 v5
 //
 // [BUG-05 FIX] is_revoked(): Redis 不可用时仅依赖内存 map，不额外写入（避免误写）
 // [BUG-06 FIX] throttle_key() 去掉冗余 lc_ 前缀，统一使用 KEY_NS
-// [NEW]        mark_revoked_in_memory() 对外暴露，revoke 时主动调用加速拦截
-// [OPT-1]      set_verify_cache() 增加 activation_ts/expires_at 零值 guard
-
+// [BUG-11 FIX] set_verify_cache 前检查 activation_ts/expires_at 有效性
+// [NEW] mark_revoked_in_memory() 对外暴露，revoke 时主动调用加速拦截
+// [OPT-1] set_verify_cache() 增加 activation_ts/expires_at 零值 guard
+// [OPT-2] 添加缓存命中率监控
 use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -26,6 +28,10 @@ pub struct VerifyCacheEntry {
 static VERIFY_CACHE_TTL: OnceLock<u64> = OnceLock::new();
 static TOMBSTONE_TTL: OnceLock<u64> = OnceLock::new();
 
+// 缓存命中率统计
+static CACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
+
 fn verify_cache_ttl() -> u64 {
     *VERIFY_CACHE_TTL.get_or_init(|| {
         std::env::var("VERIFY_CACHE_TTL_SECS")
@@ -37,6 +43,13 @@ fn verify_cache_ttl() -> u64 {
 
 fn tombstone_ttl() -> u64 {
     *TOMBSTONE_TTL.get_or_init(|| std::cmp::max(verify_cache_ttl() * 100, 86400))
+}
+
+/// 获取缓存命中率统计
+pub fn get_cache_stats() -> (u64, u64) {
+    let hits = CACHE_HIT_COUNT.load(Ordering::Relaxed);
+    let misses = CACHE_MISS_COUNT.load(Ordering::Relaxed);
+    (hits, misses)
 }
 
 pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
@@ -58,12 +71,14 @@ pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolErro
         }),
         ..Default::default()
     };
+
     Ok(cfg.create_pool(Some(Runtime::Tokio1))?)
 }
 
 fn verify_cache_key(key_hash: &str) -> String {
     format!("{KEY_NS}verify:{key_hash}")
 }
+
 fn tombstone_key(key_hash: &str) -> String {
     format!("{KEY_NS}revoked:{key_hash}")
 }
@@ -92,7 +107,7 @@ pub fn mark_revoked_in_memory(key_hash: &str, expires_at: i64) {
     memory_revoke_map().insert(key_hash.to_string(), expires_at);
 }
 
-/// [OPT-1] 后台 GC：每 5 分钟清理过期 revoke 记录
+/// 后台 GC：每 5 分钟清理过期 revoke 记录
 pub fn start_cache_cleanup_task() {
     tokio::spawn(cleanup_memory_revokes());
 }
@@ -116,19 +131,36 @@ async fn cleanup_memory_revokes() {
 pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<VerifyCacheEntry> {
     let mut conn = pool.get().await.ok()?;
     let raw: Option<String> = conn.get(verify_cache_key(key_hash)).await.ok()?;
-    raw.and_then(|s| serde_json::from_str(&s).ok())
+
+    let entry = raw.and_then(|s| serde_json::from_str(&s).ok());
+
+    if entry.is_some() {
+        CACHE_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CACHE_MISS_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    entry
 }
 
-/// [OPT-1] 写入缓存前校验字段有效性
+/// [OPT-1 + BUG-11] 写入缓存前校验字段有效性
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
     // 零值 / 逻辑异常 guard
     if entry.activation_ts == 0 || entry.expires_at == 0 {
+        tracing::warn!("[Cache] 跳过零值缓存写入: {}", key_hash);
         return;
     }
     if entry.activation_ts >= entry.expires_at {
+        tracing::warn!(
+            "[Cache] 跳过逻辑异常缓存: act={} >= exp={}",
+            entry.activation_ts,
+            entry.expires_at
+        );
         return;
     }
+
     let Ok(json) = serde_json::to_string(entry) else {
+        tracing::warn!("[Cache] JSON 序列化失败");
         return;
     };
     let Ok(mut conn) = pool.get().await else {
@@ -147,7 +179,7 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let _: Result<i64, _> = conn.del(verify_cache_key(key_hash)).await;
+    let _: Result<(), _> = conn.del(verify_cache_key(key_hash)).await;
 }
 
 // ─── Revoke 检测（三层：内存 → Redis tombstone → false）─────────────────────

@@ -2257,6 +2257,7 @@ dependencies = [
  "deadpool-redis",
  "hex",
  "hmac",
+ "once_cell",
  "redis",
  "serde",
  "serde_json",

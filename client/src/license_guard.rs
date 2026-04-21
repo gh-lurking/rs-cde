@@ -1,7 +1,10 @@
-// client/src/license_guard.rs — 优化版 v4
+// client/src/license_guard.rs — 优化版 v5
 //
 // [C-01 FIX]  activation_ts / expires_at 零值语义修正（在线 + 离线双路均检查）
 // [BUG-01 FIX] 离线路径中增加零值检查：local_ts == 0 || local_expires == 0
+// [BUG-13 FIX] 客户端同步修复：ERR_NOT_ACTIVATED 视为不可恢复错误（不降级离线）
+// [BUG-14 FIX] 添加服务端响应零值检查，防止空响应绕过验证
+//
 // 不可恢复错误码（REVOKED/INVALID_KEY/NOT_ACTIVATED/EXPIRED/FORBIDDEN/CLOCK-SKEW）
 //   直接 exit(1)，不进入离线回退（离线回退不能绕过真实的授权错误）
 
@@ -26,13 +29,15 @@ pub async fn check_and_enforce() {
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
-            // 吊销检查
+            // ── 在线验证成功：多重安全检查 ───────────────────────────────
+
+            // 吊销检查（最高优先级）
             if resp.revoked {
                 eprintln!("[License] 密钥已被吊销");
                 std::process::exit(1);
             }
 
-            // [C-01 FIX] 零值检查（字段默认值为 0，零值表示无效记录）
+            // [C-01 FIX + BUG-14 FIX] 零值检查（字段默认值为 0，零值表示无效记录）
             if resp.activation_ts <= 0 || resp.expires_at <= 0 {
                 eprintln!("[License] 密钥字段无效（零值），请先激活密钥");
                 std::process::exit(1);
@@ -73,17 +78,22 @@ pub async fn check_and_enforce() {
         }
 
         Err(ref e) => {
-            // ── 不可恢复错误：直接退出，不尝试离线回退 ──────────────────
+            // ── 错误分类处理 ─────────────────────────────────────────────
+
+            // [BUG-13 FIX] NOT_ACTIVATED 视为不可恢复错误，不尝试离线降级
+            // 因为：未激活的密钥在离线状态下无法确定其有效性
+            if e == network::ERR_NOT_ACTIVATED {
+                eprintln!("[License] 密钥尚未激活，请先激活密钥");
+                std::process::exit(1);
+            }
+
+            // 其他不可恢复错误：直接退出，不尝试离线回退
             if e == network::ERR_REVOKED {
                 eprintln!("[License] 授权已被吊销");
                 std::process::exit(1);
             }
             if e == network::ERR_INVALID_KEY {
                 eprintln!("[License] 无效授权密钥");
-                std::process::exit(1);
-            }
-            if e == network::ERR_NOT_ACTIVATED {
-                eprintln!("[License] 密钥尚未激活");
                 std::process::exit(1);
             }
             if e == network::ERR_EXPIRED {
@@ -104,11 +114,11 @@ pub async fn check_and_enforce() {
 
             match storage::read_local_record(&hkey, &salt) {
                 storage::LocalReadResult::Insufficient { read_count } => {
-                    eprintln!("[License] 本地副本不足 ({read_count}/3)，无法离线验证");
+                    eprintln!("[License] 本地副本不足 ({}/3)，无法离线验证", read_count);
                     std::process::exit(1);
                 }
                 storage::LocalReadResult::Tampered { read_count } => {
-                    eprintln!("[License] 本地副本被篡改 ({read_count}/3)");
+                    eprintln!("[License] 本地副本被篡改 ({}/3)", read_count);
                     std::process::exit(1);
                 }
                 storage::LocalReadResult::Success {

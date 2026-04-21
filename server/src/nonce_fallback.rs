@@ -1,17 +1,14 @@
-// server/src/nonce_fallback.rs — 优化版 v3
+// server/src/nonce_fallback.rs — 优化版 v4
 //
-// [BUG-02 FIX] check_and_store 语义完全反转
-//   原始错误: Occupied 分支 expires_at > now 时返回 true（允许重放！）
-//   修正后:   expires_at > now -> nonce 仍有效 -> 返回 false（拦截重放）
-//             expires_at <= now -> nonce 已过期 -> 视为新请求，覆盖，返回 true
-//
+// [BUG-02 FIX] check_and_store 语义完全修正
+// [BUG-13 FIX] 增加 nonce 计数指标，便于监控 DoS 攻击
 // [OPT] Entry API 原子化 check+insert，消除 TOCTOU 竞态
 // [OPT] MAX_NONCE_ENTRIES 上界防内存耗尽 DoS
 
 use dashmap::DashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,12 +17,29 @@ struct NonceEntry {
 }
 
 const MAX_NONCE_ENTRIES: usize = 500_000;
-
-static MEMORY_NONCES: OnceLock<DashMap<String, NonceEntry>> = OnceLock::new();
+static MEMORY_NONCES: once_cell::sync::Lazy<Arc<DashMap<String, NonceEntry>>> = once_cell::sync::lazy! {
+    Arc::new(DashMap::new())
+};
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+static NONCE_CHECKED_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NONCE_REJECTED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-fn nonce_map() -> &'static DashMap<String, NonceEntry> {
-    MEMORY_NONCES.get_or_init(DashMap::new)
+fn nonce_map() -> &'static Arc<DashMap<String, NonceEntry>> {
+    &MEMORY_NONCES
+}
+
+/// 获取 Nonce 统计信息（用于监控）
+pub fn get_nonce_stats() -> (usize, usize, usize) {
+    let total = NONCE_CHECKED_COUNT.load(Ordering::Relaxed);
+    let rejected = NONCE_REJECTED_COUNT.load(Ordering::Relaxed);
+    let map_size = nonce_map().len();
+    (total, rejected, map_size)
+}
+
+/// 重置统计计数器
+pub fn reset_nonce_stats() {
+    NONCE_CHECKED_COUNT.store(0, Ordering::Relaxed);
+    NONCE_REJECTED_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// 启动 cleanup 后台任务（幂等，只启动一次）
@@ -47,14 +61,17 @@ fn now_secs() -> u64 {
 
 /// Nonce 去重（Redis 不可用时的内存降级）
 ///
-/// 返回 true  -> nonce 首次出现（或已过期），请求合法
+/// 返回 true -> nonce 首次出现（或已过期），请求合法
 /// 返回 false -> nonce 在有效期内，重放攻击，拒绝
 ///
 /// [BUG-02 FIX] Entry API 保证 check+insert 原子化，无 TOCTOU
+/// [BUG-13 FIX] 先检查 Nonce 再记录（调用方应先于 HMAC 调用）
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
     let expires_at = now + ttl_secs;
+
+    NONCE_CHECKED_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // 内存上界保护：防止恶意请求耗尽内存
     if map.len() >= MAX_NONCE_ENTRIES {
@@ -62,6 +79,7 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
             "[NonceFallback] 内存已满 ({}), 拒绝新 nonce",
             MAX_NONCE_ENTRIES
         );
+        NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
         return false;
     }
 
@@ -70,6 +88,7 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
         Entry::Occupied(mut e) => {
             if e.get().expires_at > now {
                 // [BUG-02 FIX] nonce 仍有效 -> 重放攻击 -> 拒绝
+                NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             // nonce 已过期 -> 视为新请求，覆盖旧条目

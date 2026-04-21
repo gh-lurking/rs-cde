@@ -41,6 +41,9 @@ hmac = "0.12.1"
 #  ✅ OPT-A FIX: 真正常量时间比较
 subtle = "2"
 
+# 全局单例
+once_cell = "1.19"
+
 [profile.release]
 opt-level = 3
 lto = true

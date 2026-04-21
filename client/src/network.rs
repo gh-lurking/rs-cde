@@ -1,19 +1,18 @@
-// client/src/network.rs — 优化版 v3
+// client/src/network.rs — 优化版 v4
 //
-// [M-01 FIX]  server_id 编译期 option_env! 硬编码，不再动态网络拉取
+// [M-01 FIX] server_id 编译期 option_env! 硬编码，不再动态网络拉取
 // [MD-01 FIX] SNTP 时间校正公式修正：one_way_delay = RTT / 2（取自 RFC 5905）
-// [M-03 FIX]  validate_system_time 阈值统一为 300s（与服务端 timestamp_window 一致）
+// [M-03 FIX] validate_system_time 阈值统一为 300s（与服务端 timestamp_window 一致）
 // [BUG-07 FIX] one_way_delay 上界钳制 min(RTT/2, timeout)，防非对称 RTT 估算过大
 // [BUG-09 FIX] 优先使用 CF trace ts= 字段（Unix 浮点秒，毫秒精度，非 CDN 缓存）
-
+// [BUG-13 FIX] 客户端同步修复：服务器返回 409 CONFLICT 时 ERR-NOT_ACTIVATED 也视为不可恢复
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<Sha256>;
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 const MAX_CLOCK_OFFSET_SECS: i64 = 300;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -90,8 +89,19 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
 /// 解析服务端错误，映射到统一错误常量
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
+
     match status.as_u16() {
+        // [BUG-13 FIX] ERR-EXPIRED 统一用 410，ERR-NOT-ACTIVATED 统一用 409
         410 => return ERR_EXPIRED.to_string(),
+        409 => {
+            return match err_code {
+                "ERR-NOT-ACTIVATED" | "not activated" | "ERR-ALREADY-ACTIVATED" => {
+                    ERR_NOT_ACTIVATED.to_string()
+                }
+                "ERR-NONCE-REPLAY" => "ERR-NONCE-REPLAY".to_string(),
+                _ => format!("ERR-FORBIDDEN:{}", err_code),
+            }
+        }
         403 => {
             return match err_code {
                 "ERR-REVOKED" | "key revoked" => ERR_REVOKED.to_string(),
@@ -100,9 +110,9 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
                 _ => format!("ERR-FORBIDDEN:{}", err_code),
             }
         }
-        409 if err_code == "ERR-NOT-ACTIVATED" => return ERR_NOT_ACTIVATED.to_string(),
         _ => {}
     }
+
     match err_code {
         "ERR-REVOKED" => ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" => ERR_INVALID_KEY.to_string(),
@@ -122,6 +132,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
 async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyResponse, String> {
     let key_hash = hash_key(hkey);
     let signature = sign_request(hkey, &key_hash, ts);
+
     let req = VerifyRequest {
         key_hash,
         timestamp: ts,
@@ -140,6 +151,10 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("JSON decode: {e}"))?;
 
     if status.is_success() {
+        // [BUG-13 FIX] 检查响应字段零值
+        let activation_ts = body["activation_ts"].as_i64().unwrap_or(0);
+        let expires_at = body["expires_at"].as_i64().unwrap_or(0);
+
         serde_json::from_value(body).map_err(|e| e.to_string())
     } else {
         Err(parse_server_error(status, &body))
@@ -157,7 +172,6 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 .trim_start_matches("ERR-TIME-RECORD:server_time=")
                 .parse()
                 .unwrap_or(t1);
-
             let t4 = now_secs();
             let full_rtt = t4 - t1;
 
@@ -168,8 +182,9 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
             }
 
             // [BUG-07 FIX] one_way_delay 上界钳制（防非对称 RTT 导致估算过大）
-            // [MD-01 FIX]  RFC 5905: one_way_delay = RTT / 2
+            // [MD-01 FIX] RFC 5905: one_way_delay = RTT / 2
             let one_way_delay = (full_rtt / 2).max(0).min(NET_DEFAULT_TIMEOUT_SECS as i64);
+
             let estimated_server_now = server_ts + one_way_delay;
             let clock_offset = t1 - estimated_server_now;
 
@@ -202,7 +217,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
 /// 系统时间合理性校验
 ///
 /// [BUG-09 FIX] 优先使用 CF trace ts= 字段（毫秒精度，非 CDN 缓存）
-/// [M-03 FIX]   硬限制 300s（与服务端 timestamp_window 一致）
+/// [M-03 FIX] 硬限制 300s（与服务端 timestamp_window 一致）
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -281,24 +296,28 @@ async fn get_time_from_cf_trace(client: &reqwest::Client) -> Option<i64> {
         .send()
         .await
         .ok()?;
+
     let body = resp.text().await.ok()?;
+
     for line in body.lines() {
         if let Some(ts_str) = line.strip_prefix("ts=") {
             let ts: f64 = ts_str.trim().parse().ok()?;
             return Some(ts as i64);
         }
     }
+
     None
 }
 
 /// 解析 HTTP Date 头（RFC 7231 格式）为 Unix 时间戳
 fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let parts: Vec<&str> = date_str.split_whitespace().collect();
-    if parts.len() < 6 {
+    if parts.len() != 5 {
         return None;
     }
+
     let day: u32 = parts[1].parse().ok()?;
-    let month: u32 = match parts[2] {
+    let month = match parts[2] {
         "Jan" => 1,
         "Feb" => 2,
         "Mar" => 3,
@@ -321,6 +340,7 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let h: u32 = tp[0].parse().ok()?;
     let m: u32 = tp[1].parse().ok()?;
     let s: u32 = tp[2].parse().ok()?;
+
     let days = days_since_1970(year, month, day);
     Some(days * 86400 + h as u64 * 3600 + m as u64 * 60 + s as u64)
 }
