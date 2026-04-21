@@ -1,5 +1,7 @@
-// server/src/cache.rs — 优化版 v2
-// ✅ OPT-03 FIX: TTL 值用 OnceLock 缓存，避免高 QPS 下反复 env::var
+// server/src/cache.rs — 优化版 v3
+//
+// ✅ BUG-05 FIX: is_revoked() Redis 不可用时记录明确警告
+// ✅ BUG-06 FIX: 新增 throttle_key() 统一命名空间管理
 
 use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
@@ -9,7 +11,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub type RedisPool = Pool;
-
 const KEY_NS: &str = "lc:v1:";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -19,7 +20,6 @@ pub struct VerifyCacheEntry {
     pub expires_at: i64,
 }
 
-// ✅ OPT-03 FIX: OnceLock 缓存 TTL，避免每次调用读环境变量
 static VERIFY_CACHE_TTL: OnceLock<u64> = OnceLock::new();
 static TOMBSTONE_TTL: OnceLock<u64> = OnceLock::new();
 
@@ -39,12 +39,11 @@ fn tombstone_ttl() -> u64 {
     })
 }
 
-pub fn init_redis_pool(redis_url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolError> {
+pub fn init_redis_pool(redis_url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
     let max_size: usize = std::env::var("REDIS_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
-
     let cfg = Config {
         url: Some(redis_url.to_string()),
         pool: Some(PoolConfig {
@@ -61,11 +60,18 @@ pub fn init_redis_pool(redis_url: &str) -> Result<RedisPool, deadpool_redis::Cre
     Ok(cfg.create_pool(Some(Runtime::Tokio1))?)
 }
 
+// ✅ BUG-06 FIX: 所有 Redis key 生成函数统一在此管理
 fn verify_cache_key(key_hash: &str) -> String {
     format!("{}verify:{}", KEY_NS, key_hash)
 }
+
 fn tombstone_key(key_hash: &str) -> String {
     format!("{}revoked:{}", KEY_NS, key_hash)
+}
+
+/// ✅ BUG-06: 新增节流键生成函数，供 handlers.rs 调用，统一命名空间
+pub fn throttle_key(key_hash: &str) -> String {
+    format!("{}lc_throttle:{}", KEY_NS, key_hash)
 }
 
 // 内存 Revoke Fallback（Redis 不可用时降级）
@@ -96,12 +102,13 @@ async fn cleanup_memory_revokes() {
         map.retain(|_, exp| *exp > now);
         let cleaned = before - map.len();
         if cleaned > 0 {
-            tracing::info!("[Cache] Cleaned {} expired memory revoke entries", cleaned);
+            tracing::info!("[Cache] 清理 {} 个过期内存 revoke 条目", cleaned);
         }
     }
 }
 
-// ── Verify Cache ──────────────────────────────────────────────────────
+// ── Verify Cache ──────────────────────────────────────────────────────────
+
 pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<VerifyCacheEntry> {
     let mut conn = pool.get().await.ok()?;
     let raw: Option<String> = conn.get(verify_cache_key(key_hash)).await.ok()?;
@@ -112,19 +119,18 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
     if entry.activation_ts == 0 || entry.expires_at == 0 {
         tracing::warn!(
-            "[Cache] Refusing zero-valued entry for {}...",
+            "[Cache] 拒绝缓存零值 entry: {}...",
             &key_hash[..8.min(key_hash.len())]
         );
         return;
     }
     if entry.activation_ts >= entry.expires_at {
         tracing::error!(
-            "[Cache] Anomalous: activation_ts >= expires_at for {}...",
+            "[Cache] 异常: activation_ts >= expires_at: {}...",
             &key_hash[..8.min(key_hash.len())]
         );
         return;
     }
-
     let Ok(json) = serde_json::to_string(entry) else {
         return;
     };
@@ -144,12 +150,14 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let _: Result<i64, _> = conn.del(verify_cache_key(key_hash)).await;
+    let _: Result<(), _> = conn.del(verify_cache_key(key_hash)).await;
 }
 
-// ── Tombstone ─────────────────────────────────────────────────────────
+// ── Tombstone ─────────────────────────────────────────────────────────────
+
+/// ✅ BUG-05 FIX: Redis 不可用时记录明确警告（内存 fallback 有进程重启丢失风险）
 pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
-    // 内存 fallback 快速检查
+    // 内存 fallback 快速检查（进程级缓存）
     let mem_map = memory_revoke_map();
     if let Some(exp) = mem_map.get(key_hash) {
         if *exp > now_ts() {
@@ -159,45 +167,55 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
             mem_map.remove(key_hash);
         }
     }
+
     // Redis 查询
     let Ok(mut conn) = pool.get().await else {
+        // ⚠️ Redis 不可用：内存中无记录，但进程重启后内存 fallback 会丢失。
+        // 如需 fail-closed（更安全），应在此处返回 true；
+        // 当前保持 fail-open（可用性优先），依赖监控告警及时发现 Redis 故障。
+        tracing::warn!(
+            "[Cache] Redis 不可用，is_revoked 仅依赖内存检查 (key={}...)",
+            &key_hash[..8.min(key_hash.len())]
+        );
         return false;
     };
-    conn.exists(tombstone_key(key_hash)).await.unwrap_or(false)
+
+    conn.exists(tombstone_key(key_hash))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("[Cache] Redis exists() 错误: {e}, 当作未撤销");
+            false
+        })
 }
 
 pub async fn set_revoked_tombstone(pool: &RedisPool, key_hash: &str) {
     let revoked_at = now_ts();
     let ttl = tombstone_ttl();
-
     let Ok(mut conn) = pool.get().await else {
-        // Redis 不可用：写内存 fallback
         memory_revoke_map().insert(key_hash.to_string(), revoked_at + ttl as i64);
         tracing::error!(
-            "[Cache] Redis unavailable! Tombstone in memory only. key={}...",
+            "[Cache] Redis 不可用！Tombstone 仅在内存中（进程重启后失效）。key={}...",
             &key_hash[..8.min(key_hash.len())]
         );
         return;
     };
-
-    let result: Result<String, _> = redis::cmd("SET")
+    let result: Result<(), _> = redis::cmd("SET")
         .arg(tombstone_key(key_hash))
         .arg(revoked_at.to_string())
         .arg("EX")
         .arg(ttl)
         .query_async(&mut conn)
         .await;
-
     match result {
         Ok(_) => tracing::info!(
-            "[Cache] Tombstone written TTL={}s key={}...",
+            "[Cache] Tombstone 写入 TTL={}s key={}...",
             ttl,
             &key_hash[..8.min(key_hash.len())]
         ),
         Err(e) => {
             memory_revoke_map().insert(key_hash.to_string(), revoked_at + ttl as i64);
             tracing::error!(
-                "[Cache] Tombstone FAILED: {}, memory fallback. key={}...",
+                "[Cache] Tombstone 写入失败: {}, 内存 fallback。key={}...",
                 e,
                 &key_hash[..8.min(key_hash.len())]
             );

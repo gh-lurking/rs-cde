@@ -1,5 +1,5 @@
 // server/src/nonce_fallback.rs — 优化版 v2
-// ✅ MD-03 FIX: Entry API 原地替换，消除 TOCTOU 竞态窗口
+// ✅ Entry API 原子操作消除 TOCTOU 竞态窗口
 use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -35,14 +35,14 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// ✅ MD-03 FIX: Entry API — check + insert 原子完成，无竞态
+/// ✅ Entry API — check + insert 原子完成，无 TOCTOU 竞态窗口
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
     let expires_at = now + ttl_secs;
 
     if map.len() >= MAX_NONCE_ENTRIES {
-        tracing::error!("[NonceFallback] Capacity exceeded, rejecting");
+        tracing::error!("[NonceFallback] 容量已满，拒绝新 nonce");
         return false;
     }
 
@@ -72,7 +72,7 @@ async fn cleanup_loop() {
         map.retain(|_, v| v.expires_at > now);
         let cleaned = before - map.len();
         if cleaned > 0 {
-            tracing::debug!("[NonceFallback] Cleaned {} expired nonces", cleaned);
+            tracing::debug!("[NonceFallback] 清理 {} 个过期 nonce", cleaned);
         }
     }
 }

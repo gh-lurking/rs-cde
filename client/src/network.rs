@@ -1,17 +1,22 @@
-// client/src/network.rs — 优化版 v2
+// client/src/network.rs — 优化版 v3
+//
 // ✅ M-01 FIX: server_id 编译期硬编码
 // ✅ MD-01 FIX: SNTP 时间校正公式
 // ✅ M-03 FIX: validate_system_time 阈值改为 300s
+// ✅ BUG-07 FIX: 重试时 one_way_delay 上界钳制，改善 RTT 不对称场景
+// ✅ BUG-09 FIX: 优先使用 CF trace ts= 字段（毫秒精度）
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-type HmacSha256 = Hmac<Sha256>;
+
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 const MAX_CLOCK_OFFSET_SECS: i64 = 300;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
-const SYSTEM_TIME_HARD_LIMIT_SECS: i64 = 300; // ✅ M-03: 与服务端一致
+const SYSTEM_TIME_HARD_LIMIT_SECS: i64 = 300;
 const SYSTEM_TIME_WARN_SECS: i64 = 60;
 
 pub const ERR_REVOKED: &str = "ERR-REVOKED";
@@ -44,6 +49,7 @@ fn get_server_id() -> &'static str {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -148,30 +154,30 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
             let full_rtt = t4 - t1;
 
             if full_rtt < 0 || full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
-                tracing::warn!("[Network] Unreasonable RTT: {}s", full_rtt);
+                tracing::warn!("[Network] 不合理的 RTT: {}s", full_rtt);
                 return result;
             }
 
-            // ✅ MD-01 FIX: SNTP 单程时延补偿
-            let one_way_delay = full_rtt / 2;
-            let estimated_now = server_ts + one_way_delay;
-            let clock_offset = t1 - estimated_now;
+            // ✅ BUG-07 FIX: one_way_delay 上界钳制，防非对称 RTT 估算过大
+            let one_way_delay = (full_rtt / 2).max(0).min(NET_DEFAULT_TIMEOUT_SECS as i64);
+            let estimated_server_now = server_ts + one_way_delay;
+            let clock_offset = t1 - estimated_server_now;
 
             tracing::info!(
-                "[Network] RTT={}s offset={}s (local={} server={} estimated={})",
+                "[Network] RTT={}s one_way={}s local={} server={} estimated_server={}",
                 full_rtt,
-                clock_offset,
+                one_way_delay,
                 t1,
                 server_ts,
-                estimated_now
+                estimated_server_now
             );
 
             if clock_offset.abs() > MAX_CLOCK_OFFSET_SECS {
                 return Err(format!("ERR-CLOCK-SKEW:{}", clock_offset));
             }
 
-            // ✅ 用估算的正确时间重试
-            let retry = do_verify(hkey, server_url, estimated_now).await;
+            // 用估算的服务端当前时间重试
+            let retry = do_verify(hkey, server_url, estimated_server_now).await;
             match &retry {
                 Err(e2) if e2.starts_with("ERR-TIME-RECORD:") => {
                     Err(format!("ERR-CLOCK-SKEW-PERSISTENT:server={}", server_ts))
@@ -183,6 +189,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
     }
 }
 
+/// ✅ BUG-09 FIX: 优先使用 CF trace ts= 字段（毫秒精度，非 CDN 缓存）
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -192,19 +199,23 @@ pub async fn validate_system_time() -> Result<(), String> {
     let min_ts: u64 = 1_704_067_200; // 2024-01-01
     let max_ts: u64 = 1_893_456_000; // 2030-01-01
     if local_now < min_ts || local_now > max_ts {
-        return Err("System time outside reasonable range (2024-2030)".into());
+        return Err("系统时间超出合理范围 (2024-2030)".into());
     }
 
     let client = get_http_client();
-    let time_sources = [
-        "https://www.google.com",
-        "https://www.cloudflare.com",
-        "https://www.microsoft.com",
-    ];
     let mut valid_checks = 0i64;
     let mut total_offset = 0i64;
 
-    for url in time_sources {
+    // ✅ 优先：Cloudflare trace ts= 字段（Unix 浮点秒，精度高，非缓存）
+    if let Some(cf_ts) = get_time_from_cf_trace(client).await {
+        total_offset += local_now as i64 - cf_ts;
+        valid_checks += 1;
+        tracing::info!("[Time] CF trace ts={}, local={}", cf_ts, local_now);
+    }
+
+    // 降级：HTTP Date 头（精度 1s，CDN 可能有缓存延迟）
+    let http_sources = ["https://www.google.com", "https://www.microsoft.com"];
+    for url in http_sources {
         if let Ok(resp) = client
             .head(url)
             .timeout(Duration::from_secs(5))
@@ -223,27 +234,45 @@ pub async fn validate_system_time() -> Result<(), String> {
     }
 
     if valid_checks == 0 {
-        tracing::warn!("[Time] No time sources reachable, skipping HTTPS check");
+        tracing::warn!("[Time] 无法访问任何时间源，跳过 HTTPS 检查");
         return Ok(());
     }
 
     let avg_offset = total_offset / valid_checks;
 
-    // ✅ M-03 FIX: 阈值 300s（与服务端 TIMESTAMP_WINDOW_SECS 一致）
     if avg_offset.abs() > SYSTEM_TIME_HARD_LIMIT_SECS {
         return Err(format!(
-            "System time deviation {}s exceeds limit {}s. Sync your clock.",
+            "系统时间偏差 {}s 超过限制 {}s，请同步时钟",
             avg_offset, SYSTEM_TIME_HARD_LIMIT_SECS
         ));
     }
     if avg_offset.abs() > SYSTEM_TIME_WARN_SECS {
         tracing::warn!(
-            "[Time] offset {}s > {}s warning",
+            "[Time] 时间偏差 {}s > {}s 警告阈值",
             avg_offset,
             SYSTEM_TIME_WARN_SECS
         );
     }
     Ok(())
+}
+
+/// 从 Cloudflare /cdn-cgi/trace 获取 ts= 字段（精度高，非缓存）
+async fn get_time_from_cf_trace(client: &reqwest::Client) -> Option<i64> {
+    let resp = client
+        .get("https://cloudflare.com/cdn-cgi/trace")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    let body = resp.text().await.ok()?;
+    for line in body.lines() {
+        if let Some(ts_str) = line.strip_prefix("ts=") {
+            // ts 格式: "1700000000.123"（Unix 浮点秒）
+            let ts: f64 = ts_str.trim().parse().ok()?;
+            return Some(ts as i64);
+        }
+    }
+    None
 }
 
 fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
@@ -252,7 +281,7 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
         return None;
     }
     let day: u32 = parts[1].parse().ok()?;
-    let month = match parts[2] {
+    let month: u32 = match parts[2] {
         "Jan" => 1,
         "Feb" => 2,
         "Mar" => 3,

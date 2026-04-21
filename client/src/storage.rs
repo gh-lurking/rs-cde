@@ -1,5 +1,6 @@
-// client/src/storage.rs — 优化版 v2
-// ✅ M-02 FIX: 仲裁逻辑严格要求 3 副本，缺副本时先修复
+// client/src/storage.rs — 优化版 v3
+//
+// ✅ BUG-08 FIX: 不足 2 个副本时直接返回 Insufficient，不对单副本执行修复
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -65,15 +66,12 @@ fn write_slot(
     let cipher = Aes128Gcm::new(key);
     let nonce_bytes = Aes128Gcm::generate_nonce(&mut OsRng);
     let nonce = Nonce::from_slice(&nonce_bytes);
-
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&activation.to_le_bytes());
     plain[8..].copy_from_slice(&expires.to_le_bytes());
-
     let ct = cipher
         .encrypt(nonce, plain.as_ref())
         .map_err(|e| format!("encrypt: {e}"))?;
-
     if let Some(p) = path.parent() {
         let _ = fs::create_dir_all(p);
     }
@@ -105,7 +103,7 @@ pub fn write_all_replicas(hkey: &str, salt: &str, activation_ts: u64, expires_at
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
         if let Err(e) = write_slot(&path, &key, activation_ts, expires_at) {
-            tracing::warn!("[Storage] Replica {} write failed: {}", slot, e);
+            tracing::warn!("[Storage] 副本 {} 写入失败: {}", slot, e);
         }
     }
 }
@@ -115,10 +113,9 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-
     let (act_ts, exp_ts) = val;
 
-    // activation_ts 不能在未来超过 300 s
+    // activation_ts 不能在未来超过 300s
     if act_ts > now_u64 + 300 {
         return LocalReadResult::Tampered { read_count };
     }
@@ -127,7 +124,7 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
         return LocalReadResult::Tampered { read_count };
     }
     // activation_ts 必须 < expires_at
-    if act_ts == 0 || act_ts >= exp_ts {
+    if act_ts >= exp_ts {
         return LocalReadResult::Tampered { read_count };
     }
 
@@ -139,42 +136,28 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
 }
 
 /// 读取本地副本，多数票仲裁
-/// ✅ M-02 FIX: 严格要求 3 副本；缺副本时先尝试修复
+/// ✅ BUG-08 FIX: 不足 2 个副本时直接返回 Insufficient，不对单副本执行不可信修复
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::with_capacity(3);
+
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
         if let Some(pair) = read_slot(&path, &key) {
             values.push(pair);
         }
     }
+
     let read_count = values.len();
 
-    // ✅ M-02 FIX: 不足 3 个副本时尝试修复
-    if read_count < 3 {
-        if read_count == 2 && values[0] == values[1] {
-            // 2 个一致副本 → 找丢失槽并修复
-            let best_val = values[0];
-            let mut repair_failed = false;
-            for slot in 0..3u8 {
-                let path = derive_path(hkey, salt, slot);
-                if read_slot(&path, &key).is_none() {
-                    if let Err(e) = write_slot(&path, &key, best_val.0, best_val.1) {
-                        tracing::warn!("[Storage] Repair slot {} failed: {}", slot, e);
-                        repair_failed = true;
-                    } else {
-                        tracing::info!("[Storage] Replica {} repaired", slot);
-                    }
-                }
-            }
-            return validate_and_return(best_val, read_count, repair_failed);
-        }
-        // read_count < 2，或 2 个副本内容不一致
+    // ✅ BUG-08 FIX: 必须至少 2 个副本才能进行有意义的多数票投票
+    // 单副本无法区分是正确值还是被篡改值，直接返回 Insufficient
+    if read_count < 2 {
+        tracing::warn!("[Storage] 可读副本不足 ({}/3)，拒绝离线降级", read_count);
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // ─── 3 副本全部读到，求众数（必须 ≥ 2 票）────────────────────────
+    // 多数票投票
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(entry) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -183,14 +166,16 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
+
     let (best_val, best_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
-    // ✅ 3 副本中至少 2 票才算过半数
-    if best_count < 2 {
+    // read_count==2 时需要 2/2；read_count==3 时需要 2/3
+    let required = if read_count == 3 { 2 } else { read_count };
+    if best_count < required {
         return LocalReadResult::Tampered { read_count };
     }
 
-    // 修复少数不一致的副本
+    // 修复少数票副本
     let mut repair_failed = false;
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
@@ -200,7 +185,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         };
         if needs_repair {
             if let Err(e) = write_slot(&path, &key, best_val.0, best_val.1) {
-                tracing::warn!("[Storage] Replica {} repair failed: {}", slot, e);
+                tracing::warn!("[Storage] 副本 {} 修复失败: {}", slot, e);
                 repair_failed = true;
             }
         }
