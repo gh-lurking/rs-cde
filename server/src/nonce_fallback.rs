@@ -11,15 +11,17 @@ use std::sync::{
     Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+use once_cell::sync::Lazy;
 
 struct NonceEntry {
     expires_at: u64,
 }
 
 const MAX_NONCE_ENTRIES: usize = 500_000;
-static MEMORY_NONCES: once_cell::sync::Lazy<Arc<DashMap<String, NonceEntry>>> = once_cell::sync::lazy! {
+/// In-memory nonce storage (per-instance, for Redis failover)
+static MEMORY_NONCES: Lazy<Arc<DashMap<String, NonceEntry>>> = Lazy::new(|| {
     Arc::new(DashMap::new())
-};
+});
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 static NONCE_CHECKED_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NONCE_REJECTED_COUNT: AtomicUsize = AtomicUsize::new(0);
