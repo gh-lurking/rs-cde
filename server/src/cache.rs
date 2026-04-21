@@ -1,8 +1,10 @@
-// server/src/cache.rs -- 优化版 v4
+// server/src/cache.rs — 优化版 v4
 //
-// BUG-05 FIX: is_revoked() Redis 不可用时正确依赖内存 fallback
-// BUG-06 FIX: throttle_key() 去掉冗余 lc_ 前缀
-// NEW       : mark_revoked_in_memory() 对外暴露
+// [BUG-05 FIX] is_revoked(): Redis 不可用时仅依赖内存 map，不额外写入（避免误写）
+// [BUG-06 FIX] throttle_key() 去掉冗余 lc_ 前缀，统一使用 KEY_NS
+// [NEW]        mark_revoked_in_memory() 对外暴露，revoke 时主动调用加速拦截
+// [OPT-1]      set_verify_cache() 增加 activation_ts/expires_at 零值 guard
+
 use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
@@ -11,6 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub type RedisPool = Pool;
+
 const KEY_NS: &str = "lc:v1:";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -41,6 +44,7 @@ pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolErro
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+
     let cfg = Config {
         url: Some(url.to_string()),
         pool: Some(PoolConfig {
@@ -63,12 +67,13 @@ fn verify_cache_key(key_hash: &str) -> String {
 fn tombstone_key(key_hash: &str) -> String {
     format!("{KEY_NS}revoked:{key_hash}")
 }
-// BUG-06 FIX: 去掉多余 lc_ 前缀
+
+// [BUG-06 FIX] 去掉多余的 lc_ 前缀，与其他 key 统一使用 KEY_NS
 pub fn throttle_key(key_hash: &str) -> String {
     format!("{KEY_NS}throttle:{key_hash}")
 }
 
-// 内存 Revoke Fallback
+// ─── 内存 Revoke Fallback（DashMap，线程安全）────────────────────────────────
 static MEMORY_REVOKE_FALLBACK: OnceLock<DashMap<String, i64>> = OnceLock::new();
 
 fn memory_revoke_map() -> &'static DashMap<String, i64> {
@@ -82,11 +87,12 @@ fn now_ts() -> i64 {
         .as_secs() as i64
 }
 
-// NEW: 对外暴露，handlers 吊销时主动调用
+/// 主动写入内存 revoke map（revoke handler 调用）
 pub fn mark_revoked_in_memory(key_hash: &str, expires_at: i64) {
     memory_revoke_map().insert(key_hash.to_string(), expires_at);
 }
 
+/// [OPT-1] 后台 GC：每 5 分钟清理过期 revoke 记录
 pub fn start_cache_cleanup_task() {
     tokio::spawn(cleanup_memory_revokes());
 }
@@ -105,13 +111,17 @@ async fn cleanup_memory_revokes() {
     }
 }
 
+// ─── Verify Cache ────────────────────────────────────────────────────────────
+
 pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<VerifyCacheEntry> {
     let mut conn = pool.get().await.ok()?;
     let raw: Option<String> = conn.get(verify_cache_key(key_hash)).await.ok()?;
     raw.and_then(|s| serde_json::from_str(&s).ok())
 }
 
+/// [OPT-1] 写入缓存前校验字段有效性
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
+    // 零值 / 逻辑异常 guard
     if entry.activation_ts == 0 || entry.expires_at == 0 {
         return;
     }
@@ -137,33 +147,35 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let _: Result<(), _> = conn.del(verify_cache_key(key_hash)).await;
+    let _: Result<i64, _> = conn.del(verify_cache_key(key_hash)).await;
 }
 
-// BUG-05 FIX: 重构 is_revoked
-// 优先级：内存 map -> Redis tombstone -> false
-// Redis 失败时仅依赖内存已有状态，不额外写入
+// ─── Revoke 检测（三层：内存 → Redis tombstone → false）─────────────────────
+
+/// [BUG-05 FIX]
+/// 优先级：内存 map（最快）→ Redis tombstone → false
+/// Redis 失败时仅依赖内存（不额外写入，防止不一致）
 pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
     let mem_map = memory_revoke_map();
 
-    // 1. 内存 map（最快路径）
+    // 1. 内存 map（O(1) 最快路径）
     if let Some(exp) = mem_map.get(key_hash) {
         if *exp > now_ts() {
             return true;
         }
         drop(exp);
-        mem_map.remove(key_hash);
+        mem_map.remove(key_hash); // 过期条目惰性清理
     }
 
     // 2. Redis tombstone
     let Ok(mut conn) = pool.get().await else {
-        // Redis 不可用：仅依赖内存（已在步骤 1 检查）
+        // Redis 不可用：仅依赖内存（步骤 1 已检查），直接返回 false
         return false;
     };
 
     match conn.get::<_, Option<String>>(tombstone_key(key_hash)).await {
         Ok(Some(_)) => {
-            // 同步写入内存 map
+            // 同步写入内存 map，加速后续检查
             let exp = now_ts() + tombstone_ttl() as i64;
             mem_map.insert(key_hash.to_string(), exp);
             true

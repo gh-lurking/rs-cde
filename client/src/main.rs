@@ -46,6 +46,7 @@ async fn loc_detection() {
         Err(e) => {
             eprintln!("Failure with DETECTION ONE: {e}");
             fallback_to_cf_detection(client).await;
+            // return; // fallback 内已处理退出逻辑
         }
     }
     println!("🌍 LOC DETECTION PASSED");

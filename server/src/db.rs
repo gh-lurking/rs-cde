@@ -1,13 +1,15 @@
-// server/src/db.rs -- 优化版 v4
+// server/src/db.rs — 优化版 v4
 //
-// BUG-12 FIX: extend_license 使用 clamp 保护，防止负值延期
+// [BUG-12 FIX] extend_license db 层 clamp 保护（handler 层已做 checked_mul，双重防御）
+// [OPT]        allow_expired=true 时用 GREATEST(expires_at, now) 防止在已超期的旧值上累加
 
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type DbPool = PgPool;
-pub const MAX_EXTEND_DAYS: i64 = 3650;
+
+pub const MAX_EXTEND_DAYS: i64 = 3650; // 10 年上限
 pub const MAX_EXTEND_SECS: i64 = MAX_EXTEND_DAYS * 86400;
 
 fn now_db() -> i64 {
@@ -29,7 +31,7 @@ pub struct LicenseRecord {
     pub note: String,
 }
 
-pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
+pub async fn init_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     let max_conn: u32 = std::env::var("PG_POOL_MAX_CONN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -48,25 +50,30 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .connect(database_url)
         .await?;
 
+    // DDL 建表（幂等）
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key            TEXT    NOT NULL,
-            key_hash       TEXT    PRIMARY KEY,
-            activation_ts  BIGINT  NOT NULL DEFAULT 0,
-            expires_at     BIGINT  NOT NULL DEFAULT 0,
-            revoked        BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at     BIGINT  NOT NULL,
-            last_check     BIGINT,
-            note           TEXT    NOT NULL DEFAULT ''
+            key           TEXT    NOT NULL,
+            key_hash      TEXT    PRIMARY KEY,
+            activation_ts BIGINT  NOT NULL DEFAULT 0,
+            expires_at    BIGINT  NOT NULL DEFAULT 0,
+            revoked       BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at    BIGINT  NOT NULL,
+            last_check    BIGINT,
+            note          TEXT    NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
     .await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_licenses_key_hash ON licenses (key_hash)")
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_licenses_key_hash
+         ON licenses (key_hash)",
+    )
+    .execute(&pool)
+    .await?;
 
+    // 部分索引：仅索引激活且未吊销的记录，减少索引体积
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires
          ON licenses (expires_at)
@@ -84,8 +91,7 @@ pub async fn find_license(
     key_hash: &str,
 ) -> Result<Option<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses WHERE key_hash = $1",
     )
     .bind(key_hash)
@@ -114,6 +120,8 @@ pub async fn insert_license(
     Ok(())
 }
 
+/// 激活（条件更新：activation_ts = 0 AND NOT revoked）
+/// 返回 true 表示成功激活，false 表示并发竞态（已被激活）
 pub async fn activate_license(
     pool: &DbPool,
     key_hash: &str,
@@ -155,7 +163,12 @@ pub async fn revoke_license(
     Ok(())
 }
 
-// BUG-12 FIX: db 层 clamp 作为防御，handler 层已做 checked_mul
+/// 延期 License
+///
+/// allow_expired = true  -> 对已过期 key 从当前时间起算（GREATEST 防止在旧过期值上累加）
+/// allow_expired = false -> 仅允许对未过期 key 延期
+///
+/// [BUG-12 FIX] db 层 clamp(1, MAX_EXTEND_SECS) 作为最后防线
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
@@ -166,6 +179,7 @@ pub async fn extend_license(
     let extra_secs = extra_secs.clamp(1, MAX_EXTEND_SECS);
 
     let row: Option<(i64,)> = if allow_expired {
+        // GREATEST(expires_at, now) 确保已过期的 key 从当前时间起算
         sqlx::query_as(
             "UPDATE licenses
              SET expires_at = GREATEST(expires_at, $1) + $2
@@ -179,8 +193,7 @@ pub async fn extend_license(
         sqlx::query_as(
             "UPDATE licenses
              SET expires_at = expires_at + $2
-             WHERE key_hash = $3 AND revoked = FALSE
-               AND activation_ts > 0 AND expires_at > $1
+             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0 AND expires_at > $1
              RETURNING expires_at",
         )
         .bind(now)
@@ -195,8 +208,7 @@ pub async fn extend_license(
 
 pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses ORDER BY created_at DESC LIMIT 10000",
     )
     .fetch_all(pool)

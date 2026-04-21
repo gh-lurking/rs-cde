@@ -1,18 +1,19 @@
 // client/src/network.rs — 优化版 v3
 //
-// ✅ M-01 FIX: server_id 编译期硬编码
-// ✅ MD-01 FIX: SNTP 时间校正公式
-// ✅ M-03 FIX: validate_system_time 阈值改为 300s
-// ✅ BUG-07 FIX: 重试时 one_way_delay 上界钳制，改善 RTT 不对称场景
-// ✅ BUG-09 FIX: 优先使用 CF trace ts= 字段（毫秒精度）
+// [M-01 FIX]  server_id 编译期 option_env! 硬编码，不再动态网络拉取
+// [MD-01 FIX] SNTP 时间校正公式修正：one_way_delay = RTT / 2（取自 RFC 5905）
+// [M-03 FIX]  validate_system_time 阈值统一为 300s（与服务端 timestamp_window 一致）
+// [BUG-07 FIX] one_way_delay 上界钳制 min(RTT/2, timeout)，防非对称 RTT 估算过大
+// [BUG-09 FIX] 优先使用 CF trace ts= 字段（Unix 浮点秒，毫秒精度，非 CDN 缓存）
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-type HmacSha256 = Hmac<sha2::Sha256>;
+type HmacSha256 = Hmac<Sha256>;
 
 const MAX_CLOCK_OFFSET_SECS: i64 = 300;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
@@ -38,7 +39,7 @@ pub struct VerifyResponse {
     pub revoked: bool,
 }
 
-// ✅ M-01 FIX: 编译期确定，不再动态网络拉取
+// [M-01 FIX] 编译期确定 server_id，不再动态网络拉取
 fn get_server_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| {
@@ -48,6 +49,7 @@ fn get_server_id() -> &'static str {
     })
 }
 
+// 全局 HTTP Client 单例（OnceLock，连接池复用）
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_http_client() -> &'static reqwest::Client {
@@ -85,6 +87,7 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
     format!("{:x}", mac.finalize().into_bytes())
 }
 
+/// 解析服务端错误，映射到统一错误常量
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
     match status.as_u16() {
@@ -124,6 +127,7 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
         timestamp: ts,
         signature,
     };
+
     let url = format!("{}/verify", server_url);
     let resp = get_http_client()
         .post(&url)
@@ -131,8 +135,10 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
         .send()
         .await
         .map_err(|e| e.to_string())?;
+
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("JSON decode: {e}"))?;
+
     if status.is_success() {
         serde_json::from_value(body).map_err(|e| e.to_string())
     } else {
@@ -140,6 +146,7 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
     }
 }
 
+/// 在线验证（含时钟偏差自动补偿）
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let t1 = now_secs();
     let result = do_verify(hkey, server_url, t1).await;
@@ -150,15 +157,18 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 .trim_start_matches("ERR-TIME-RECORD:server_time=")
                 .parse()
                 .unwrap_or(t1);
+
             let t4 = now_secs();
             let full_rtt = t4 - t1;
 
-            if full_rtt < 0 || full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
-                tracing::warn!("[Network] 不合理的 RTT: {}s", full_rtt);
+            // RTT 合理性检查（超过 2×timeout 说明网络极端拥塞，放弃重试）
+            if full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
+                tracing::warn!("[Network] 不合理的 RTT: {}s，放弃时钟补偿重试", full_rtt);
                 return result;
             }
 
-            // ✅ BUG-07 FIX: one_way_delay 上界钳制，防非对称 RTT 估算过大
+            // [BUG-07 FIX] one_way_delay 上界钳制（防非对称 RTT 导致估算过大）
+            // [MD-01 FIX]  RFC 5905: one_way_delay = RTT / 2
             let one_way_delay = (full_rtt / 2).max(0).min(NET_DEFAULT_TIMEOUT_SECS as i64);
             let estimated_server_now = server_ts + one_way_delay;
             let clock_offset = t1 - estimated_server_now;
@@ -189,13 +199,17 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
     }
 }
 
-/// ✅ BUG-09 FIX: 优先使用 CF trace ts= 字段（毫秒精度，非 CDN 缓存）
+/// 系统时间合理性校验
+///
+/// [BUG-09 FIX] 优先使用 CF trace ts= 字段（毫秒精度，非 CDN 缓存）
+/// [M-03 FIX]   硬限制 300s（与服务端 timestamp_window 一致）
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
+    // 基础合理性检查（防止系统时间极端错误）
     let min_ts: u64 = 1_704_067_200; // 2024-01-01
     let max_ts: u64 = 1_893_456_000; // 2030-01-01
     if local_now < min_ts || local_now > max_ts {
@@ -206,7 +220,7 @@ pub async fn validate_system_time() -> Result<(), String> {
     let mut valid_checks = 0i64;
     let mut total_offset = 0i64;
 
-    // ✅ 优先：Cloudflare trace ts= 字段（Unix 浮点秒，精度高，非缓存）
+    // [BUG-09 FIX] 优先：Cloudflare trace ts= 字段（高精度，非缓存）
     if let Some(cf_ts) = get_time_from_cf_trace(client).await {
         total_offset += local_now as i64 - cf_ts;
         valid_checks += 1;
@@ -234,7 +248,7 @@ pub async fn validate_system_time() -> Result<(), String> {
     }
 
     if valid_checks == 0 {
-        tracing::warn!("[Time] 无法访问任何时间源，跳过 HTTPS 检查");
+        tracing::warn!("[Time] 无法访问任何时间源，跳过 HTTPS 时间检查");
         return Ok(());
     }
 
@@ -246,6 +260,7 @@ pub async fn validate_system_time() -> Result<(), String> {
             avg_offset, SYSTEM_TIME_HARD_LIMIT_SECS
         ));
     }
+
     if avg_offset.abs() > SYSTEM_TIME_WARN_SECS {
         tracing::warn!(
             "[Time] 时间偏差 {}s > {}s 警告阈值",
@@ -253,10 +268,12 @@ pub async fn validate_system_time() -> Result<(), String> {
             SYSTEM_TIME_WARN_SECS
         );
     }
+
     Ok(())
 }
 
-/// 从 Cloudflare /cdn-cgi/trace 获取 ts= 字段（精度高，非缓存）
+/// 从 Cloudflare /cdn-cgi/trace 获取 ts= 字段
+/// ts 格式: "1700000000.123"（Unix 浮点秒，高精度，非 CDN 缓存）
 async fn get_time_from_cf_trace(client: &reqwest::Client) -> Option<i64> {
     let resp = client
         .get("https://cloudflare.com/cdn-cgi/trace")
@@ -267,7 +284,6 @@ async fn get_time_from_cf_trace(client: &reqwest::Client) -> Option<i64> {
     let body = resp.text().await.ok()?;
     for line in body.lines() {
         if let Some(ts_str) = line.strip_prefix("ts=") {
-            // ts 格式: "1700000000.123"（Unix 浮点秒）
             let ts: f64 = ts_str.trim().parse().ok()?;
             return Some(ts as i64);
         }
@@ -275,6 +291,7 @@ async fn get_time_from_cf_trace(client: &reqwest::Client) -> Option<i64> {
     None
 }
 
+/// 解析 HTTP Date 头（RFC 7231 格式）为 Unix 时间戳
 fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let parts: Vec<&str> = date_str.split_whitespace().collect();
     if parts.len() < 6 {

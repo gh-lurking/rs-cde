@@ -1,8 +1,10 @@
-// client/src/license_guard.rs -- 优化版 v4
+// client/src/license_guard.rs — 优化版 v4
 //
-// C-01 FIX: activation_ts/expires_at 零值判断语义修正
-// BUG-01 FIX: 离线路径零值检查
-// 不可恢复错误码直接 exit，不尝试离线回退
+// [C-01 FIX]  activation_ts / expires_at 零值语义修正（在线 + 离线双路均检查）
+// [BUG-01 FIX] 离线路径中增加零值检查：local_ts == 0 || local_expires == 0
+// 不可恢复错误码（REVOKED/INVALID_KEY/NOT_ACTIVATED/EXPIRED/FORBIDDEN/CLOCK-SKEW）
+//   直接 exit(1)，不进入离线回退（离线回退不能绕过真实的授权错误）
+
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,8 +15,10 @@ pub async fn check_and_enforce() {
         std::process::exit(1);
     });
 
+    // 编译期混淆 salt（防止逆向工程提取）
     let salt = obfstr!("PROG_ACTIVATION_SALT_V1_SECRET").to_owned();
     let server_url = obfstr!("https://license.example.com").to_owned();
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -22,41 +26,54 @@ pub async fn check_and_enforce() {
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
+            // 吊销检查
             if resp.revoked {
                 eprintln!("[License] 密钥已被吊销");
                 std::process::exit(1);
             }
-            // C-01 FIX: 零值检查
+
+            // [C-01 FIX] 零值检查（字段默认值为 0，零值表示无效记录）
             if resp.activation_ts <= 0 || resp.expires_at <= 0 {
-                eprintln!("[License] 密钥字段无效（零值）");
+                eprintln!("[License] 密钥字段无效（零值），请先激活密钥");
                 std::process::exit(1);
             }
+
+            // 防时钟篡改：activation_ts 不应在未来 300s 以外
             if resp.activation_ts > now + 300 {
                 eprintln!("[License] activation_ts 在未来，可能时钟篡改");
                 std::process::exit(1);
             }
+
+            // 逻辑一致性检查
             if resp.activation_ts >= resp.expires_at {
                 eprintln!("[License] 数据异常: activation_ts >= expires_at");
                 std::process::exit(1);
             }
+
+            // 过期检查
             if now >= resp.expires_at {
                 let days = (now - resp.expires_at) / 86400;
                 eprintln!("[License] 授权已过期 {} 天", days);
                 std::process::exit(1);
             }
+
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] 在线验证通过，剩余 {} 天", remaining);
+
+            // 写入本地 3 副本加密缓存（离线降级用）
             storage::write_all_replicas(
                 &hkey,
                 &salt,
                 resp.activation_ts as u64,
                 resp.expires_at as u64,
             );
+
+            // 设置运行时到期时间（TimeGuard 监控用）
             time_guard::set_expiry_time(resp.expires_at);
         }
 
         Err(ref e) => {
-            // 不可恢复错误码直接退出
+            // ── 不可恢复错误：直接退出，不尝试离线回退 ──────────────────
             if e == network::ERR_REVOKED {
                 eprintln!("[License] 授权已被吊销");
                 std::process::exit(1);
@@ -70,11 +87,11 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
             if e == network::ERR_EXPIRED {
-                eprintln!("[License] 授权已过期（服务端）");
+                eprintln!("[License] 授权已过期（服务端确认）");
                 std::process::exit(1);
             }
             if e.starts_with("ERR-FORBIDDEN:") {
-                eprintln!("[License] 区域不允许");
+                eprintln!("[License] 区域不允许: {e}");
                 std::process::exit(1);
             }
             if e.starts_with("ERR-CLOCK-SKEW-PERSISTENT:") {
@@ -82,11 +99,12 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
 
+            // ── 网络故障 / 临时错误：尝试离线缓存 ────────────────────────
             eprintln!("[License] 在线验证失败 ({e}), 尝试本地缓存...");
 
             match storage::read_local_record(&hkey, &salt) {
                 storage::LocalReadResult::Insufficient { read_count } => {
-                    eprintln!("[License] 本地副本不足 ({read_count}/3)");
+                    eprintln!("[License] 本地副本不足 ({read_count}/3)，无法离线验证");
                     std::process::exit(1);
                 }
                 storage::LocalReadResult::Tampered { read_count } => {
@@ -99,23 +117,28 @@ pub async fn check_and_enforce() {
                     repair_failed,
                 } => {
                     if repair_failed {
-                        eprintln!("[License] 部分副本修复失败");
+                        eprintln!("[License] 部分副本修复失败（继续使用有效副本）");
                     }
-                    // C-01 FIX: 离线路径零值检查
+
+                    // [C-01 FIX + BUG-01 FIX] 离线路径零值检查
                     if local_ts == 0 || local_expires == 0 {
                         eprintln!("[License] 本地记录无效（零值）");
                         std::process::exit(1);
                     }
-                    // C-01 FIX: 离线过期检查
+
+                    // 离线过期检查
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
                         eprintln!("[License] 授权已过期 {} 天（离线）", days);
                         std::process::exit(1);
                     }
+
+                    // 防篡改：activation_ts 不应在未来
                     if local_ts as i64 > now + 300 {
-                        eprintln!("[License] activation_ts 在未来（可能篡改）");
+                        eprintln!("[License] 本地 activation_ts 在未来（可能被篡改）");
                         std::process::exit(1);
                     }
+
                     let remaining = (local_expires as i64 - now) / 86400;
                     println!("[License] 离线验证通过，剩余 {} 天", remaining);
                     time_guard::set_expiry_time(local_expires as i64);
