@@ -1,7 +1,8 @@
-// client/src/time_guard.rs — 运行时时间监控模块
-// 修复：运行时时间监控，防止运行过程中修改系统时间
+// client/src/time_guard.rs — 优化版 v2
+// ✅ C-03 FIX: 系统挂起唤醒后不再误报退出
+//             时间跳跃时先验证密钥是否过期，未过期则接受跳跃
+
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-// use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,58 +21,77 @@ pub fn start_monitor() {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return; // 已经启动
+        return; // 防止重复启动
     }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-
     LAST_VALID_TIME.store(now, Ordering::SeqCst);
 
     thread::Builder::new()
         .name("time-guard".to_string())
-        .spawn(|| {
-            monitor_loop();
-        })
-        .expect("Failed to spawn time guard thread");
+        .spawn(monitor_loop)
+        .expect("Failed to spawn time-guard thread");
 
     tracing::info!("[TimeGuard] Monitor started");
 }
 
 fn monitor_loop() {
     loop {
-        thread::sleep(Duration::from_secs(15)); // 每15秒检查一次
+        thread::sleep(Duration::from_secs(15));
 
         let current = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-
         let last = LAST_VALID_TIME.load(Ordering::SeqCst);
-
-        // 检查时间倒退（允许 NTP 微调 60 秒）
-        if current < last - 60 {
-            eprintln!("❌ [TimeGuard] System time tampering detected!");
-            eprintln!("   Last valid: {}, Current: {}", last, current);
-            eprintln!("   Time went backwards by {} seconds", last - current);
-            std::process::exit(1);
-        }
-
-        // 检查时间跳跃（允许 1 小时内的正常跳变）
-        if current > last + 3600 {
-            eprintln!("❌ [TimeGuard] Suspicious time jump detected!");
-            eprintln!("   Last valid: {}, Current: {}", last, current);
-            eprintln!("   Jumped forward by {} seconds", current - last);
-            std::process::exit(1);
-        }
-
-        // 检查是否超过密钥过期时间
         let expiry = EXPIRY_TIME.load(Ordering::SeqCst);
+
+        // ── 1. 时间倒退检查（允许 60 s NTP 微调）──────────────────────
+        if current < last - 60 {
+            eprintln!(
+                "❌ [TimeGuard] Time went backwards: last={} current={} diff={}s",
+                last,
+                current,
+                last - current
+            );
+            std::process::exit(1);
+        }
+
+        // ── 2. 时间跳跃处理（✅ C-03 FIX）────────────────────────────
+        //    原逻辑：跳跃 >1h 直接退出（合盖唤醒必中招）
+        //    新逻辑：跳跃时先检查密钥是否已过期
+        if current > last + 3600 {
+            tracing::warn!(
+                "[TimeGuard] Time jump detected: {}s (suspend/resume?). Checking expiry...",
+                current - last
+            );
+
+            if expiry > 0 && current >= expiry {
+                // 跳跃后密钥已过期 → 退出
+                eprintln!(
+                    "❌ [TimeGuard] License expired during suspend. expired_at={} current={}",
+                    expiry, current
+                );
+                std::process::exit(1);
+            }
+
+            // 跳跃但密钥仍有效 → 接受新时间，继续运行
+            tracing::info!(
+                "[TimeGuard] Time jump accepted (license still valid). Updating baseline."
+            );
+            LAST_VALID_TIME.store(current, Ordering::SeqCst);
+            continue;
+        }
+
+        // ── 3. 正常周期：检查密钥是否到期 ────────────────────────────
         if expiry > 0 && current >= expiry {
-            eprintln!("❌ [TimeGuard] License expired during runtime!");
-            eprintln!("   Expires at: {}, Current: {}", expiry, current);
+            eprintln!(
+                "❌ [TimeGuard] License expired during runtime! expired_at={} current={}",
+                expiry, current
+            );
             std::process::exit(1);
         }
 

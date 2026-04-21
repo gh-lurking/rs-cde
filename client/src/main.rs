@@ -1,7 +1,6 @@
 // client/src/main.rs — 优化版
 // ✅ BUG-06 FIX: license_guard::check_and_enforce() 是 async fn，需 .await
 // ✅ BUG-10 FIX: 地理检测两层降级，网络不可用时退出而非忽略
-
 use reqwest::Client;
 use std::process;
 mod cn_cidr;
@@ -13,9 +12,10 @@ mod time_guard;
 
 #[tokio::main]
 async fn main() {
-    loc_detection().await;
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
-    // [新增] 启动时检查系统时间合理性
+    loc_detection().await;
+    // 系统时间合理性校验（阈值 300 s，与服务端时间窗口一致）
     if let Err(e) = network::validate_system_time().await {
         eprintln!("❌ System time validation failed: {e}");
         process::exit(1);

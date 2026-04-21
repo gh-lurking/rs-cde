@@ -10,9 +10,9 @@ mod handlers;
 mod nonce_fallback;
 
 use axum::{
-    Extension, Router,
     extract::DefaultBodyLimit,
     routing::{get, post},
+    Extension, Router,
 };
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;

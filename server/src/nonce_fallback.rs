@@ -1,6 +1,6 @@
-// server/src/nonce_fallback.rs — 修复无意义比较版
-// ✅ BUG-05 FIX: 移除无意义的 ct_eq 比较
-// ✅ BUG-5 FIX: 容量保护防 OOM
+// server/src/nonce_fallback.rs — 优化版 v2
+// ✅ MD-03 FIX: 使用 OccupiedEntry::insert 原地替换，消除竞态窗口
+
 use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -37,7 +37,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// ✅ FIX: 移除无意义的 ct_eq，直接返回
+/// ✅ MD-03 FIX: 使用 OccupiedEntry::insert 原地替换，持锁内完成，无竞态窗口
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
@@ -46,7 +46,7 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     // 容量保护
     if map.len() >= MAX_NONCE_ENTRIES {
         tracing::error!(
-            "[NonceFallback] Capacity exceeded ({} entries), rejecting",
+            "[NonceFallback] Capacity exceeded ({}), rejecting",
             MAX_NONCE_ENTRIES
         );
         return false;
@@ -54,21 +54,21 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
 
     use dashmap::mapref::entry::Entry;
     match map.entry(key.to_string()) {
-        Entry::Occupied(e) => {
-            let old_exp = e.get().expires_at;
-            if old_exp > now {
-                return false; // nonce 仍有效，重放
+        Entry::Occupied(mut e) => {
+            if e.get().expires_at > now {
+                // nonce 仍在有效期，拒绝重放
+                return false;
             }
-            // 过期，移除旧条目
-            e.remove();
-            // 继续插入
+            // ✅ 过期：原地替换（持锁，无竞态窗口）
+            e.insert(NonceEntry { expires_at });
+            true
         }
-        Entry::Vacant(_) => {}
+        Entry::Vacant(e) => {
+            // 新 nonce，直接插入
+            e.insert(NonceEntry { expires_at });
+            true
+        }
     }
-
-    // 插入新 nonce
-    map.insert(key.to_string(), NonceEntry { expires_at });
-    true
 }
 
 async fn cleanup_loop() {
@@ -78,12 +78,12 @@ async fn cleanup_loop() {
         let now = now_secs();
         let before = map.len();
         map.retain(|_, v| v.expires_at > now);
-        let after = map.len();
-        if before != after {
+        let cleaned = before - map.len();
+        if cleaned > 0 {
             tracing::debug!(
                 "[NonceFallback] Cleaned {} expired nonces ({} remaining)",
-                before - after,
-                after
+                cleaned,
+                map.len()
             );
         }
     }

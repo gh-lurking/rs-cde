@@ -36,7 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 # 错误处理 & 追踪
 anyhow = "1"
 tracing = "0.1"
-
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # subtle = "2"
 # M-04 FIX: 移除 async-recursion，改用 loop + flag
 
