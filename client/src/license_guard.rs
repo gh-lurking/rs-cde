@@ -1,6 +1,5 @@
 // client/src/license_guard.rs — 优化版 v2
 // ✅ C-01 FIX: 离线模式先做零值检查，再做过期检查（顺序正确）
-// ✅ 集成时间监控基准设置
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +18,7 @@ pub async fn check_and_enforce() {
         .as_secs() as i64;
 
     match network::verify_online(&hkey, &server_url).await {
-        // ─── 在线成功路径 ───────────────────────────────────────────────
+        // ─── 在线成功路径 ──────────────────────────────────────
         Ok(resp) => {
             if resp.revoked {
                 eprintln!("[License] Server returned revoked=true");
@@ -42,7 +41,6 @@ pub async fn check_and_enforce() {
                 eprintln!("[License] Key expired {} days ago", days);
                 std::process::exit(1);
             }
-
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] Online OK, {} days remaining", remaining);
 
@@ -55,9 +53,8 @@ pub async fn check_and_enforce() {
             time_guard::set_expiry_time(resp.expires_at);
         }
 
-        // ─── 网络失败路径 ───────────────────────────────────────────────
+        // ─── 网络失败路径 ──────────────────────────────────────
         Err(ref e) => {
-            // 确定性错误：立即退出，不尝试离线
             if e == network::ERR_REVOKED {
                 eprintln!("[License] Key revoked");
                 std::process::exit(1);
@@ -100,23 +97,22 @@ pub async fn check_and_enforce() {
                     repair_failed,
                 } => {
                     if repair_failed {
-                        eprintln!("[License] Replica repair failed, proceeding with caution");
+                        eprintln!("[License] Replica repair failed, caution");
                     }
 
-                    // ✅ C-01 FIX 步骤 1：先做零值检查（防 u64→i64 溢出）
+                    // ✅ C-01 FIX 步骤 1：先做零值检查
                     if local_ts == 0 || local_expires == 0 {
                         eprintln!("[License] Corrupt local record (zero values)");
                         std::process::exit(1);
                     }
 
-                    // ✅ C-01 FIX 步骤 2：再做过期检查（顺序不可颠倒）
+                    // ✅ C-01 FIX 步骤 2：再做过期检查
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
                         eprintln!("[License] Key expired {} days ago (offline)", days);
                         std::process::exit(1);
                     }
 
-                    // 活跃时间戳合理性检查
                     if local_ts as i64 > now + 300 {
                         eprintln!("[License] activation_ts in future (tamper?)");
                         std::process::exit(1);

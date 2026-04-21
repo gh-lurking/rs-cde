@@ -1,5 +1,5 @@
 // server/src/db.rs — 优化版 v2
-// ✅ MD-02 FIX: extend_license 增加 allow_expired 参数，明确区分续期行为
+// ✅ MD-02 FIX: extend_license 增加 allow_expired 参数
 
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -16,12 +16,12 @@ fn now_db() -> i64 {
         .as_secs() as i64
 }
 
-fn hash_key(key: &str) -> String {
-    use sha2::Digest;
-    let mut h = sha2::Sha256::new();
-    h.update(key.as_bytes());
-    hex::encode(h.finalize())
-}
+// fn _hash_key(key: &str) -> String {
+//     use sha2::Digest;
+//     let mut h = sha2::Sha256::new();
+//     h.update(key.as_bytes());
+//     hex::encode(h.finalize())
+// }
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct LicenseRecord {
@@ -56,14 +56,14 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key           TEXT NOT NULL,
-            key_hash      TEXT PRIMARY KEY,
+            key TEXT NOT NULL,
+            key_hash TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at    BIGINT NOT NULL DEFAULT 0,
-            revoked       BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at    BIGINT NOT NULL,
-            last_check    BIGINT,
-            note          TEXT NOT NULL DEFAULT ''
+            expires_at BIGINT NOT NULL DEFAULT 0,
+            revoked BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at BIGINT NOT NULL,
+            last_check BIGINT,
+            note TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
@@ -72,8 +72,10 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_licenses_key_hash ON licenses (key_hash)")
         .execute(&pool)
         .await?;
+
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires ON licenses (expires_at)
+        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires
+         ON licenses (expires_at)
          WHERE revoked = FALSE AND activation_ts > 0",
     )
     .execute(&pool)
@@ -88,7 +90,8 @@ pub async fn find_license(
     key_hash: &str,
 ) -> Result<Option<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked,
+                created_at, last_check, note
          FROM licenses WHERE key_hash = $1",
     )
     .bind(key_hash)
@@ -105,7 +108,8 @@ pub async fn insert_license(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO licenses (key, key_hash, created_at, note)
-         VALUES ($1, $2, $3, $4) ON CONFLICT (key_hash) DO NOTHING",
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(key)
     .bind(key_hash)
@@ -167,24 +171,24 @@ pub async fn extend_license(
     let extra_secs = extra_secs.min(MAX_EXTEND_SECS);
 
     let row: Option<(i64,)> = if allow_expired {
-        // 允许对已过期 key 续期（以 GREATEST(expires_at, now) 为基准）
+        // 已过期也允许：以 GREATEST(expires_at, now) 为基准
         sqlx::query_as(
             "UPDATE licenses
              SET expires_at = GREATEST(expires_at, $1) + $2
-             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0
+             WHERE key_hash = $3
+               AND revoked = FALSE AND activation_ts > 0
              RETURNING expires_at",
         )
         .bind(now)
         .bind(extra_secs)
         .bind(key_hash)
     } else {
-        // 默认：仅对未过期 key 续期（从现有 expires_at 加）
+        // 默认：仅对未过期密钥续期
         sqlx::query_as(
             "UPDATE licenses
              SET expires_at = expires_at + $2
              WHERE key_hash = $3
-               AND revoked = FALSE
-               AND activation_ts > 0
+               AND revoked = FALSE AND activation_ts > 0
                AND expires_at > $1
              RETURNING expires_at",
         )
@@ -200,7 +204,8 @@ pub async fn extend_license(
 
 pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked,
+                created_at, last_check, note
          FROM licenses ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -208,16 +213,17 @@ pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx
 }
 
 /// unnest() 批量 INSERT，O(1) DB trips
+/// ✅ OPT-02: 接收预计算的 key_hashes，不再重算
 pub async fn batch_init_keys(
     pool: &DbPool,
     keys: &[String],
+    key_hashes: &[String],
     note: &str,
 ) -> Result<(), sqlx::Error> {
     if keys.is_empty() {
         return Ok(());
     }
     let now = now_db();
-    let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
     let created_ats = vec![now; keys.len()];
     let notes = vec![note.to_string(); keys.len()];
 
@@ -227,7 +233,7 @@ pub async fn batch_init_keys(
          ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(keys)
-    .bind(&key_hashes)
+    .bind(key_hashes)
     .bind(&created_ats)
     .bind(&notes)
     .execute(pool)

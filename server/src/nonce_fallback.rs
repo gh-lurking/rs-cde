@@ -1,6 +1,5 @@
 // server/src/nonce_fallback.rs — 优化版 v2
-// ✅ MD-03 FIX: 使用 OccupiedEntry::insert 原地替换，消除竞态窗口
-
+// ✅ MD-03 FIX: Entry API 原地替换，消除 TOCTOU 竞态窗口
 use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -13,7 +12,6 @@ struct NonceEntry {
 }
 
 const MAX_NONCE_ENTRIES: usize = 500_000;
-
 static MEMORY_NONCES: OnceLock<DashMap<String, NonceEntry>> = OnceLock::new();
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -37,18 +35,14 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// ✅ MD-03 FIX: 使用 OccupiedEntry::insert 原地替换，持锁内完成，无竞态窗口
+/// ✅ MD-03 FIX: Entry API — check + insert 原子完成，无竞态
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
     let expires_at = now + ttl_secs;
 
-    // 容量保护
     if map.len() >= MAX_NONCE_ENTRIES {
-        tracing::error!(
-            "[NonceFallback] Capacity exceeded ({}), rejecting",
-            MAX_NONCE_ENTRIES
-        );
+        tracing::error!("[NonceFallback] Capacity exceeded, rejecting");
         return false;
     }
 
@@ -56,15 +50,13 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     match map.entry(key.to_string()) {
         Entry::Occupied(mut e) => {
             if e.get().expires_at > now {
-                // nonce 仍在有效期，拒绝重放
-                return false;
+                return false; // nonce 仍有效，拒绝重放
             }
-            // ✅ 过期：原地替换（持锁，无竞态窗口）
+            // 过期：原地替换（持锁，无竞态窗口）
             e.insert(NonceEntry { expires_at });
             true
         }
         Entry::Vacant(e) => {
-            // 新 nonce，直接插入
             e.insert(NonceEntry { expires_at });
             true
         }
@@ -80,11 +72,7 @@ async fn cleanup_loop() {
         map.retain(|_, v| v.expires_at > now);
         let cleaned = before - map.len();
         if cleaned > 0 {
-            tracing::debug!(
-                "[NonceFallback] Cleaned {} expired nonces ({} remaining)",
-                cleaned,
-                map.len()
-            );
+            tracing::debug!("[NonceFallback] Cleaned {} expired nonces", cleaned);
         }
     }
 }
