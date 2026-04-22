@@ -1,11 +1,8 @@
-// client/src/network.rs — 优化版 v4
+// client/src/network.rs — 优化版 v5
 //
-// [M-01 FIX] server_id 编译期 option_env! 硬编码，不再动态网络拉取
-// [MD-01 FIX] SNTP 时间校正公式修正：one_way_delay = RTT / 2（取自 RFC 5905）
-// [M-03 FIX] validate_system_time 阈值统一为 300s（与服务端 timestamp_window 一致）
-// [BUG-07 FIX] one_way_delay 上界钳制 min(RTT/2, timeout)，防非对称 RTT 估算过大
-// [BUG-09 FIX] 优先使用 CF trace ts= 字段（Unix 浮点秒，毫秒精度，非 CDN 缓存）
-// [BUG-13 FIX] 客户端同步修复：服务器返回 409 CONFLICT 时 ERR-NOT_ACTIVATED 也视为不可恢复
+// [BUG-A1 FIX] do_verify 零值 guard 实际生效（不再被 serde 覆盖）
+// [BUG-A9 FIX] max_ts 改为动态计算，避免程序到 2030 年后无法启动
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,7 +35,6 @@ pub struct VerifyResponse {
     pub revoked: bool,
 }
 
-// [M-01 FIX] 编译期确定 server_id，不再动态网络拉取
 fn get_server_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| {
@@ -48,9 +44,7 @@ fn get_server_id() -> &'static str {
     })
 }
 
-// 全局 HTTP Client 单例（OnceLock，连接池复用）
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -86,12 +80,9 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
     format!("{:x}", mac.finalize().into_bytes())
 }
 
-/// 解析服务端错误，映射到统一错误常量
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
-
     match status.as_u16() {
-        // [BUG-13 FIX] ERR-EXPIRED 统一用 410，ERR-NOT-ACTIVATED 统一用 409
         410 => return ERR_EXPIRED.to_string(),
         409 => {
             return match err_code {
@@ -112,7 +103,6 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         }
         _ => {}
     }
-
     match err_code {
         "ERR-REVOKED" => ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" => ERR_INVALID_KEY.to_string(),
@@ -132,13 +122,11 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
 async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyResponse, String> {
     let key_hash = hash_key(hkey);
     let signature = sign_request(hkey, &key_hash, ts);
-
     let req = VerifyRequest {
         key_hash,
         timestamp: ts,
         signature,
     };
-
     let url = format!("{}/verify", server_url);
     let resp = get_http_client()
         .post(&url)
@@ -146,26 +134,25 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
         .send()
         .await
         .map_err(|e| e.to_string())?;
-
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("JSON decode: {e}"))?;
 
     if status.is_success() {
-        // [BUG-13 FIX] 检查响应字段零值
-        let activation_ts = body["activation_ts"].as_i64().unwrap_or(0);
-        let expires_at = body["expires_at"].as_i64().unwrap_or(0);
-
-        serde_json::from_value(body).map_err(|e| e.to_string())
+        // [BUG-A1 FIX] 零值 guard 实际生效：先解析，再检查，不被后续代码覆盖
+        let vr: VerifyResponse =
+            serde_json::from_value(body).map_err(|e| format!("JSON decode: {e}"))?;
+        if vr.activation_ts <= 0 || vr.expires_at <= 0 {
+            return Err(ERR_NOT_ACTIVATED.to_string());
+        }
+        Ok(vr)
     } else {
         Err(parse_server_error(status, &body))
     }
 }
 
-/// 在线验证（含时钟偏差自动补偿）
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let t1 = now_secs();
     let result = do_verify(hkey, server_url, t1).await;
-
     match &result {
         Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
             let server_ts: i64 = e
@@ -174,20 +161,13 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 .unwrap_or(t1);
             let t4 = now_secs();
             let full_rtt = t4 - t1;
-
-            // RTT 合理性检查（超过 2×timeout 说明网络极端拥塞，放弃重试）
             if full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
                 tracing::warn!("[Network] 不合理的 RTT: {}s，放弃时钟补偿重试", full_rtt);
                 return result;
             }
-
-            // [BUG-07 FIX] one_way_delay 上界钳制（防非对称 RTT 导致估算过大）
-            // [MD-01 FIX] RFC 5905: one_way_delay = RTT / 2
             let one_way_delay = (full_rtt / 2).max(0).min(NET_DEFAULT_TIMEOUT_SECS as i64);
-
             let estimated_server_now = server_ts + one_way_delay;
             let clock_offset = t1 - estimated_server_now;
-
             tracing::info!(
                 "[Network] RTT={}s one_way={}s local={} server={} estimated_server={}",
                 full_rtt,
@@ -196,12 +176,9 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 server_ts,
                 estimated_server_now
             );
-
             if clock_offset.abs() > MAX_CLOCK_OFFSET_SECS {
                 return Err(format!("ERR-CLOCK-SKEW:{}", clock_offset));
             }
-
-            // 用估算的服务端当前时间重试
             let retry = do_verify(hkey, server_url, estimated_server_now).await;
             match &retry {
                 Err(e2) if e2.starts_with("ERR-TIME-RECORD:") => {
@@ -214,35 +191,33 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
     }
 }
 
-/// 系统时间合理性校验
-///
-/// [BUG-09 FIX] 优先使用 CF trace ts= 字段（毫秒精度，非 CDN 缓存）
-/// [M-03 FIX] 硬限制 300s（与服务端 timestamp_window 一致）
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    // 基础合理性检查（防止系统时间极端错误）
+    // [BUG-A9 FIX] 下界固定（2024-01-01），上界动态（当前+10年），永不过时
     let min_ts: u64 = 1_704_067_200; // 2024-01-01
-    let max_ts: u64 = 1_893_456_000; // 2030-01-01
-    if local_now < min_ts || local_now > max_ts {
-        return Err("系统时间超出合理范围 (2024-2030)".into());
+    let max_ts: u64 = local_now + 10 * 365 * 86400; // 动态：当前时间 + 10 年
+
+    if local_now < min_ts {
+        return Err(format!(
+            "系统时间过早（{local_now} < {min_ts}），请检查系统时钟"
+        ));
     }
+    // max_ts 是动态的，正常使用永远不会触发上界
 
     let client = get_http_client();
     let mut valid_checks = 0i64;
     let mut total_offset = 0i64;
 
-    // [BUG-09 FIX] 优先：Cloudflare trace ts= 字段（高精度，非缓存）
     if let Some(cf_ts) = get_time_from_cf_trace(client).await {
         total_offset += local_now as i64 - cf_ts;
         valid_checks += 1;
         tracing::info!("[Time] CF trace ts={}, local={}", cf_ts, local_now);
     }
 
-    // 降级：HTTP Date 头（精度 1s，CDN 可能有缓存延迟）
     let http_sources = ["https://www.google.com", "https://www.microsoft.com"];
     for url in http_sources {
         if let Ok(resp) = client
@@ -268,14 +243,12 @@ pub async fn validate_system_time() -> Result<(), String> {
     }
 
     let avg_offset = total_offset / valid_checks;
-
     if avg_offset.abs() > SYSTEM_TIME_HARD_LIMIT_SECS {
         return Err(format!(
             "系统时间偏差 {}s 超过限制 {}s，请同步时钟",
             avg_offset, SYSTEM_TIME_HARD_LIMIT_SECS
         ));
     }
-
     if avg_offset.abs() > SYSTEM_TIME_WARN_SECS {
         tracing::warn!(
             "[Time] 时间偏差 {}s > {}s 警告阈值",
@@ -283,12 +256,9 @@ pub async fn validate_system_time() -> Result<(), String> {
             SYSTEM_TIME_WARN_SECS
         );
     }
-
     Ok(())
 }
 
-/// 从 Cloudflare /cdn-cgi/trace 获取 ts= 字段
-/// ts 格式: "1700000000.123"（Unix 浮点秒，高精度，非 CDN 缓存）
 async fn get_time_from_cf_trace(client: &reqwest::Client) -> Option<i64> {
     let resp = client
         .get("https://cloudflare.com/cdn-cgi/trace")
@@ -296,26 +266,21 @@ async fn get_time_from_cf_trace(client: &reqwest::Client) -> Option<i64> {
         .send()
         .await
         .ok()?;
-
     let body = resp.text().await.ok()?;
-
     for line in body.lines() {
         if let Some(ts_str) = line.strip_prefix("ts=") {
             let ts: f64 = ts_str.trim().parse().ok()?;
             return Some(ts as i64);
         }
     }
-
     None
 }
 
-/// 解析 HTTP Date 头（RFC 7231 格式）为 Unix 时间戳
 fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let parts: Vec<&str> = date_str.split_whitespace().collect();
     if parts.len() != 5 {
         return None;
     }
-
     let day: u32 = parts[1].parse().ok()?;
     let month = match parts[2] {
         "Jan" => 1,
@@ -340,7 +305,6 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let h: u32 = tp[0].parse().ok()?;
     let m: u32 = tp[1].parse().ok()?;
     let s: u32 = tp[2].parse().ok()?;
-
     let days = days_since_1970(year, month, day);
     Some(days * 86400 + h as u64 * 3600 + m as u64 * 60 + s as u64)
 }

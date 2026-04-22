@@ -207,8 +207,13 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
 
     match conn.get::<_, Option<String>>(tombstone_key(key_hash)).await {
         Ok(Some(_)) => {
-            // 同步写入内存 map，加速后续检查
-            let exp = now_ts() + tombstone_ttl() as i64;
+            // 查询实际剩余 TTL
+            let remaining_ttl: i64 = redis::cmd("TTL")
+                .arg(tombstone_key(key_hash))
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(300); // 查询失败时保守取 5 分钟
+            let exp = now_ts() + remaining_ttl.max(0);
             mem_map.insert(key_hash.to_string(), exp);
             true
         }
