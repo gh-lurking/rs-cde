@@ -1,12 +1,14 @@
-// server/src/db.rs — 优化版 v8
+// server/src/db.rs — 优化版 v9
 //
-// [新增] get_key_only(): 缓存命中路径 HMAC 验证时查 DB 取 key，不信任 Redis
+// [BUG-D2 NOTE] batch_init_keys UNNEST参数顺序添加注释明确对应关系
+// 其余逻辑保持不变
 
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type DbPool = PgPool;
+
 pub const MAX_EXTEND_DAYS: i64 = 3650;
 pub const MAX_EXTEND_SECS: i64 = MAX_EXTEND_DAYS * 86400;
 
@@ -93,8 +95,6 @@ pub async fn find_license(
     .await
 }
 
-// [BUG-H3 FIX] 仅取 key 列，用于缓存命中路径的 HMAC 验证
-// 避免全量查询 LicenseRecord 的开销，同时修复 Redis key 污染问题
 pub async fn get_key_only(pool: &DbPool, key_hash: &str) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar("SELECT key FROM licenses WHERE key_hash = $1")
         .bind(key_hash)
@@ -110,8 +110,8 @@ pub async fn insert_license(
     note: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO licenses (key, key_hash, created_at, note) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (key_hash) DO NOTHING",
+        "INSERT INTO licenses (key, key_hash, created_at, note)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(key)
     .bind(key_hash)
@@ -216,6 +216,8 @@ pub async fn batch_init_keys(
     let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
     let created_ats = vec![now; keys.len()];
     let notes = vec![note.to_string(); keys.len()];
+    // [BUG-D2 NOTE] UNNEST列顺序：$1=key, $2=key_hash, $3=created_at, $4=note
+    // 与INSERT列顺序严格对应，修改任意一侧时必须同步修改另一侧
     sqlx::query(
         "INSERT INTO licenses (key, key_hash, created_at, note)
          SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[])

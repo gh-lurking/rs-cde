@@ -1,8 +1,8 @@
-// server/src/cache.rs — 优化版 v9
+// server/src/cache.rs — 优化版 v10
 //
+// [BUG-H1 FIX] is_revoked() 热路径：tombstone_key 局部变量复用，消除重复String分配
 // [BUG-C1 FIX] tombstone TTL 查询失败时降级为 MIN_MEMORY_REVOKE_TTL（60s）
-//              而非 tombstone_ttl()（最大值，最长30天）
-//              防止 TTL 查询失败时内存缓存远超 Redis 实际 TTL 导致的误判
+// 其余逻辑保持不变
 
 use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
@@ -13,7 +13,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub type RedisPool = Pool;
-
 const KEY_NS: &str = "lc:v1:";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -74,17 +73,14 @@ pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolErro
 fn verify_cache_key(key_hash: &str) -> String {
     format!("{KEY_NS}verify:{key_hash}")
 }
-
 fn tombstone_key(key_hash: &str) -> String {
     format!("{KEY_NS}revoked:{key_hash}")
 }
-
 pub fn throttle_key(key_hash: &str) -> String {
     format!("{KEY_NS}throttle:{key_hash}")
 }
 
 static MEMORY_REVOKE_FALLBACK: OnceLock<DashMap<String, i64>> = OnceLock::new();
-
 fn memory_revoke_map() -> &'static DashMap<String, i64> {
     MEMORY_REVOKE_FALLBACK.get_or_init(DashMap::new)
 }
@@ -108,8 +104,12 @@ pub fn start_cache_cleanup_task() {
         return;
     }
     tokio::spawn(async {
-        cleanup_memory_revokes().await;
-        tracing::error!("[Cache] cleanup task exited unexpectedly — memory revoke map GC stopped");
+        loop {
+            cleanup_memory_revokes().await;
+            // cleanup_memory_revokes 内部是无限循环，只有 panic 才会到这里
+            tracing::error!("[Cache] cleanup_memory_revokes 意外退出，正在重启...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     });
 }
 
@@ -153,7 +153,6 @@ pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCa
         return;
     }
     let Ok(json) = serde_json::to_string(entry) else {
-        tracing::warn!("[Cache] JSON 序列化失败");
         return;
     };
     let Ok(mut conn) = pool.get().await else {
@@ -172,7 +171,7 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-    let _: Result<i64, _> = conn.del(verify_cache_key(key_hash)).await;
+    let _: Result<(), _> = conn.del(verify_cache_key(key_hash)).await;
 }
 
 pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
@@ -184,19 +183,20 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
         drop(exp);
         mem_map.remove(key_hash);
     }
-
     let Ok(mut conn) = pool.get().await else {
         return false;
     };
-    match conn.get::<_, Option<String>>(tombstone_key(key_hash)).await {
+
+    // [BUG-H1 FIX] 局部变量复用，避免tombstone_key()调用两次重复分配String
+    let tkey = tombstone_key(key_hash);
+    match conn.get::<_, Option<String>>(&tkey).await {
         Ok(Some(_)) => {
-            // [BUG-C1 FIX] TTL 查询失败时降级为 MIN_MEMORY_REVOKE_TTL（60s），
-            // 而非 tombstone_ttl()（最大30天），防止内存缓存远超 Redis 实际 TTL
+            // [BUG-C1 FIX] TTL查询失败时降级为MIN_MEMORY_REVOKE_TTL(60s)
             let remaining_ttl: i64 = redis::cmd("TTL")
-                .arg(tombstone_key(key_hash))
+                .arg(&tkey) // ← 复用 tkey，不再重复 format!()
                 .query_async(&mut conn)
                 .await
-                .unwrap_or(MIN_MEMORY_REVOKE_TTL); // ✅ 失败时用最小值
+                .unwrap_or(MIN_MEMORY_REVOKE_TTL);
             let effective_ttl = remaining_ttl
                 .max(MIN_MEMORY_REVOKE_TTL)
                 .min(tombstone_ttl() as i64);

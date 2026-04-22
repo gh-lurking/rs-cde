@@ -1,7 +1,7 @@
-// server/src/nonce_fallback.rs — 优化版 v4
+// server/src/nonce_fallback.rs — 优化版 v5
 //
+// [BUG-NF1 FIX] cleanup_loop 任务增加外层重启逻辑，防止panic后GC永久停止
 // [BUG-02 FIX] check_and_store 语义完全修正
-// [BUG-13 FIX] 增加 nonce 计数指标，便于监控 DoS 攻击
 // [OPT] Entry API 原子化 check+insert，消除 TOCTOU 竞态
 // [OPT] MAX_NONCE_ENTRIES 上界防内存耗尽 DoS
 
@@ -21,7 +21,6 @@ const MAX_NONCE_ENTRIES: usize = 500_000;
 
 static MEMORY_NONCES: Lazy<Arc<DashMap<String, NonceEntry>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
-
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 static NONCE_CHECKED_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NONCE_REJECTED_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -31,24 +30,29 @@ fn nonce_map() -> &'static Arc<DashMap<String, NonceEntry>> {
 }
 
 pub fn get_nonce_stats() -> (usize, usize, usize) {
-    let total = NONCE_CHECKED_COUNT.load(Ordering::Relaxed);
-    let rejected = NONCE_REJECTED_COUNT.load(Ordering::Relaxed);
-    let map_size = nonce_map().len();
-    (total, rejected, map_size)
-}
-
-pub fn _reset_nonce_stats() {
-    NONCE_CHECKED_COUNT.store(0, Ordering::Relaxed);
-    NONCE_REJECTED_COUNT.store(0, Ordering::Relaxed);
+    (
+        NONCE_CHECKED_COUNT.load(Ordering::Relaxed),
+        NONCE_REJECTED_COUNT.load(Ordering::Relaxed),
+        nonce_map().len(),
+    )
 }
 
 pub fn start_cleanup_task() {
     if CLEANUP_STARTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
+        .is_err()
     {
-        tokio::spawn(cleanup_loop());
+        return;
     }
+
+    // [BUG-NF1 FIX] 外层loop：cleanup_loop panic后自动重启，防止GC永久停止
+    tokio::spawn(async {
+        loop {
+            cleanup_loop().await;
+            tracing::error!("[NonceFallback] cleanup_loop 意外退出，5秒后重启...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 }
 
 fn now_secs() -> u64 {
@@ -58,15 +62,13 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Nonce 去重（Redis 不可用时的内存降级）
-///
-/// 返回 true  -> nonce 首次出现（或已过期），请求合法
-/// 返回 false -> nonce 在有效期内，重放攻击，拒绝
+/// Nonce去重（Redis不可用时的内存降级）
+/// 返回 true -> nonce首次出现（或已过期），请求合法
+/// 返回 false -> nonce在有效期内，重放攻击，拒绝
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
     let now = now_secs();
     let expires_at = now + ttl_secs;
-
     NONCE_CHECKED_COUNT.fetch_add(1, Ordering::Relaxed);
 
     if map.len() >= MAX_NONCE_ENTRIES {

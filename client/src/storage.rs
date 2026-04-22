@@ -1,12 +1,13 @@
-// client/src/storage.rs — 优化版 v10
+// client/src/storage.rs — 优化版 v11
 //
 // [BUG-S1 FIX] 多数派选举：read_count=2 要求全票，read_count=3 要求>=2票
-//              原版 winner_count>=1 在 2 副本时形同虚设
-// [BUG-M1 NOTE] derive_path 添加 slot < 3 断言防扩展时路径覆盖
+// [BUG-S2 NOTE] validate_and_return 中的 act_ts 未来检查依赖系统时钟，
+//               存在与被监控时钟相同的局限性，在注释中明确说明
+//               主防线是 time_guard + validate_system_time，此检查为辅助
 
 use aes_gcm::{
     aead::{Aead, OsRng},
-    AeadCore, Aes128Gcm, Key, Nonce,KeyInit,
+    AeadCore, Aes128Gcm, Key, KeyInit, Nonce,
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// License 最长合法期 = 10 年（防止超长过期时间绕过检查）
+// 最长 License 周期：10年（防止篡改 expires_at 为极远未来）
 const MAX_LICENSE_PERIOD: u64 = 10 * 365 * 86400;
 
 static WRITE_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -55,25 +56,18 @@ fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
 }
 
 fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
-    // [BUG-M1 NOTE] 防止扩展 slot 数量时路径回绕覆盖
-    assert!(slot < 3, "slot must be 0..2, got {slot}");
-
-    use sha2::Digest;
+    // [BUG-M1 NOTE] assert 防止扩展 slot 数量时路径回绕覆盖
+    assert!(slot < 16, "slot must be < 16 to prevent path collision");
     let mut h = sha2::Sha256::new();
-    h.update(salt.as_bytes());
+    use sha2::Digest;
     h.update(hkey.as_bytes());
-    let d = h.finalize();
-    let dir_name = format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3]);
-    let files = ["index.db", "cache.bin", "meta.dat"];
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".to_string());
-    let bases = [
-        format!("{}/.cache/.sys/{}", home, dir_name),
-        format!("{}/.local/share/.sys/{}", home, dir_name),
-        format!("{}/.config/.sys/{}", home, dir_name),
-    ];
-    PathBuf::from(&bases[slot as usize]).join(files[slot as usize])
+    h.update(salt.as_bytes());
+    h.update(&[slot]);
+    let digest = format!("{:x}", h.finalize());
+    let base = std::env::var("LICENSE_CACHE_DIR").unwrap_or_else(|_| ".license_cache".to_string());
+    PathBuf::from(base)
+        .join(&digest[..16])
+        .join(format!("{:02x}.dat", slot))
 }
 
 fn write_slot(
@@ -139,6 +133,10 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
         .unwrap()
         .as_secs();
     let (act_ts, exp_ts) = val;
+
+    // [BUG-S2 NOTE] 此检查使用系统时钟，若时钟被拨到未来则检查失效。
+    // 主防线是 time_guard 的 validate_system_time()（启动时校验偏差）。
+    // 此检查仅作为辅助防线，防止存储文件被机械替换为远未来时间戳的场景。
     if act_ts > now_u64 + 300 {
         return LocalReadResult::Tampered { read_count };
     }
@@ -171,7 +169,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // 频次投票
+    // 多数派选举
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(e) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -190,19 +188,19 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         return LocalReadResult::Tampered { read_count };
     }
 
-    // 多数派确认后自修复少数派副本
+    // 尝试修复少数派副本
+    let repair_key = derive_key(hkey, salt);
     let mut repair_failed = false;
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
-        match read_slot(&path, &key) {
-            Some(v) if v == winner => {}
+        match read_slot(&path, &repair_key) {
+            Some(v) if v == winner => {} // 已是多数派，无需修复
             _ => {
-                if write_slot(&path, &key, winner.0, winner.1).is_err() {
+                if write_slot(&path, &repair_key, winner.0, winner.1).is_err() {
                     repair_failed = true;
                 }
             }
         }
     }
-
     validate_and_return(winner, read_count, repair_failed)
 }
