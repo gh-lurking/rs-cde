@@ -1,7 +1,7 @@
-// client/src/network.rs — 优化版 v10
+// client/src/network.rs
 //
 // [BUG-N1 FIX] 二次重试使用独立 RTT（t5/t6），而非沿用第一次 RTT
-// [BUG-N1-PARTIAL FIX] 第二次ERR-TIME-RECORD处理增加server_ts2上界校验，与第一次路径一致
+// [BUG-N1-PARTIAL FIX] 第二次ERR-TIME-RECORD处理增加server_ts2上界校验
 // [OPT-2 FIX] validate_system_time 两个时间源改为 tokio::join! 并发请求
 
 use hmac::{Hmac, Mac};
@@ -46,6 +46,7 @@ fn get_server_id() -> &'static str {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -128,6 +129,7 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
         timestamp: ts,
         signature,
     };
+
     let url = format!("{}/verify", server_url);
     let resp = get_http_client()
         .post(&url)
@@ -135,18 +137,20 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
         .send()
         .await
         .map_err(|e| e.to_string())?;
+
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("JSON decode: {e}"))?;
+
     if status.is_success() {
         let vr: VerifyResponse =
             serde_json::from_value(body).map_err(|e| format!("JSON decode: {e}"))?;
         if vr.activation_ts <= 0 || vr.expires_at <= 0 {
-            return Err("ERR-INVALID-RESPONSE:zero-fields".to_string());
+            return Err("ERR-ZERO-VALUE-RESPONSE".to_string());
         }
-        Ok(vr)
-    } else {
-        Err(parse_server_error(status, &body))
+        return Ok(vr);
     }
+
+    Err(parse_server_error(status, &body))
 }
 
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
@@ -164,17 +168,24 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
             let full_rtt = t2 - t1;
 
             // 第一次重试路径：server_ts 合法性校验（上下界）
-            if server_ts < 0 || full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
+            if server_ts < t1 - MAX_CLOCK_OFFSET_SECS * 2
+                || server_ts > t1 + MAX_CLOCK_OFFSET_SECS * 2
+                || full_rtt < 0
+                || full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2
+            {
                 tracing::warn!("[Network] 不合理的RTT或server_ts，放弃时钟补偿重试");
                 return result;
             }
+
             let one_way_delay = (full_rtt / 2).max(0).min(NET_DEFAULT_TIMEOUT_SECS as i64);
             let estimated_server_now = server_ts + one_way_delay;
             let clock_offset = t1 - estimated_server_now;
+
             if clock_offset.abs() > MAX_CLOCK_OFFSET_SECS {
                 return Err(format!("ERR-CLOCK-SKEW:{}", clock_offset));
             }
 
+            // [BUG-N1 FIX] 使用独立 t5/t6，不复用第一次的 RTT
             let t5 = now_secs();
             let retry = do_verify(hkey, server_url, estimated_server_now).await;
             let t6 = now_secs();
@@ -187,16 +198,24 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                         .unwrap_or(estimated_server_now);
 
                     let rtt2 = t6 - t5;
-                    // [BUG-N1-PARTIAL FIX] 第二次重试也做上界校验，与第一次路径一致
-                    if server_ts2 < 0 || rtt2 > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
+
+                    // [BUG-N1-PARTIAL FIX] 第二次也做上界校验
+                    if server_ts2 < t5 - MAX_CLOCK_OFFSET_SECS * 2
+                        || server_ts2 > t5 + MAX_CLOCK_OFFSET_SECS * 2
+                        || rtt2 < 0
+                        || rtt2 > NET_DEFAULT_TIMEOUT_SECS as i64 * 2
+                    {
                         tracing::warn!("[Network] 第二次重试server_ts2不合理，放弃");
                         return Err(format!("ERR-CLOCK-SKEW-PERSISTENT:server={}", server_ts2));
                     }
+
                     let one_way2 = (rtt2 / 2).max(0).min(NET_DEFAULT_TIMEOUT_SECS as i64);
                     let est2 = server_ts2 + one_way2;
+
                     if (t5 - est2).abs() > MAX_CLOCK_OFFSET_SECS {
                         return Err(format!("ERR-CLOCK-SKEW-PERSISTENT:server={}", server_ts2));
                     }
+
                     let retry2 = do_verify(hkey, server_url, est2).await;
                     match &retry2 {
                         Err(e3) if e3.starts_with("ERR-TIME-RECORD:") => {
@@ -217,33 +236,41 @@ pub async fn validate_system_time() -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let min_ts: u64 = 1_704_067_200;
+
+    let min_ts: u64 = 1_704_067_200; // 2024-01-01
     let max_ts: u64 = local_now + 10 * 365 * 86400;
+
     if local_now < min_ts || local_now > max_ts {
         return Err(format!("系统时间 {} 超出合理范围", local_now));
     }
+
     let client = get_http_client();
+
+    // [OPT-2 FIX] 两个时间源并发请求
     let (cf_ts, http_ts) = tokio::join!(
         get_time_from_cf_trace(client),
         get_time_from_http_date(client)
     );
+
     let timestamps: Vec<i64> = [cf_ts, http_ts].into_iter().flatten().collect();
+
     if timestamps.is_empty() {
-        return Err(
-            "无法获取外部时间源，请检查网络连接".to_string(),
-        );
+        return Err("无法获取外部时间源，请检查网络连接".to_string());
     }
+
     let avg_offset: i64 = timestamps
         .iter()
         .map(|&t| local_now as i64 - t)
         .sum::<i64>()
         / timestamps.len() as i64;
+
     if avg_offset.abs() > SYSTEM_TIME_HARD_LIMIT_SECS {
         return Err(format!(
             "系统时间偏差 {}s 超过限制 {}s，请同步时钟",
             avg_offset, SYSTEM_TIME_HARD_LIMIT_SECS
         ));
     }
+
     if avg_offset.abs() > SYSTEM_TIME_WARN_SECS {
         tracing::warn!(
             "[Time] 时间偏差 {}s > {}s 警告阈值",
@@ -251,6 +278,7 @@ pub async fn validate_system_time() -> Result<(), String> {
             SYSTEM_TIME_WARN_SECS
         );
     }
+
     Ok(())
 }
 
@@ -312,10 +340,8 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let h: u32 = tp[0].parse().ok()?;
     let m: u32 = tp[1].parse().ok()?;
     let s: u32 = tp[2].parse().ok()?;
-    if day == 0 || day > 31 {
-        return None;
-    }
-    if month == 0 || month > 12 {
+
+    if day == 0 || day > 31 || month == 0 || month > 12 {
         return None;
     }
     if year < 1970 || year > 2100 {
@@ -324,6 +350,7 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     if h > 23 || m > 59 || s > 60 {
         return None;
     }
+
     let days = days_since_1970(year, month, day);
     Some(days * 86400 + h as u64 * 3600 + m as u64 * 60 + s as u64)
 }

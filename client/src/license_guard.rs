@@ -1,11 +1,10 @@
-// client/src/license_guard.rs — 优化版 v5（无逻辑变更，注释更新）
+// client/src/license_guard.rs
 //
 // [C-01 FIX]  activation_ts / expires_at 零值语义修正（在线 + 离线双路均检查）
 // [BUG-01 FIX] 离线路径中增加零值检查
-// [BUG-13 FIX] ERR_NOT_ACTIVATED 视为不可恢复错误（不降级离线）
+// [BUG-13 FIX] ERR_NOT_ACTIVATED / ERR_REVOKED / ERR_INVALID_KEY / ERR_EXPIRED 视为不可恢复
 // [BUG-14 FIX] 服务端响应零值检查，防止空响应绕过验证
-// NOTE: storage::write_all_replicas 在 time_guard::set_expiry_time 之前调用
-//       main.rs 保证 check_and_enforce().await 先于 start_monitor()，顺序正确
+
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +25,7 @@ pub async fn check_and_enforce() {
 
     match network::verify_online(&hkey, &server_url).await {
         Ok(resp) => {
-            // ── 在线验证成功：多重安全检查 ───────────────────────────────
+            // ── 在线验证成功：多重安全检查 ──────────────────────────────
 
             if resp.revoked {
                 eprintln!("[License] 密钥已被吊销");
@@ -61,7 +60,7 @@ pub async fn check_and_enforce() {
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] 在线验证通过，剩余 {} 天", remaining);
 
-            // NOTE: write_all_replicas 先于 set_expiry_time，顺序依赖由 main.rs 保证
+            // write_all_replicas 先于 set_expiry_time（顺序由 main.rs 保证）
             storage::write_all_replicas(
                 &hkey,
                 &salt,
@@ -73,9 +72,9 @@ pub async fn check_and_enforce() {
         }
 
         Err(ref e) => {
-            // ── 不可恢复错误：直接退出 ────────────────────────────────────
+            // ── 不可恢复错误：直接退出 ──────────────────────────────────
 
-            // [BUG-13 FIX] NOT_ACTIVATED 视为不可恢复错误
+            // [BUG-13 FIX] 以下错误码不降级离线，直接退出
             if e == network::ERR_NOT_ACTIVATED {
                 eprintln!("[License] 密钥尚未激活，请先激活密钥");
                 std::process::exit(1);

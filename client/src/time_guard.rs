@@ -1,12 +1,10 @@
-// client/src/time_guard.rs — 优化版 v6
+// client/src/time_guard.rs
 //
 // [C-03 FIX]  时间正向大跳变（>3600s）后更新基准，避免永久误报
 // [BUG-10 FIX] watchdog Ok(_) 分支也视为异常
 // [OPT]        MONITOR_STARTED AtomicBool 防止重复启动
 // [BUG-14 FIX] 添加 EXPIRY_TIME 零值检查
 // [BUG-T1 FIX] ROLLBACK_TOLERANCE_SECS 改为 300s，与服务端 TIMESTAMP_WINDOW_SECS 一致
-//              可通过 ROLLBACK_TOLERANCE_SECS 环境变量覆盖
-
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +13,7 @@ static LAST_VALID_TIME: AtomicI64 = AtomicI64::new(0);
 static EXPIRY_TIME: AtomicI64 = AtomicI64::new(0);
 static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
-// [BUG-T1 FIX] 与服务端 TIMESTAMP_WINDOW_SECS 保持一致（300s）
+// [BUG-T1 FIX] 与服务端 TIMESTAMP_WINDOW_SECS 一致（300s）
 // 原值 60s 会导致 NTP 大步回拨（60~300s 范围）误判为时钟篡改而终止进程
 fn rollback_tolerance_secs() -> i64 {
     std::env::var("ROLLBACK_TOLERANCE_SECS")

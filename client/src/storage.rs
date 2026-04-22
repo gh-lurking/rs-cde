@@ -1,10 +1,8 @@
-// client/src/storage.rs — 优化版 v11
+// client/src/storage.rs
 //
 // [BUG-S1 FIX] 多数派选举：read_count=2 要求全票，read_count=3 要求>=2票
 // [BUG-S2 NOTE] validate_and_return 中的 act_ts 未来检查依赖系统时钟，
-//               存在与被监控时钟相同的局限性，在注释中明确说明
-//               主防线是 time_guard + validate_system_time，此检查为辅助
-
+//               主防线是 time_guard + validate_system_time，此为辅助
 use aes_gcm::{
     aead::{Aead, OsRng},
     AeadCore, Aes128Gcm, Key, KeyInit, Nonce,
@@ -16,9 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// 最长 License 周期：10年（防止篡改 expires_at 为极远未来）
 const MAX_LICENSE_PERIOD: u64 = 10 * 365 * 86400;
-
 static WRITE_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 static READ_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -80,15 +76,19 @@ fn write_slot(
     let cipher = Aes128Gcm::new(key);
     let nonce_bytes = Aes128Gcm::generate_nonce(&mut OsRng);
     let nonce = Nonce::from_slice(&nonce_bytes);
+
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&activation.to_le_bytes());
     plain[8..].copy_from_slice(&expires.to_le_bytes());
+
     let ct = cipher
         .encrypt(nonce, plain.as_ref())
         .map_err(|e| format!("encrypt: {e}"))?;
+
     if let Some(p) = path.parent() {
         let _ = fs::create_dir_all(p);
     }
+
     let mut out = nonce_bytes.to_vec();
     out.extend_from_slice(&ct);
     fs::write(path, &out).map_err(|e| format!("write: {e}"))?;
@@ -132,11 +132,9 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+
     let (act_ts, exp_ts) = val;
 
-    // [BUG-S2 NOTE] 此检查使用系统时钟，若时钟被拨到未来则检查失效。
-    // 主防线是 time_guard 的 validate_system_time()（启动时校验偏差）。
-    // 此检查仅作为辅助防线，防止存储文件被机械替换为远未来时间戳的场景。
     if act_ts > now_u64 + 300 {
         return LocalReadResult::Tampered { read_count };
     }
@@ -146,6 +144,7 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
     if act_ts >= exp_ts {
         return LocalReadResult::Tampered { read_count };
     }
+
     LocalReadResult::Success {
         value: val,
         read_count,
@@ -156,12 +155,14 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::with_capacity(3);
+
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
         if let Some(pair) = read_slot(&path, &key) {
             values.push(pair);
         }
     }
+
     let read_count = values.len();
 
     // 至少 2 副本可读，单副本无法证明未被篡改
@@ -169,7 +170,7 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // 多数派选举
+    // 多数派计票
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(e) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -178,17 +179,19 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
+
     let (winner, winner_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
     // [BUG-S1 FIX] 严格多数派：
     // read_count=2 → 要求 2 票（完全一致）
     // read_count=3 → 要求 2 票（2/3 多数）
     let min_votes = if read_count == 3 { 2 } else { read_count };
+
     if winner_count < min_votes {
         return LocalReadResult::Tampered { read_count };
     }
 
-    // 尝试修复少数派副本
+    // 修复少数派副本
     let repair_key = derive_key(hkey, salt);
     let mut repair_failed = false;
     for slot in 0..3u8 {
@@ -202,5 +205,6 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             }
         }
     }
+
     validate_and_return(winner, read_count, repair_failed)
 }
