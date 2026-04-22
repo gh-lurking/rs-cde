@@ -1,13 +1,9 @@
 // client/src/license_guard.rs — 优化版 v5
 //
 // [C-01 FIX]  activation_ts / expires_at 零值语义修正（在线 + 离线双路均检查）
-// [BUG-01 FIX] 离线路径中增加零值检查：local_ts == 0 || local_expires == 0
-// [BUG-13 FIX] 客户端同步修复：ERR_NOT_ACTIVATED 视为不可恢复错误（不降级离线）
-// [BUG-14 FIX] 添加服务端响应零值检查，防止空响应绕过验证
-//
-// 不可恢复错误码（REVOKED/INVALID_KEY/NOT_ACTIVATED/EXPIRED/FORBIDDEN/CLOCK-SKEW）
-//   直接 exit(1)，不进入离线回退（离线回退不能绕过真实的授权错误）
-
+// [BUG-01 FIX] 离线路径中增加零值检查
+// [BUG-13 FIX] ERR_NOT_ACTIVATED 视为不可恢复错误（不降级离线）
+// [BUG-14 FIX] 服务端响应零值检查，防止空响应绕过验证
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +14,6 @@ pub async fn check_and_enforce() {
         std::process::exit(1);
     });
 
-    // 编译期混淆 salt（防止逆向工程提取）
     let salt = obfstr!("PROG_ACTIVATION_SALT_V1_SECRET").to_owned();
     let server_url = obfstr!("https://license.example.com").to_owned();
 
@@ -31,19 +26,18 @@ pub async fn check_and_enforce() {
         Ok(resp) => {
             // ── 在线验证成功：多重安全检查 ───────────────────────────────
 
-            // 吊销检查（最高优先级）
             if resp.revoked {
                 eprintln!("[License] 密钥已被吊销");
                 std::process::exit(1);
             }
 
-            // [C-01 FIX + BUG-14 FIX] 零值检查（字段默认值为 0，零值表示无效记录）
+            // [C-01 FIX + BUG-14 FIX] 零值检查
             if resp.activation_ts <= 0 || resp.expires_at <= 0 {
                 eprintln!("[License] 密钥字段无效（零值），请先激活密钥");
                 std::process::exit(1);
             }
 
-            // 防时钟篡改：activation_ts 不应在未来 300s 以外
+            // 防时钟篡改
             if resp.activation_ts > now + 300 {
                 eprintln!("[License] activation_ts 在未来，可能时钟篡改");
                 std::process::exit(1);
@@ -65,7 +59,6 @@ pub async fn check_and_enforce() {
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] 在线验证通过，剩余 {} 天", remaining);
 
-            // 写入本地 3 副本加密缓存（离线降级用）
             storage::write_all_replicas(
                 &hkey,
                 &salt,
@@ -73,21 +66,17 @@ pub async fn check_and_enforce() {
                 resp.expires_at as u64,
             );
 
-            // 设置运行时到期时间（TimeGuard 监控用）
             time_guard::set_expiry_time(resp.expires_at);
         }
 
         Err(ref e) => {
-            // ── 错误分类处理 ─────────────────────────────────────────────
+            // ── 不可恢复错误：直接退出 ────────────────────────────────────
 
-            // [BUG-13 FIX] NOT_ACTIVATED 视为不可恢复错误，不尝试离线降级
-            // 因为：未激活的密钥在离线状态下无法确定其有效性
+            // [BUG-13 FIX] NOT_ACTIVATED 视为不可恢复错误
             if e == network::ERR_NOT_ACTIVATED {
                 eprintln!("[License] 密钥尚未激活，请先激活密钥");
                 std::process::exit(1);
             }
-
-            // 其他不可恢复错误：直接退出，不尝试离线回退
             if e == network::ERR_REVOKED {
                 eprintln!("[License] 授权已被吊销");
                 std::process::exit(1);
@@ -136,14 +125,12 @@ pub async fn check_and_enforce() {
                         std::process::exit(1);
                     }
 
-                    // 离线过期检查
                     if now >= local_expires as i64 {
                         let days = (now - local_expires as i64) / 86400;
                         eprintln!("[License] 授权已过期 {} 天（离线）", days);
                         std::process::exit(1);
                     }
 
-                    // 防篡改：activation_ts 不应在未来
                     if local_ts as i64 > now + 300 {
                         eprintln!("[License] 本地 activation_ts 在未来（可能被篡改）");
                         std::process::exit(1);

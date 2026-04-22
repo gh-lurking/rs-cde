@@ -1,7 +1,10 @@
-// server/src/db.rs — 优化版 v6
+// server/src/db.rs — 优化版 v7
 //
-// [BUG-A5 FIX] RETURNING (expires_at) → query_scalar + RETURNING expires_at（去歧义）
+// [BUG-A5  FIX] RETURNING (expires_at) → query_scalar + RETURNING expires_at（去歧义）
 // [BUG-A12 FIX] 导出 hash_key，handlers.rs 复用，消除重复实现
+// [BUG-S4  FIX] revoke_license 返回 bool，调用方可检测 0 rows
+// [BUG-S5  FIX] 删除 handlers.rs 中的本地 hash_key，统一使用 db::hash_key
+
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,14 +61,14 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key TEXT NOT NULL,
-            key_hash TEXT PRIMARY KEY,
+            key          TEXT    NOT NULL,
+            key_hash     TEXT    PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at BIGINT NOT NULL DEFAULT 0,
-            revoked BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at BIGINT NOT NULL,
-            last_check BIGINT,
-            note TEXT NOT NULL DEFAULT ''
+            expires_at   BIGINT NOT NULL DEFAULT 0,
+            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at   BIGINT NOT NULL,
+            last_check   BIGINT,
+            note         TEXT    NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
@@ -74,8 +77,10 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_licenses_key_hash ON licenses (key_hash)")
         .execute(&pool)
         .await?;
+
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires ON licenses (expires_at)
+        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires
+         ON licenses (expires_at)
          WHERE revoked = FALSE AND activation_ts > 0",
     )
     .execute(&pool)
@@ -106,7 +111,8 @@ pub async fn insert_license(
     note: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO licenses (key, key_hash, created_at, note) VALUES ($1, $2, $3, $4)
+        "INSERT INTO licenses (key, key_hash, created_at, note)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(key)
@@ -145,17 +151,18 @@ pub async fn update_last_check(pool: &DbPool, key_hash: &str, ts: i64) -> Result
     Ok(())
 }
 
+// [BUG-S4 FIX] 返回 bool：false = key 不存在，调用方可据此返回 404
 pub async fn revoke_license(
     pool: &DbPool,
     key_hash: &str,
     reason: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE licenses SET revoked = TRUE, note = $1 WHERE key_hash = $2")
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("UPDATE licenses SET revoked = TRUE, note = $1 WHERE key_hash = $2")
         .bind(reason)
         .bind(key_hash)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
 }
 
 // [BUG-A5 FIX] 使用 query_scalar + RETURNING expires_at（无括号，语义明确）
@@ -172,7 +179,9 @@ pub async fn extend_license(
         sqlx::query_scalar::<_, i64>(
             "UPDATE licenses
              SET expires_at = GREATEST(expires_at, $1) + $2
-             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0
+             WHERE key_hash = $3
+               AND revoked = FALSE
+               AND activation_ts > 0
              RETURNING expires_at",
         )
         .bind(now)
@@ -184,7 +193,10 @@ pub async fn extend_license(
         sqlx::query_scalar::<_, i64>(
             "UPDATE licenses
              SET expires_at = expires_at + $2
-             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0 AND expires_at > $1
+             WHERE key_hash = $3
+               AND revoked = FALSE
+               AND activation_ts > 0
+               AND expires_at > $1
              RETURNING expires_at",
         )
         .bind(now)
@@ -216,6 +228,7 @@ pub async fn batch_init_keys(
     let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
     let created_ats = vec![now; keys.len()];
     let notes = vec![note.to_string(); keys.len()];
+
     sqlx::query(
         "INSERT INTO licenses (key, key_hash, created_at, note)
          SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[])
@@ -227,6 +240,7 @@ pub async fn batch_init_keys(
     .bind(&notes)
     .execute(pool)
     .await?;
+
     tracing::info!("[DB] batch_init_keys: {} keys inserted", keys.len());
     Ok(())
 }

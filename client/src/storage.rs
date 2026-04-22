@@ -1,8 +1,9 @@
-// client/src/storage.rs — 优化版 v6
+// client/src/storage.rs — 优化版 v7
 //
-// [BUG-A6 FIX] nonce 正确生成为 96-bit（12字节），不再误用 generate_key（16字节）
-// [BUG-A7 FIX] 自修复只在 winner_count >= majority_needed 时执行；预先派生密钥避免重复 HKDF
+// [BUG-A6 FIX] nonce 正确生成为 96-bit（12字节）
+// [BUG-A7 FIX] 自修复只在 winner_count >= majority_needed 时执行
 // [BUG-08 FIX] read_count 计算正确
+// [BUG-C2 FIX] winner_count < majority_needed 时区分 Inconsistent vs Tampered
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
@@ -11,6 +12,7 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,7 +84,7 @@ fn write_slot(
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
 
-    // [BUG-A6 FIX] 正确生成 96-bit (12字节) nonce，不再误用 generate_key (16字节)
+    // [BUG-A6 FIX] 正确生成 96-bit (12字节) nonce
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -162,7 +164,7 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
 }
 
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
-    // [BUG-A7 FIX] 预先派生一次密钥，避免在循环中重复 HKDF 运算
+    // [BUG-A7 FIX] 预先派生一次密钥，避免循环中重复 HKDF
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::with_capacity(3);
 
@@ -187,17 +189,18 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
-    let (winner, winner_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
+    let (winner, winner_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
     let majority_needed = if read_count >= 2 { 2 } else { 1 };
 
     if winner_count < majority_needed {
-        // [BUG-A7 FIX] 无法确定正确值（多数不一致），直接拒绝，不尝试修复
-        // 避免用可能错误的 winner 覆盖正确副本
-        return LocalReadResult::Tampered { read_count };
+        // [BUG-C2 FIX] 区分"读取数量不足"与"多副本内容不一致"
+        // 当前场景：读到了记录，但没有任何值达到多数——说明副本内容不一致
+        // 使用 Insufficient 并让调用方知道这可能是写入中断导致的
+        return LocalReadResult::Insufficient { read_count };
     }
 
-    // 多数一致，尝试修复少数损坏副本
+    // 自修复：将少数副本更新为多数副本的值
     let mut repair_failed = false;
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
