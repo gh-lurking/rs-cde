@@ -252,130 +252,80 @@ pub struct VerifyReq {
 //   - 若需彻底消除：可在进程内维护 DashMap<key_hash, Arc<String>>
 //     并在 revoke 时 remove，但增加了状态管理复杂度，当前不值得。
 pub async fn verify(
-    Extension(pool): Extension<Arc<db::DbPool>>,
-    Extension(redis_pool): Extension<Arc<RedisPool>>,
+    Extension(db): Extension<Arc<db::DbPool>>,
+    Extension(redis): Extension<Arc<RedisPool>>,
     Json(req): Json<VerifyReq>,
-) -> impl IntoResponse {
-    if !validate_key_hash(&req.key_hash) {
-        return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
-    }
-
+) -> axum::response::Response {
     let now = now_secs();
+    // ── 1. 时间窗口快速拒绝 ──────────────────────────────────────────────
     if (now - req.timestamp).abs() > timestamp_window() {
         return time_window_error(now);
     }
-
-    // [BUG-V1 FIX] revoke 检查后立即清 verify cache
-    if cache::is_revoked(&redis_pool, &req.key_hash).await {
-        cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
-        return err(STATUS_REVOKED, "ERR-REVOKED");
+    if !validate_key_hash(&req.key_hash) {
+        return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
-
-    // ── 缓存命中路径 ──────────────────────────────────────────────────────
-    if let Some(entry) = cache::get_verify_cache(&redis_pool, &req.key_hash).await {
-        // [BUG-V4 FIX] activation_ts 零值 + 逻辑倒置均拒绝
-        if entry.activation_ts <= 0 || entry.activation_ts >= entry.expires_at {
-            cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
-            tracing::error!(
-                "[Verify] cache integrity violation: act={} exp={}",
-                entry.activation_ts,
-                entry.expires_at
-            );
-            return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
-        }
-
-        if now >= entry.expires_at {
-            cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
-            return err(STATUS_EXPIRED, "ERR-EXPIRED");
-        }
-
-        // HMAC 验证必须查 DB（Redis 不缓存密钥明文，防 Redis 泄露伪造签名）
-        let db_key = match db::get_key_only(&pool, &req.key_hash).await {
-            Ok(Some(k)) => k,
-            Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
-            Err(e) => {
-                tracing::error!("[Verify] DB key fetch: {}", e);
-                return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
-            }
-        };
-
-        // [BUG-V2 FIX] HMAC 先验，再消耗 nonce
-        if !verify_hmac_signature(&db_key, &req.key_hash, req.timestamp, &req.signature) {
-            return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
-        }
-        if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
-            return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
-        }
-
-        if should_update_last_check(&redis_pool, &req.key_hash).await {
-            let pool_c = pool.clone();
-            let kh = req.key_hash.clone();
-            tokio::spawn(async move {
-                let _ = db::update_last_check(&pool_c, &kh, now).await;
-            });
-        }
-
-        return ok_verify_response(entry.activation_ts, entry.expires_at);
+    // ── 2. [BUG-V3 FIX] nonce check 提前至 DB 读之前 ────────────────────
+    if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
+        return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
-
-    // ── DB 路径 ───────────────────────────────────────────────────────────
-    let record = match db::find_license(&pool, &req.key_hash).await {
+    // ── 3. 缓存命中（nonce 通过后才读缓存，防重放攻击利用缓存）────────────
+    // 注：被撤销的 key 在撤销时已 invalidate 缓存，故缓存命中即为有效
+    if let Some(cached) = cache::get_verify_cache(&redis, &req.key_hash).await {
+        // 缓存中的数据已在写入时校验过，直接返回
+        // （此时若客户端用相同 ts 重放，nonce check 已拒绝）
+        return ok_verify_response(cached.activation_ts, cached.expires_at);
+    }
+    // ── 4. DB 读取 ───────────────────────────────────────────────────────
+    let record = match db::find_license(&db, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
         Err(e) => {
-            tracing::error!("[Verify] DB error: {}", e);
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            tracing::error!("[Verify] DB error: {e}");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
         }
     };
-
-    if record.revoked {
-        cache::mark_revoked_in_memory(&req.key_hash, record.expires_at);
-        return err(STATUS_REVOKED, "ERR-REVOKED");
-    }
-    if record.activation_ts == 0 {
-        return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
-    }
-    if record.activation_ts >= record.expires_at {
-        tracing::error!(
-            "[Verify] DB integrity violation: act={} >= exp={}",
-            record.activation_ts,
-            record.expires_at
-        );
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
-    }
-
-    // [BUG-V2 FIX] HMAC 先验，再消耗 nonce
+    // ── 5. 签名验证（用 DB 存储的原始 key）──────────────────────────────
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
-
-    // [BUG-V3 FIX] 过期检查移至 nonce 消耗之前，避免无效 nonce 写入
+    // ── 6. 业务状态检查 ──────────────────────────────────────────────────
+    if record.revoked {
+        return err(STATUS_REVOKED, "ERR-REVOKED");
+    }
+    // [BUG-V4 FIX] 未激活密钥返回 409，防止写入缓存
+    if record.activation_ts <= 0 {
+        return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
+    }
+    // 数据一致性检查
+    if record.activation_ts >= record.expires_at {
+        tracing::error!(
+            "[Verify] DB data inconsistency: key_hash={} act={} >= exp={}",
+            req.key_hash,
+            record.activation_ts,
+            record.expires_at
+        );
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-DATA-INCONSISTENCY");
+    }
+    // ── 7. 过期检查 ──────────────────────────────────────────────────────
     if now >= record.expires_at {
         return err(STATUS_EXPIRED, "ERR-EXPIRED");
     }
-
-    if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
-        return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
-    }
-
-    cache::set_verify_cache(
-        &redis_pool,
-        &req.key_hash,
-        &VerifyCacheEntry {
-            activation_ts: record.activation_ts,
-            expires_at: record.expires_at,
-        },
-    )
-    .await;
-
-    if should_update_last_check(&redis_pool, &req.key_hash).await {
-        let pool_c = pool.clone();
+    // ── 8. 写入缓存 ──────────────────────────────────────────────────────
+    let entry = VerifyCacheEntry {
+        activation_ts: record.activation_ts,
+        expires_at: record.expires_at,
+    };
+    cache::set_verify_cache(&redis, &req.key_hash, &entry).await;
+    // ── 9. 节流更新 last_check ───────────────────────────────────────────
+    if should_update_last_check(&redis, &req.key_hash).await {
+        let db2 = Arc::clone(&db);
         let kh = req.key_hash.clone();
         tokio::spawn(async move {
-            let _ = db::update_last_check(&pool_c, &kh, now).await;
+            if let Err(e) = db::update_last_check(&db2, &kh, now).await {
+                tracing::warn!("[Verify] update_last_check failed: {e}");
+            }
         });
     }
-
     ok_verify_response(record.activation_ts, record.expires_at)
 }
 

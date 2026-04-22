@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
+use crate::cache::Ordering::SeqCst;
+// use std::sync::atomic::Ordering::SeqCst;
 
 pub type RedisPool = Pool;
 const KEY_NS: &str = "lc:v1:";
@@ -101,33 +103,25 @@ pub fn mark_revoked_in_memory(key_hash: &str, expires_at: i64) {
 }
 
 pub fn start_cache_cleanup_task() {
-    if CACHE_CLEANUP_STARTED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
+    if CACHE_CLEANUP_STARTED.compare_exchange(false, true, SeqCst, SeqCst).is_err() { return; }
     tokio::spawn(async {
         loop {
-            cleanup_memory_revokes().await;
-            tracing::error!("[Cache] cleanup_memory_revokes 意外退出，正在重启...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            cleanup_memory_revokes_once().await;   // ✅ 单次 GC，不含 loop
+            tracing::debug!("[Cache] GC tick done");
+            tokio::time::sleep(Duration::from_secs(300)).await;
         }
     });
 }
 
-async fn cleanup_memory_revokes() {
-    loop {
-        tokio::time::sleep(Duration::from_secs(300)).await;
-        let map = memory_revoke_map();
-        let now = now_ts();
-        let before = map.len();
-        map.retain(|_, exp| *exp > now);
-        let cleaned = before - map.len();
-        if cleaned > 0 {
-            tracing::info!("[Cache] 清理 {} 条过期 revoke 记录", cleaned);
-        }
+async fn cleanup_memory_revokes_once() {
+    // ✅ 单次扫描，不含 loop
+    let map = memory_revoke_map();
+    let now = now_ts();
+    let before = map.len();
+    map.retain(|_, exp| *exp > now);
+    let cleaned = before - map.len();
+    if cleaned > 0 {
+        tracing::info!("[Cache] GC 清理 {} 条过期 revoke 记录", cleaned);
     }
 }
 

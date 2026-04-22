@@ -1,14 +1,17 @@
 // client/src/storage.rs
 //
-// [BUG-S1 FIX] 多数派选举：read_count=2 要求全票，read_count=3 要求>=2票
-// [BUG-S2 NOTE] validate_and_return 中的 act_ts 未来检查依赖系统时钟，
-//               主防线是 time_guard + validate_system_time，此为辅助
+// [BUG-S1 FIX] 投票 quorum 阈值：动态多数 (read_count/2)+1，而非固定 >= 2
+// [BUG-S2 NOTE] validate_and_return 中 act_ts 零值检查已添加
+//               (time_guard + validate_system_time 保护时钟回拨)
+// [BUG-01 FIX + C-01 FIX] act_ts == 0 / exp_ts == 0 提前拒绝
+
 use aes_gcm::{
     aead::{Aead, OsRng},
     AeadCore, Aes128Gcm, Key, KeyInit, Nonce,
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,8 +55,10 @@ fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
 }
 
 fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
-    // [BUG-M1 NOTE] assert 防止扩展 slot 数量时路径回绕覆盖
-    assert!(slot < 16, "slot must be < 16 to prevent path collision");
+    // [BUG-M1 NOTE] debug_assert + release 安全截断
+    debug_assert!(slot < 16, "slot must be < 16 to prevent path collision");
+    let slot = slot.min(15);
+
     let mut h = sha2::Sha256::new();
     use sha2::Digest;
     h.update(hkey.as_bytes());
@@ -122,7 +127,7 @@ pub fn write_all_replicas(hkey: &str, salt: &str, activation_ts: u64, expires_at
         let path = derive_path(hkey, salt, slot);
         if let Err(e) = write_slot(&path, &key, activation_ts, expires_at) {
             WRITE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("[Storage] 写入副本 {} 失败: {}", slot, e);
+            tracing::warn!("[Storage] 副本槽 {} 写入失败: {}", slot, e);
         }
     }
 }
@@ -135,12 +140,22 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
 
     let (act_ts, exp_ts) = val;
 
+    // [C-01 FIX + BUG-01 FIX] 零值必须最先拒绝
+    if act_ts == 0 || exp_ts == 0 {
+        return LocalReadResult::Tampered { read_count };
+    }
+
+    // 防未来时间戳（允许 5 分钟时钟偏差）
     if act_ts > now_u64 + 300 {
         return LocalReadResult::Tampered { read_count };
     }
-    if exp_ts == 0 || exp_ts > now_u64 + MAX_LICENSE_PERIOD {
+
+    // 防超长有效期（超过 10 年视为篡改）
+    if exp_ts > now_u64 + MAX_LICENSE_PERIOD {
         return LocalReadResult::Tampered { read_count };
     }
+
+    // 逻辑一致性
     if act_ts >= exp_ts {
         return LocalReadResult::Tampered { read_count };
     }
@@ -165,12 +180,12 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
 
     let read_count = values.len();
 
-    // 至少 2 副本可读，单副本无法证明未被篡改
+    // 至少 2 个副本才能投票
     if read_count < 2 {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // 多数派计票
+    // 多数投票（统计计数）
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(e) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -180,31 +195,34 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
         }
     }
 
-    let (winner, winner_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
+    // [BUG-S1 FIX] 动态多数阈值：> total/2
+    let majority_threshold = (read_count / 2) + 1;
+    let best = counts.iter().max_by_key(|e| e.1).unwrap();
 
-    // [BUG-S1 FIX] 严格多数派：
-    // read_count=2 → 要求 2 票（完全一致）
-    // read_count=3 → 要求 2 票（2/3 多数）
-    let min_votes = if read_count == 3 { 2 } else { read_count };
-
-    if winner_count < min_votes {
-        return LocalReadResult::Tampered { read_count };
-    }
-
-    // 修复少数派副本
-    let repair_key = derive_key(hkey, salt);
-    let mut repair_failed = false;
-    for slot in 0..3u8 {
-        let path = derive_path(hkey, salt, slot);
-        match read_slot(&path, &repair_key) {
-            Some(v) if v == winner => {} // 已是多数派，无需修复
-            _ => {
-                if write_slot(&path, &repair_key, winner.0, winner.1).is_err() {
-                    repair_failed = true;
+    let repair_failed = if best.1 < read_count {
+        // 有少数副本与多数不一致，尝试修复
+        let key_for_repair = key;
+        let mut any_repair_failed = false;
+        for slot in 0..3u8 {
+            let path = derive_path(hkey, salt, slot);
+            if let Some(v) = read_slot(&path, &key_for_repair) {
+                if v != best.0 {
+                    if let Err(e) = write_slot(&path, &key_for_repair, best.0 .0, best.0 .1) {
+                        tracing::warn!("[Storage] 副本 {} 修复失败: {}", slot, e);
+                        any_repair_failed = true;
+                    }
                 }
             }
         }
-    }
+        any_repair_failed
+    } else {
+        false
+    };
 
-    validate_and_return(winner, read_count, repair_failed)
+    if best.1 >= majority_threshold {
+        validate_and_return(best.0, read_count, repair_failed)
+    } else {
+        // 所有副本各不相同，无法确定正确值
+        LocalReadResult::Tampered { read_count }
+    }
 }

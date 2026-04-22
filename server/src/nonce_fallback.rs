@@ -7,10 +7,12 @@
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct NonceEntry {
@@ -39,18 +41,15 @@ pub fn get_nonce_stats() -> (usize, usize, usize) {
 
 pub fn start_cleanup_task() {
     if CLEANUP_STARTED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .compare_exchange(false, true, SeqCst, SeqCst)
         .is_err()
     {
         return;
     }
-
-    // [BUG-NF1 FIX] 外层 loop：cleanup_loop panic 后自动重启，防止 GC 永久停止
     tokio::spawn(async {
         loop {
-            cleanup_loop().await;
-            tracing::error!("[NonceFallback] cleanup_loop 意外退出，5秒后重启...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            cleanup_once().await; // ✅ 单次 GC
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }
@@ -99,16 +98,13 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     }
 }
 
-async fn cleanup_loop() {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        let map = nonce_map();
-        let now = now_secs();
-        let before = map.len();
-        map.retain(|_, v| v.expires_at > now);
-        let cleaned = before - map.len();
-        if cleaned > 0 {
-            tracing::debug!("[NonceFallback] 清理 {} 条过期 nonce", cleaned);
-        }
+async fn cleanup_once() {
+    let map = nonce_map();
+    let now = now_secs();
+    let before = map.len();
+    map.retain(|_, v| v.expires_at > now);
+    let cleaned = before - map.len();
+    if cleaned > 0 {
+        tracing::debug!("[NonceFallback] GC 清理 {} 条过期 nonce", cleaned);
     }
 }
