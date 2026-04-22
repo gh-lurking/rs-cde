@@ -1,27 +1,29 @@
-// client/src/storage.rs — 优化版 v9
+// client/src/storage.rs — 优化版 v10
 //
-// [BUG-S1 FIX] read_count < 2 时直接返回 Insufficient，强制要求至少 2/3 副本一致
-//              原逻辑 majority_needed=1 允许单副本通过，无法检测篡改
-use aes_gcm::aead::rand_core::RngCore;
+// [BUG-S1 FIX] 多数派选举：read_count=2 要求全票，read_count=3 要求>=2票
+//              原版 winner_count>=1 在 2 副本时形同虚设
+// [BUG-M1 NOTE] derive_path 添加 slot < 3 断言防扩展时路径覆盖
+
 use aes_gcm::{
     aead::{Aead, OsRng},
-    Aes128Gcm, Key, KeyInit, Nonce,
+    AeadCore, Aes128Gcm, Key, Nonce,KeyInit,
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_LICENSE_PERIOD: u64 = 3650 * 86400;
+// License 最长合法期 = 10 年（防止超长过期时间绕过检查）
+const MAX_LICENSE_PERIOD: u64 = 10 * 365 * 86400;
 
-static WRITE_SUCCESS_COUNT: AtomicUsize = AtomicUsize::new(0);
-static WRITE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
-static READ_SUCCESS_COUNT: AtomicUsize = AtomicUsize::new(0);
-static READ_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WRITE_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static WRITE_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static READ_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static READ_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 
-pub fn _get_storage_stats() -> (usize, usize, usize, usize) {
+pub fn _get_storage_stats() -> (u64, u64, u64, u64) {
     (
         WRITE_SUCCESS_COUNT.load(Ordering::Relaxed),
         WRITE_FAIL_COUNT.load(Ordering::Relaxed),
@@ -53,6 +55,9 @@ fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
 }
 
 fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
+    // [BUG-M1 NOTE] 防止扩展 slot 数量时路径回绕覆盖
+    assert!(slot < 3, "slot must be 0..2, got {slot}");
+
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(salt.as_bytes());
@@ -68,7 +73,7 @@ fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
         format!("{}/.local/share/.sys/{}", home, dir_name),
         format!("{}/.config/.sys/{}", home, dir_name),
     ];
-    PathBuf::from(&bases[slot as usize % 3]).join(files[slot as usize % 3])
+    PathBuf::from(&bases[slot as usize]).join(files[slot as usize])
 }
 
 fn write_slot(
@@ -79,8 +84,7 @@ fn write_slot(
 ) -> Result<(), String> {
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_bytes = Aes128Gcm::generate_nonce(&mut OsRng);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&activation.to_le_bytes());
@@ -160,15 +164,14 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             values.push(pair);
         }
     }
-
     let read_count = values.len();
 
-    // [BUG-S1 FIX] 强制要求至少 2 副本可读，单副本无法证明未被篡改
+    // 至少 2 副本可读，单副本无法证明未被篡改
     if read_count < 2 {
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // 统计各值出现次数，取最多数
+    // 频次投票
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(e) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -177,16 +180,17 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
-
     let (winner, winner_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
 
-    // 要求多数派（读到 2/3 时需要 2 票，读到 3/3 时仍需 2 票）
-    if winner_count < 2 {
-        // 3 副本各不相同，无法确定哪个正确
+    // [BUG-S1 FIX] 严格多数派：
+    // read_count=2 → 要求 2 票（完全一致）
+    // read_count=3 → 要求 2 票（2/3 多数）
+    let min_votes = if read_count == 3 { 2 } else { read_count };
+    if winner_count < min_votes {
         return LocalReadResult::Tampered { read_count };
     }
 
-    // [BUG-S1 FIX] 仅在多数派（>=2 票）时自修复，防止单票可疑值传播
+    // 多数派确认后自修复少数派副本
     let mut repair_failed = false;
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);

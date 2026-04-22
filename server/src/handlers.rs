@@ -1,11 +1,11 @@
-// server/src/handlers.rs — 优化版 v10
+// server/src/handlers.rs — 优化版 v11
 //
-// [BUG-V1 FIX] verify() 入口 is_revoked() 同时清 verify cache，消除残留缓存
-// [BUG-V2 FIX] 缓存命中路径增加 activation_ts >= expires_at 一致性检查
-// [BUG-V3 FIX] DB 路径增加 activation_ts >= expires_at 一致性检查
-// [BUG-A1 FIX] activate() 中 nonce 检查提前（时间戳窗口之后，DB 查询之前）
-// [BUG-D1 FIX] extend_license 响应中返回实际延长秒数
-// [BUG-H1 NOTE] 缓存命中路径仍需 get_key_only（DB），属有意设计，已注释说明
+// [BUG-V1 FIX] is_revoked() 返回 true 后立即 invalidate verify cache
+// [BUG-V2 FIX] 缓存命中路径：HMAC 验证 → nonce 消耗（顺序修正）
+// [BUG-A1 FIX] activate()：HMAC 验证移至 nonce 消耗之前
+// [BUG-C1 FIX] tombstone TTL 查询失败时用 MIN_MEMORY_REVOKE_TTL 而非最大值（见 cache.rs）
+// [BUG-D1 FIX] extend 响应返回真实延长秒数
+// [OPT-1 NOTE] throttle_key 全局唯一，两路径不重复写，补充注释
 
 use crate::cache::{RedisPool, VerifyCacheEntry};
 use crate::{auth, cache, db, nonce_fallback};
@@ -116,6 +116,8 @@ async fn check_and_store_nonce(pool: &RedisPool, key_hash: &str, ts: i64) -> boo
 }
 
 async fn should_update_last_check(pool: &RedisPool, key_hash: &str) -> bool {
+    // NOTE: throttle_key 全局唯一（lc:v1:throttle:{key_hash}），缓存和 DB 两条路径
+    // 共享同一个节流 key，60s 内对同一 key_hash 只允许一次通过，不存在重复写问题。
     let throttle_key = cache::throttle_key(key_hash);
     let Ok(mut conn) = pool.get().await else {
         return false;
@@ -171,15 +173,9 @@ pub async fn activate(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
     }
-
     let now = now_secs();
     if (now - req.timestamp).abs() > timestamp_window() {
         return time_window_error(now);
-    }
-
-    // [BUG-A1 FIX] nonce 检查提前至 DB 查询之前，快速拒绝重放请求
-    if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
-        return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
 
     let record = match db::find_license(&pool, &req.key_hash).await {
@@ -194,13 +190,18 @@ pub async fn activate(
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
-
     if record.activation_ts > 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED");
     }
 
+    // [BUG-A1 FIX] HMAC 验证移至 nonce 消耗之前，防止签名无效请求耗尽 nonce 槽
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
+    }
+
+    // ✅ 签名合法后才消耗 nonce
+    if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
+        return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
 
     let activation_ts = now;
@@ -247,28 +248,21 @@ pub async fn verify(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
     }
-
     let now = now_secs();
     if (now - req.timestamp).abs() > timestamp_window() {
         return time_window_error(now);
     }
 
-    // [BUG-V1 FIX] 入口统一检查并清缓存，防止 tombstone 过期后残留 verify cache 被命中
+    // [BUG-V1 FIX] revoke 检查后立即清 verify cache，防止30s窗口内残留缓存被命中
     if cache::is_revoked(&redis_pool, &req.key_hash).await {
-        cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
+        cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await; // ✅ 先清再返回
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
 
     // 缓存命中路径
-    // NOTE [BUG-H1]: get_key_only 仍需一次 DB 查询（主键索引，~1ms）。
-    // Redis 不缓存密钥明文（BUG-H3），HMAC 必须用 DB 中的 key 验证。
     if let Some(entry) = cache::get_verify_cache(&redis_pool, &req.key_hash).await {
-        // [BUG-V2 FIX] 缓存数据一致性检查（防御脏数据）
-        if entry.activation_ts <= 0 || entry.expires_at <= 0 {
-            cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
-            return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
-        }
-        if entry.activation_ts >= entry.expires_at {
+        // [BUG-V2 FIX] 缓存数据一致性检查
+        if entry.activation_ts <= 0 || entry.activation_ts >= entry.expires_at {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             tracing::error!(
                 "[Verify] cache integrity violation: act={} >= exp={}",
@@ -277,13 +271,15 @@ pub async fn verify(
             );
             return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
         }
-        // [BUG-H1 原有] 过期检查
+
         if now >= entry.expires_at {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             return err(STATUS_EXPIRED, "ERR-EXPIRED");
         }
 
         // HMAC 验证必须用 DB 中的 key（Redis 不缓存明文）
+        // NOTE: get_key_only 仍需一次 DB 查询（主键 B-tree 索引，~1ms）。
+        // 这是有意的安全设计：不在 Redis 缓存密钥明文，防止 Redis 泄露导致签名伪造。
         let db_key = match db::get_key_only(&pool, &req.key_hash).await {
             Ok(Some(k)) => k,
             Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -293,10 +289,11 @@ pub async fn verify(
             }
         };
 
+        // [BUG-V2 FIX] HMAC 先验，通过后才消耗 nonce
         if !verify_hmac_signature(&db_key, &req.key_hash, req.timestamp, &req.signature) {
             return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
         }
-
+        // ✅ 签名合法后才消耗 nonce
         if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
             return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
         }
@@ -308,7 +305,6 @@ pub async fn verify(
                 let _ = db::update_last_check(&pool_c, &kh, now).await;
             });
         }
-
         return ok_verify_response(entry.activation_ts, entry.expires_at);
     }
 
@@ -326,12 +322,11 @@ pub async fn verify(
         cache::mark_revoked_in_memory(&req.key_hash, record.expires_at);
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
-
     if record.activation_ts == 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
     }
 
-    // [BUG-V3 FIX] DB 数据一致性防御
+    // 数据一致性防御
     if record.activation_ts >= record.expires_at {
         tracing::error!(
             "[Verify] DB integrity violation: act={} >= exp={}",
@@ -341,15 +336,14 @@ pub async fn verify(
         return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
     }
 
+    // ✅ HMAC 先验，通过后才消耗 nonce
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
-
     if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
 
-    // [BUG-H1 FIX] 统一方向：now >= expires_at
     if now >= record.expires_at {
         return err(STATUS_EXPIRED, "ERR-EXPIRED");
     }
@@ -389,16 +383,13 @@ pub async fn health(
             .is_ok(),
         Err(_) => false,
     };
-
     let (nonce_total, nonce_rejected, nonce_map_size) = nonce_fallback::get_nonce_stats();
     let (cache_hits, cache_misses) = cache::get_cache_stats();
-
     let status = if db_ok && redis_ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-
     (
         status,
         Json(serde_json::json!({
@@ -473,6 +464,7 @@ pub async fn revoke_license(
         Ok(true) => {}
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+    // [BUG-V1 FIX] 严格顺序：先清 verify cache，再设 tombstone，再内存标记
     cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
     cache::set_revoke_tombstone(&redis_pool, &req.key_hash).await;
     let tombstone_exp = now_secs() + 86400 * 30;
@@ -509,23 +501,29 @@ pub async fn extend_license(
             &format!("extra_days must be <= {}", db::MAX_EXTEND_DAYS),
         );
     }
-    let extra_secs = req.extra_days * 86400;
-    match db::extend_license(
-        &pool,
-        &req.key_hash,
-        extra_secs,
-        req.allow_expired.unwrap_or(false),
-    )
-    .await
-    {
+    let allow_expired = req.allow_expired.unwrap_or(false);
+    let extra_secs = req
+        .extra_days
+        .saturating_mul(86400)
+        .clamp(1, db::MAX_EXTEND_SECS);
+
+    // 先查旧 expires_at（用于计算实际延长量）
+    let old_exp = match db::find_license(&pool, &req.key_hash).await {
+        Ok(Some(r)) => r.expires_at,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "license not found"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    match db::extend_license(&pool, &req.key_hash, extra_secs, allow_expired).await {
         Ok(Some(new_exp)) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
-            // [BUG-D1 FIX] 返回实际延长秒数（DB 层 clamp 后的值）
+            // [BUG-D1 FIX] 返回实际延长秒数（DB clamp 后的真实差值）
+            let actual_extra_secs = new_exp - old_exp;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "new_expires_at": new_exp,
-                    "actual_extra_secs": extra_secs
+                    "actual_extra_secs": actual_extra_secs
                 })),
             )
                 .into_response()
@@ -588,7 +586,7 @@ pub async fn batch_init(
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
     match db::batch_init_keys(&pool, &keys, &note).await {
         Ok(()) => {
-            let results: Vec<_> = keys
+            let results: Vec<serde_json::Value> = keys
                 .iter()
                 .map(|k| serde_json::json!({ "key": k, "key_hash": hash_key(k) }))
                 .collect();

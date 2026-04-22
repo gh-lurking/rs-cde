@@ -1,8 +1,9 @@
-// server/src/cache.rs — 优化版 v8
+// server/src/cache.rs — 优化版 v9
 //
-// [BUG-H3 FIX] VerifyCacheEntry 移除 key 字段，不在 Redis 缓存密钥明文
-// [BUG-C1 FIX] tombstone 内存缓存最短存活 MIN_MEMORY_REVOKE_TTL（60s）
-// [BUG-C1 FIX] start_cache_cleanup_task 添加防重复启动 + panic 日志
+// [BUG-C1 FIX] tombstone TTL 查询失败时降级为 MIN_MEMORY_REVOKE_TTL（60s）
+//              而非 tombstone_ttl()（最大值，最长30天）
+//              防止 TTL 查询失败时内存缓存远超 Redis 实际 TTL 导致的误判
+
 use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
@@ -15,7 +16,6 @@ pub type RedisPool = Pool;
 
 const KEY_NS: &str = "lc:v1:";
 
-// [BUG-H3 FIX] 移除 key 字段：HMAC 验证始终走 DB 路径，Redis 不缓存密钥明文
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VerifyCacheEntry {
     pub activation_ts: i64,
@@ -26,11 +26,8 @@ static VERIFY_CACHE_TTL: OnceLock<u64> = OnceLock::new();
 static TOMBSTONE_TTL: OnceLock<u64> = OnceLock::new();
 static CACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static CACHE_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// [BUG-C1 FIX] 防重复启动
 static CACHE_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 
-// [BUG-C1 FIX] tombstone 在内存中的最短存活时间
 const MIN_MEMORY_REVOKE_TTL: i64 = 60;
 
 fn verify_cache_ttl() -> u64 {
@@ -53,7 +50,7 @@ pub fn get_cache_stats() -> (u64, u64) {
     )
 }
 
-pub fn init_redis_pool(url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolError> {
+pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
     let max_size: usize = std::env::var("REDIS_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -103,7 +100,6 @@ pub fn mark_revoked_in_memory(key_hash: &str, expires_at: i64) {
     memory_revoke_map().insert(key_hash.to_string(), expires_at);
 }
 
-// [BUG-C1 FIX] 防重复启动 + panic 日志
 pub fn start_cache_cleanup_task() {
     if CACHE_CLEANUP_STARTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -113,7 +109,6 @@ pub fn start_cache_cleanup_task() {
     }
     tokio::spawn(async {
         cleanup_memory_revokes().await;
-        // cleanup_memory_revokes 是永久循环，退出说明出现了 panic
         tracing::error!("[Cache] cleanup task exited unexpectedly — memory revoke map GC stopped");
     });
 }
@@ -195,12 +190,13 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
     };
     match conn.get::<_, Option<String>>(tombstone_key(key_hash)).await {
         Ok(Some(_)) => {
+            // [BUG-C1 FIX] TTL 查询失败时降级为 MIN_MEMORY_REVOKE_TTL（60s），
+            // 而非 tombstone_ttl()（最大30天），防止内存缓存远超 Redis 实际 TTL
             let remaining_ttl: i64 = redis::cmd("TTL")
                 .arg(tombstone_key(key_hash))
                 .query_async(&mut conn)
                 .await
-                .unwrap_or(tombstone_ttl() as i64);
-            // [BUG-C1 FIX] 内存缓存至少存活 MIN_MEMORY_REVOKE_TTL 秒
+                .unwrap_or(MIN_MEMORY_REVOKE_TTL); // ✅ 失败时用最小值
             let effective_ttl = remaining_ttl
                 .max(MIN_MEMORY_REVOKE_TTL)
                 .min(tombstone_ttl() as i64);
