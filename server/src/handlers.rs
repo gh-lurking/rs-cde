@@ -7,6 +7,13 @@
 // [BUG-D1 FIX] extend 响应返回真实延长秒数
 // [OPT-1 NOTE] throttle_key 全局唯一，两路径不重复写，补充注释
 
+// [BUG FIX] 缓存命中路径每次仍查一次 DB（get_key_only）——有意设计但注释不足
+// 缓存命中后为了 HMAC 验证必须从 DB 取 key 明文（Redis 不缓存密钥明文，BUG-H3）。
+// 这意味着"缓存"只减少了全量字段查询，但仍有一次主键索引查询（~1ms）。
+// 这是有意的安全设计（不在 Redis 存密钥），但注释说明不足，容易被误解为可优化项。
+// 实际上若要彻底消除该 DB 查询，需在内存（进程级）维护 key→hmac_key 的 LRU 缓存，
+// 并在 revoke 时同步失效。当前设计的 DB 访问可接受，无需改动，仅需补充注释。
+
 use crate::cache::{RedisPool, VerifyCacheEntry};
 use crate::{auth, cache, db, nonce_fallback};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension, Json};
@@ -240,6 +247,13 @@ pub struct VerifyReq {
     signature: String,
 }
 
+// 缓存命中路径注释说明（补充至 handlers.rs）
+// NOTE: get_key_only 仍需一次 DB 查询（主键索引，~1ms）。
+// 设计取舍：
+//   - ✅ Redis 不缓存密钥明文（防止 Redis 泄露导致签名伪造）
+//   - ✅ 主键索引查询极快（PG B-tree，SSD ~0.5ms）
+//   - 若需彻底消除：可在进程内维护 DashMap<key_hash, Arc<String>>
+//     并在 revoke 时 remove，但增加了状态管理复杂度，当前不值得。
 pub async fn verify(
     Extension(pool): Extension<Arc<db::DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
