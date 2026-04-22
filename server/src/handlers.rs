@@ -1,25 +1,17 @@
-// server/src/handlers.rs — 优化版 v8
+// server/src/handlers.rs — 优化版 v9
 //
-// [BUG-A2  FIX] 缓存命中路径强制 revoke 二次检查（解决 revoke→invalidate 竞态窗口）
-// [BUG-A3  FIX] 统一 HTTP 状态码常量，消除散落的魔法数字
-// [BUG-A4  FIX] revoke handler 同时写 Redis tombstone（重启后持久有效）
-// [BUG-A8  FIX] 缓存命中响应补充 revoked: false 字段（与 DB 路径响应对称）
-// [BUG-A10 FIX] nonce key 改为 {key_hash}:{timestamp}，避免未验证 sig 注入 Redis
-// [BUG-S1  FIX] activate/verify: nonce 检查移至 HMAC 验证之后
-// [BUG-S2  FIX] 缓存命中路径补充 now >= entry.expires_at 过期检查
-// [BUG-S3  FIX] 缓存命中路径也更新 last_check（异步 spawn，不阻塞响应）
-// [BUG-S4  FIX] revoke handler 检查 rows_affected == 0 时返回 404
-// [BUG-S5  FIX] 删除本地 hash_key，改用 db::hash_key
-// [BUG-S8  FIX] should_update_last_check Redis 不可用时返回 false
+// [BUG-H1 FIX] DB 路径过期检查方向：now >= record.expires_at
+// [BUG-H3 FIX] 缓存路径不再持有/验证 entry.key；改为查 DB get_key_only
+// [BUG-D1 FIX] extend_license extra_days 上界在 handler 层提前校验
+// [OPT-2 FIX] health() 补充 DB + Redis 连通性探针
 
 use crate::cache::{RedisPool, VerifyCacheEntry};
 use crate::{auth, cache, db, nonce_fallback};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension, Json};
 use hex;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
 use serde::Deserialize;
+use sha2::Sha256;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
@@ -27,7 +19,6 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// [BUG-A3 FIX] 统一状态码常量
 const STATUS_EXPIRED: StatusCode = StatusCode::GONE;
 const STATUS_REVOKED: StatusCode = StatusCode::FORBIDDEN;
 const STATUS_NOT_ACTIVATED: StatusCode = StatusCode::CONFLICT;
@@ -35,7 +26,6 @@ const STATUS_NONCE_REPLAY: StatusCode = StatusCode::CONFLICT;
 const STATUS_INVALID_KEY: StatusCode = StatusCode::FORBIDDEN;
 
 static SERVER_ID: OnceLock<String> = OnceLock::new();
-
 fn get_server_id() -> &'static str {
     SERVER_ID.get_or_init(|| {
         std::env::var("SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string())
@@ -49,8 +39,6 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-// [BUG-S5 FIX] 删除本地 hash_key，直接使用 db::hash_key
-// (在此处仅保留别名以避免大量改动)
 fn hash_key(key: &str) -> String {
     db::hash_key(key)
 }
@@ -103,7 +91,6 @@ fn nonce_ttl() -> i64 {
     timestamp_window() * 2 + 30
 }
 
-// [BUG-A10 FIX] nonce key 只用 key_hash + timestamp（不含未验证的 sig）
 async fn check_and_store_nonce(pool: &RedisPool, key_hash: &str, ts: i64) -> bool {
     let key = format!("nonce:{}:{}", key_hash, ts);
     match pool.get().await {
@@ -125,11 +112,9 @@ async fn check_and_store_nonce(pool: &RedisPool, key_hash: &str, ts: i64) -> boo
     }
 }
 
-// [BUG-S8 FIX] Redis 不可用时返回 false（保守策略），避免放大 DB 写压力
 async fn should_update_last_check(pool: &RedisPool, key_hash: &str) -> bool {
     let throttle_key = cache::throttle_key(key_hash);
     let Ok(mut conn) = pool.get().await else {
-        // [BUG-S8 FIX] Redis 不可用时返回 false，不触发 DB 写
         return false;
     };
     let result: Result<Option<String>, _> = deadpool_redis::redis::cmd("SET")
@@ -149,15 +134,14 @@ fn ok_verify_response(activation_ts: i64, expires_at: i64) -> axum::response::Re
         Json(serde_json::json!({
             "activation_ts": activation_ts,
             "expires_at": expires_at,
-            "revoked": false,  // [BUG-A8 FIX] 统一包含 revoked 字段
+            "revoked": false,
         })),
     )
         .into_response()
 }
 
-// ═══════════════════════════════════════════════════════
-// POST /activate
-// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════ POST /activate ═══════════════════════════════
+
 #[derive(Deserialize)]
 pub struct ActivateReq {
     key_hash: String,
@@ -173,19 +157,16 @@ pub async fn activate(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
     }
-
     let now = now_secs();
     if (now - req.timestamp).abs() > timestamp_window() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "ERR-TIME-RECORD",
-                "server_time": now
+                "error": "ERR-TIME-RECORD", "server_time": now
             })),
         )
             .into_response();
     }
-
     let record = match db::find_license(&pool, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -194,23 +175,18 @@ pub async fn activate(
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         }
     };
-
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
     if record.activation_ts > 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED");
     }
-
-    // [BUG-S1 FIX] 先验证 HMAC，通过后再记录 nonce
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
-
     if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
-
     let activation_ts = now;
     let default_days: i64 = std::env::var("DEFAULT_LICENSE_DAYS")
         .ok()
@@ -221,17 +197,13 @@ pub async fn activate(
         .unwrap_or(db::MAX_EXTEND_SECS)
         .clamp(1, db::MAX_EXTEND_SECS);
     let expires_at = activation_ts + extra_secs;
-
     match db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
         Ok(true) => {
             tracing::info!("[Activate] activated key_hash={}...", &req.key_hash[..8]);
             ok_verify_response(activation_ts, expires_at)
         }
         Ok(false) => {
-            tracing::warn!(
-                "[Activate] concurrent activation for {}...",
-                &req.key_hash[..8]
-            );
+            tracing::warn!("[Activate] concurrent activation");
             err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED")
         }
         Err(e) => {
@@ -241,9 +213,8 @@ pub async fn activate(
     }
 }
 
-// ═══════════════════════════════════════════════════════
-// POST /verify
-// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════ POST /verify ═══════════════════════════════
+
 #[derive(Deserialize)]
 pub struct VerifyReq {
     key_hash: String,
@@ -259,53 +230,49 @@ pub async fn verify(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
     }
-
     let now = now_secs();
     if (now - req.timestamp).abs() > timestamp_window() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "ERR-TIME-RECORD",
-                "server_time": now
+                "error": "ERR-TIME-RECORD", "server_time": now
             })),
         )
             .into_response();
     }
-
-    // 快速 revoke 检查（内存 map → Redis tombstone）
     if cache::is_revoked(&redis_pool, &req.key_hash).await {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
-
-    // 缓存命中路径
+    // 缓存命中路径：仅读 activation_ts / expires_at，不再信任缓存中的 key
     if let Some(entry) = cache::get_verify_cache(&redis_pool, &req.key_hash).await {
-        // [BUG-A2 FIX] 缓存命中后强制二次 revoke 检查
         if cache::is_revoked(&redis_pool, &req.key_hash).await {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             return err(STATUS_REVOKED, "ERR-REVOKED");
         }
-
-        // [BUG-S2 FIX] 缓存命中路径补充过期检查
+        // [BUG-H1 FIX] 统一过期检查方向
         if now >= entry.expires_at {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             return err(STATUS_EXPIRED, "ERR-EXPIRED");
         }
-
         if entry.activation_ts <= 0 || entry.expires_at <= 0 {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
         }
-
-        // [BUG-S1 FIX] 先验证 HMAC，通过后再记录 nonce
-        if !verify_hmac_signature(&entry.key, &req.key_hash, req.timestamp, &req.signature) {
+        // [BUG-H3 FIX] HMAC 必须用 DB 中的 key，不能信任 Redis 缓存的 key
+        let db_key = match db::get_key_only(&pool, &req.key_hash).await {
+            Ok(Some(k)) => k,
+            Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
+            Err(e) => {
+                tracing::error!("[Verify] DB key fetch: {}", e);
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
+        };
+        if !verify_hmac_signature(&db_key, &req.key_hash, req.timestamp, &req.signature) {
             return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
         }
-
         if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
             return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
         }
-
-        // [BUG-S3 FIX] 缓存命中路径也更新 last_check（异步，不阻塞响应）
         if should_update_last_check(&redis_pool, &req.key_hash).await {
             let pool_c = pool.clone();
             let kh = req.key_hash.clone();
@@ -313,10 +280,8 @@ pub async fn verify(
                 let _ = db::update_last_check(&pool_c, &kh, now).await;
             });
         }
-
         return ok_verify_response(entry.activation_ts, entry.expires_at);
     }
-
     // DB 路径
     let record = match db::find_license(&pool, &req.key_hash).await {
         Ok(Some(r)) => r,
@@ -326,7 +291,6 @@ pub async fn verify(
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         }
     };
-
     if record.revoked {
         cache::mark_revoked_in_memory(&req.key_hash, record.expires_at);
         return err(STATUS_REVOKED, "ERR-REVOKED");
@@ -334,32 +298,25 @@ pub async fn verify(
     if record.activation_ts == 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
     }
-
-    // [BUG-S1 FIX] 先验证 HMAC，通过后再记录 nonce
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
-
     if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
-
-    if record.expires_at < now {
+    // [BUG-H1 FIX] 统一方向：now >= expires_at
+    if now >= record.expires_at {
         return err(STATUS_EXPIRED, "ERR-EXPIRED");
     }
-
-    // 更新缓存
     cache::set_verify_cache(
         &redis_pool,
         &req.key_hash,
         &VerifyCacheEntry {
-            key: record.key.clone(),
             activation_ts: record.activation_ts,
             expires_at: record.expires_at,
         },
     )
     .await;
-
     if should_update_last_check(&redis_pool, &req.key_hash).await {
         let pool_c = pool.clone();
         let kh = req.key_hash.clone();
@@ -367,41 +324,46 @@ pub async fn verify(
             let _ = db::update_last_check(&pool_c, &kh, now).await;
         });
     }
-
     ok_verify_response(record.activation_ts, record.expires_at)
 }
 
-// ═══════════════════════════════════════════════════════
-// GET /health
-// ═══════════════════════════════════════════════════════
-pub async fn health(Extension(redis_pool): Extension<Arc<RedisPool>>) -> impl IntoResponse {
+// ═══════════════════════════════ GET /health ═══════════════════════════════
+
+// [OPT-2 FIX] 补充 DB + Redis 连通性检查
+pub async fn health(
+    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(redis_pool): Extension<Arc<RedisPool>>,
+) -> impl IntoResponse {
+    let db_ok = sqlx::query("SELECT 1").execute(pool.as_ref()).await.is_ok();
+    let redis_ok = match redis_pool.get().await {
+        Ok(mut c) => deadpool_redis::redis::cmd("PING")
+            .query_async::<_, String>(&mut c)
+            .await
+            .is_ok(),
+        Err(_) => false,
+    };
     let (nonce_total, nonce_rejected, nonce_map_size) = nonce_fallback::get_nonce_stats();
     let (cache_hits, cache_misses) = cache::get_cache_stats();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "nonce_stats": {
-                "total_checks": nonce_total,
-                "rejected": nonce_rejected,
-                "map_size": nonce_map_size
-            },
-            "cache_stats": {
-                "hits": cache_hits,
-                "misses": cache_misses,
-            }
-        })),
-    )
-        .into_response()
+    let status = if db_ok && redis_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(serde_json::json!({
+        "status": if db_ok && redis_ok { "ok" } else { "degraded" },
+        "db": db_ok,
+        "redis": redis_ok,
+        "nonce_stats": { "total_checks": nonce_total, "rejected": nonce_rejected, "map_size": nonce_map_size },
+        "cache_stats": { "hits": cache_hits, "misses": cache_misses },
+    }))).into_response()
 }
 
 fn err(code: StatusCode, msg: &str) -> axum::response::Response {
     (code, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
-// ═══════════════════════════════════════════════════════
-// Admin endpoints
-// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════ Admin ═══════════════════════════════
+
 #[derive(Deserialize)]
 pub struct AdminToken {
     token: String,
@@ -444,22 +406,16 @@ pub async fn revoke_license(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash");
     }
-
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
-
-    // [BUG-S4 FIX] 检查是否实际吊销了记录
     match db::revoke_license(&pool, &req.key_hash, reason).await {
         Ok(false) => return err(StatusCode::NOT_FOUND, "key not found"),
         Ok(true) => {}
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
-
     cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
-    // [BUG-A4 FIX] 同时写 Redis tombstone（重启后持久有效）
     cache::set_revoke_tombstone(&redis_pool, &req.key_hash).await;
     let tombstone_exp = now_secs() + 86400 * 30;
     cache::mark_revoked_in_memory(&req.key_hash, tombstone_exp);
-
     (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
 }
 
@@ -483,16 +439,17 @@ pub async fn extend_license(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash");
     }
-    // [BUG-S4 FIX] 校验 extra_days 必须 >= 1（防负数静默截断到 1 秒）
     if req.extra_days < 1 {
         return err(StatusCode::BAD_REQUEST, "extra_days must be >= 1");
     }
-
-    let extra_secs = match req.extra_days.checked_mul(86400) {
-        Some(s) => s,
-        None => return err(StatusCode::BAD_REQUEST, "extra_days out of range"),
-    };
-
+    // [BUG-D1 FIX] 提前校验上界，给调用方明确错误
+    if req.extra_days > db::MAX_EXTEND_DAYS {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!("extra_days must be <= {}", db::MAX_EXTEND_DAYS),
+        );
+    }
+    let extra_secs = req.extra_days * 86400;
     match db::extend_license(
         &pool,
         &req.key_hash,
@@ -563,24 +520,17 @@ pub async fn batch_init(
         )
             .into_response();
     }
-
     let note = req.note.unwrap_or_default();
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
-
     match db::batch_init_keys(&pool, &keys, &note).await {
         Ok(()) => {
             let results: Vec<_> = keys
                 .iter()
-                // [BUG-S5 FIX] 使用 db::hash_key（通过本地别名 hash_key）
                 .map(|k| serde_json::json!({ "key": k, "key_hash": hash_key(k) }))
                 .collect();
             tracing::info!("[Admin] batch_init: {} keys created", keys.len());
-            Json(serde_json::json!({
-                "ok": true,
-                "count": keys.len(),
-                "keys": results
-            }))
-            .into_response()
+            Json(serde_json::json!({ "ok": true, "count": keys.len(), "keys": results }))
+                .into_response()
         }
         Err(e) => {
             tracing::error!("[Admin] batch_init error: {}", e);

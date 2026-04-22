@@ -37,7 +37,7 @@ pub fn get_nonce_stats() -> (usize, usize, usize) {
     (total, rejected, map_size)
 }
 
-pub fn reset_nonce_stats() {
+pub fn _reset_nonce_stats() {
     NONCE_CHECKED_COUNT.store(0, Ordering::Relaxed);
     NONCE_REJECTED_COUNT.store(0, Ordering::Relaxed);
 }

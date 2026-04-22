@@ -1,9 +1,7 @@
-// client/src/storage.rs — 优化版 v7
+// client/src/storage.rs — 优化版 v8
 //
-// [BUG-A6 FIX] nonce 正确生成为 96-bit（12字节）
-// [BUG-A7 FIX] 自修复只在 winner_count >= majority_needed 时执行
-// [BUG-08 FIX] read_count 计算正确
-// [BUG-C2 FIX] winner_count < majority_needed 时区分 Inconsistent vs Tampered
+// [BUG-S1 FIX] 自修复只在 winner_count >= 2（多数派）时执行，
+//              避免单票可疑值被写入所有副本
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
@@ -12,7 +10,6 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
-
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,7 +22,7 @@ static WRITE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static READ_SUCCESS_COUNT: AtomicUsize = AtomicUsize::new(0);
 static READ_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-pub fn get_storage_stats() -> (usize, usize, usize, usize) {
+pub fn _get_storage_stats() -> (usize, usize, usize, usize) {
     (
         WRITE_SUCCESS_COUNT.load(Ordering::Relaxed),
         WRITE_FAIL_COUNT.load(Ordering::Relaxed),
@@ -52,7 +49,7 @@ fn derive_key(hkey: &str, salt: &str) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), hkey.as_bytes());
     let mut okm = [0u8; 16];
     hk.expand(b"aes-128-gcm-key", &mut okm)
-        .expect("HKDF expand should never fail for 16-byte output");
+        .expect("HKDF expand should never fail");
     okm
 }
 
@@ -83,25 +80,18 @@ fn write_slot(
 ) -> Result<(), String> {
     let key = Key::<Aes128Gcm>::from_slice(key_bytes);
     let cipher = Aes128Gcm::new(key);
-
-    // [BUG-A6 FIX] 正确生成 96-bit (12字节) nonce
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&activation.to_le_bytes());
     plain[8..].copy_from_slice(&expires.to_le_bytes());
-
     let ct = cipher
         .encrypt(nonce, plain.as_ref())
         .map_err(|e| format!("encrypt: {e}"))?;
-
     if let Some(p) = path.parent() {
         let _ = fs::create_dir_all(p);
     }
-
-    // 格式: [12字节 nonce][16+16字节 ciphertext+tag] = 44字节
     let mut out = nonce_bytes.to_vec();
     out.extend_from_slice(&ct);
     fs::write(path, &out).map_err(|e| format!("write: {e}"))?;
@@ -111,7 +101,6 @@ fn write_slot(
 
 fn read_slot(path: &PathBuf, key_bytes: &[u8; 16]) -> Option<(u64, u64)> {
     let data = fs::read(path).ok()?;
-    // [BUG-A6 FIX] 正确的长度校验：12(nonce) + 16(plain) + 16(tag) = 44
     if data.len() != 44 {
         READ_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -164,23 +153,19 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
 }
 
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
-    // [BUG-A7 FIX] 预先派生一次密钥，避免循环中重复 HKDF
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::with_capacity(3);
-
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
         if let Some(pair) = read_slot(&path, &key) {
             values.push(pair);
         }
     }
-
     let read_count = values.len();
     if read_count == 0 {
         return LocalReadResult::Insufficient { read_count: 0 };
     }
 
-    // 多数投票
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(e) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -189,30 +174,26 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
-
     let (winner, winner_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
     let majority_needed = if read_count >= 2 { 2 } else { 1 };
-
     if winner_count < majority_needed {
-        // [BUG-C2 FIX] 区分"读取数量不足"与"多副本内容不一致"
-        // 当前场景：读到了记录，但没有任何值达到多数——说明副本内容不一致
-        // 使用 Insufficient 并让调用方知道这可能是写入中断导致的
         return LocalReadResult::Insufficient { read_count };
     }
 
-    // 自修复：将少数副本更新为多数副本的值
+    // [BUG-S1 FIX] 仅在多数派（>=2 票）时自修复，防止单票可疑值传播
     let mut repair_failed = false;
-    for slot in 0..3u8 {
-        let path = derive_path(hkey, salt, slot);
-        match read_slot(&path, &key) {
-            Some(v) if v == winner => {} // 已一致，跳过
-            _ => {
-                if write_slot(&path, &key, winner.0, winner.1).is_err() {
-                    repair_failed = true;
+    if winner_count >= 2 {
+        for slot in 0..3u8 {
+            let path = derive_path(hkey, salt, slot);
+            match read_slot(&path, &key) {
+                Some(v) if v == winner => {}
+                _ => {
+                    if write_slot(&path, &key, winner.0, winner.1).is_err() {
+                        repair_failed = true;
+                    }
                 }
             }
         }
     }
-
     validate_and_return(winner, read_count, repair_failed)
 }

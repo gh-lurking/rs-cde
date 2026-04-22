@@ -1,12 +1,7 @@
-// server/src/cache.rs — 优化版 v6
+// server/src/cache.rs — 优化版 v7
 //
-// [BUG-05 FIX]  is_revoked(): Redis 不可用时仅依赖内存 map，不额外写入
-// [BUG-06 FIX]  throttle_key() 去掉冗余前缀，统一使用 KEY_NS
-// [BUG-11 FIX]  set_verify_cache 前检查 activation_ts/expires_at 有效性
-// [BUG-S7 FIX]  tombstone TTL 查询异常时使用保守值（tombstone_ttl()）而非 0
-// [OPT-1]       缓存写入增加零值 guard
-// [OPT-2]       缓存命中率监控
-
+// [BUG-H3 FIX] VerifyCacheEntry 移除 key 字段，不在 Redis 缓存密钥明文
+// [BUG-C1 FIX] tombstone 内存缓存最短存活 MIN_MEMORY_REVOKE_TTL（60s）
 use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
@@ -18,18 +13,20 @@ use std::time::Duration;
 pub type RedisPool = Pool;
 const KEY_NS: &str = "lc:v1:";
 
+// [BUG-H3 FIX] 移除 key 字段：HMAC 验证始终走 DB 路径，Redis 不缓存密钥明文
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VerifyCacheEntry {
-    pub key: String,
     pub activation_ts: i64,
     pub expires_at: i64,
 }
 
 static VERIFY_CACHE_TTL: OnceLock<u64> = OnceLock::new();
 static TOMBSTONE_TTL: OnceLock<u64> = OnceLock::new();
-
 static CACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static CACHE_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// [BUG-C1 FIX] tombstone 在内存中的最短存活时间
+const MIN_MEMORY_REVOKE_TTL: i64 = 60;
 
 fn verify_cache_ttl() -> u64 {
     *VERIFY_CACHE_TTL.get_or_init(|| {
@@ -56,7 +53,6 @@ pub fn init_redis_pool(url: &str) -> Result<RedisPool, deadpool_redis::CreatePoo
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
-
     let cfg = Config {
         url: Some(url.to_string()),
         pool: Some(PoolConfig {
@@ -76,17 +72,14 @@ pub fn init_redis_pool(url: &str) -> Result<RedisPool, deadpool_redis::CreatePoo
 fn verify_cache_key(key_hash: &str) -> String {
     format!("{KEY_NS}verify:{key_hash}")
 }
-
 fn tombstone_key(key_hash: &str) -> String {
     format!("{KEY_NS}revoked:{key_hash}")
 }
-
 pub fn throttle_key(key_hash: &str) -> String {
     format!("{KEY_NS}throttle:{key_hash}")
 }
 
 static MEMORY_REVOKE_FALLBACK: OnceLock<DashMap<String, i64>> = OnceLock::new();
-
 fn memory_revoke_map() -> &'static DashMap<String, i64> {
     MEMORY_REVOKE_FALLBACK.get_or_init(DashMap::new)
 }
@@ -132,7 +125,6 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
     entry
 }
 
-// [OPT-1 + BUG-11 FIX] 写入缓存前校验字段有效性
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
     if entry.activation_ts == 0 || entry.expires_at == 0 {
         tracing::warn!("[Cache] 跳过零值缓存写入: {}", key_hash);
@@ -146,7 +138,6 @@ pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCa
         );
         return;
     }
-
     let Ok(json) = serde_json::to_string(entry) else {
         tracing::warn!("[Cache] JSON 序列化失败");
         return;
@@ -170,12 +161,8 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
     let _: Result<i64, _> = conn.del(verify_cache_key(key_hash)).await;
 }
 
-// [BUG-05 FIX] 优先级：内存 map → Redis tombstone → false
-// [BUG-S7 FIX] TTL 查询异常时使用 tombstone_ttl() 作为保守值
 pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
     let mem_map = memory_revoke_map();
-
-    // 1. 内存 map（O(1) 最快路径）
     if let Some(exp) = mem_map.get(key_hash) {
         if *exp > now_ts() {
             return true;
@@ -183,22 +170,21 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
         drop(exp);
         mem_map.remove(key_hash);
     }
-
-    // 2. Redis tombstone
     let Ok(mut conn) = pool.get().await else {
         return false;
     };
-
     match conn.get::<_, Option<String>>(tombstone_key(key_hash)).await {
         Ok(Some(_)) => {
-            // [BUG-S7 FIX] TTL 查询失败时使用完整 tombstone_ttl() 而非 0
             let remaining_ttl: i64 = redis::cmd("TTL")
                 .arg(tombstone_key(key_hash))
                 .query_async(&mut conn)
                 .await
                 .unwrap_or(tombstone_ttl() as i64);
-
-            let exp = now_ts() + remaining_ttl.max(tombstone_ttl() as i64 / 2);
+            // [BUG-C1 FIX] 内存缓存至少存活 MIN_MEMORY_REVOKE_TTL 秒
+            let effective_ttl = remaining_ttl
+                .max(MIN_MEMORY_REVOKE_TTL)
+                .min(tombstone_ttl() as i64);
+            let exp = now_ts() + effective_ttl;
             mem_map.insert(key_hash.to_string(), exp);
             true
         }

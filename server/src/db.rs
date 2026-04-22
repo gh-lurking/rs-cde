@@ -1,9 +1,6 @@
-// server/src/db.rs — 优化版 v7
+// server/src/db.rs — 优化版 v8
 //
-// [BUG-A5  FIX] RETURNING (expires_at) → query_scalar + RETURNING expires_at（去歧义）
-// [BUG-A12 FIX] 导出 hash_key，handlers.rs 复用，消除重复实现
-// [BUG-S4  FIX] revoke_license 返回 bool，调用方可检测 0 rows
-// [BUG-S5  FIX] 删除 handlers.rs 中的本地 hash_key，统一使用 db::hash_key
+// [新增] get_key_only(): 缓存命中路径 HMAC 验证时查 DB 取 key，不信任 Redis
 
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -20,7 +17,6 @@ fn now_db() -> i64 {
         .as_secs() as i64
 }
 
-// [BUG-A12 FIX] 统一导出，handlers.rs 不再重复定义
 pub fn hash_key(key: &str) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
@@ -49,7 +45,6 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-
     let pool = PgPoolOptions::new()
         .max_connections(max_conn)
         .min_connections(min_conn)
@@ -58,34 +53,29 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .max_lifetime(Duration::from_secs(1800))
         .connect(database_url)
         .await?;
-
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key          TEXT    NOT NULL,
-            key_hash     TEXT    PRIMARY KEY,
+            key TEXT NOT NULL,
+            key_hash TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at   BIGINT NOT NULL DEFAULT 0,
-            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   BIGINT NOT NULL,
-            last_check   BIGINT,
-            note         TEXT    NOT NULL DEFAULT ''
+            expires_at BIGINT NOT NULL DEFAULT 0,
+            revoked BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at BIGINT NOT NULL,
+            last_check BIGINT,
+            note TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
     .await?;
-
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_licenses_key_hash ON licenses (key_hash)")
         .execute(&pool)
         .await?;
-
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires
-         ON licenses (expires_at)
+        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires ON licenses (expires_at)
          WHERE revoked = FALSE AND activation_ts > 0",
     )
     .execute(&pool)
     .await?;
-
     tracing::info!("PostgreSQL pool ready: max={} min={}", max_conn, min_conn);
     Ok(pool)
 }
@@ -103,6 +93,15 @@ pub async fn find_license(
     .await
 }
 
+// [BUG-H3 FIX] 仅取 key 列，用于缓存命中路径的 HMAC 验证
+// 避免全量查询 LicenseRecord 的开销，同时修复 Redis key 污染问题
+pub async fn get_key_only(pool: &DbPool, key_hash: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT key FROM licenses WHERE key_hash = $1")
+        .bind(key_hash)
+        .fetch_optional(pool)
+        .await
+}
+
 pub async fn insert_license(
     pool: &DbPool,
     key: &str,
@@ -111,8 +110,7 @@ pub async fn insert_license(
     note: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO licenses (key, key_hash, created_at, note)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO licenses (key, key_hash, created_at, note) VALUES ($1, $2, $3, $4)
          ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(key)
@@ -151,7 +149,6 @@ pub async fn update_last_check(pool: &DbPool, key_hash: &str, ts: i64) -> Result
     Ok(())
 }
 
-// [BUG-S4 FIX] 返回 bool：false = key 不存在，调用方可据此返回 404
 pub async fn revoke_license(
     pool: &DbPool,
     key_hash: &str,
@@ -165,7 +162,6 @@ pub async fn revoke_license(
     Ok(r.rows_affected() > 0)
 }
 
-// [BUG-A5 FIX] 使用 query_scalar + RETURNING expires_at（无括号，语义明确）
 pub async fn extend_license(
     pool: &DbPool,
     key_hash: &str,
@@ -174,14 +170,10 @@ pub async fn extend_license(
 ) -> Result<Option<i64>, sqlx::Error> {
     let now = now_db();
     let extra_secs = extra_secs.clamp(1, MAX_EXTEND_SECS);
-
     if allow_expired {
         sqlx::query_scalar::<_, i64>(
-            "UPDATE licenses
-             SET expires_at = GREATEST(expires_at, $1) + $2
-             WHERE key_hash = $3
-               AND revoked = FALSE
-               AND activation_ts > 0
+            "UPDATE licenses SET expires_at = GREATEST(expires_at, $1) + $2
+             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0
              RETURNING expires_at",
         )
         .bind(now)
@@ -191,12 +183,8 @@ pub async fn extend_license(
         .await
     } else {
         sqlx::query_scalar::<_, i64>(
-            "UPDATE licenses
-             SET expires_at = expires_at + $2
-             WHERE key_hash = $3
-               AND revoked = FALSE
-               AND activation_ts > 0
-               AND expires_at > $1
+            "UPDATE licenses SET expires_at = expires_at + $2
+             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0 AND expires_at > $1
              RETURNING expires_at",
         )
         .bind(now)
@@ -228,7 +216,6 @@ pub async fn batch_init_keys(
     let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
     let created_ats = vec![now; keys.len()];
     let notes = vec![note.to_string(); keys.len()];
-
     sqlx::query(
         "INSERT INTO licenses (key, key_hash, created_at, note)
          SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[])
@@ -240,7 +227,6 @@ pub async fn batch_init_keys(
     .bind(&notes)
     .execute(pool)
     .await?;
-
     tracing::info!("[DB] batch_init_keys: {} keys inserted", keys.len());
     Ok(())
 }
