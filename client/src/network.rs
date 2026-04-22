@@ -1,9 +1,9 @@
-// client/src/network.rs — 优化版 v7
+// client/src/network.rs — 优化版 v8
 //
 // [BUG-H2 FIX] get_time_from_http_date: .unwrap() → ? 防 panic
 // [BUG-N1 FIX] 时钟补偿：server_ts 合理性校验（>= 2024-01-01）
 // [BUG-N2 FIX] parse_http_date_to_timestamp: 添加日期字段范围校验
-
+// [BUG-N2 FIX] 二次重试 delay2 改用 t4 作为基准，修正偏移量估算
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +46,7 @@ fn get_server_id() -> &'static str {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -152,29 +153,34 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
 pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyResponse, String> {
     let t1 = now_secs();
     let result = do_verify(hkey, server_url, t1).await;
+
     match &result {
         Err(e) if e.starts_with("ERR-TIME-RECORD:server_time=") => {
             let server_ts: i64 = e
                 .trim_start_matches("ERR-TIME-RECORD:server_time=")
                 .parse()
                 .unwrap_or(t1);
+
             // [BUG-N1 FIX] 校验 server_ts 合理性，防止异常值导致无意义重试
             if server_ts < 1_704_067_200 {
                 tracing::warn!("[Network] server_time 异常: {server_ts}，放弃时钟补偿重试");
                 return Err(format!("ERR-CLOCK-SKEW:invalid-server-time={server_ts}"));
             }
+
             let t4 = now_secs();
             let full_rtt = t4 - t1;
             if full_rtt > NET_DEFAULT_TIMEOUT_SECS as i64 * 2 {
                 tracing::warn!("[Network] 不合理的 RTT: {}s，放弃时钟补偿重试", full_rtt);
                 return result;
             }
+
             let one_way_delay = (full_rtt / 2).max(0).min(NET_DEFAULT_TIMEOUT_SECS as i64);
             let estimated_server_now = server_ts + one_way_delay;
             let clock_offset = t1 - estimated_server_now;
             if clock_offset.abs() > MAX_CLOCK_OFFSET_SECS {
                 return Err(format!("ERR-CLOCK-SKEW:{}", clock_offset));
             }
+
             let retry = do_verify(hkey, server_url, estimated_server_now).await;
             match &retry {
                 Err(e2) if e2.starts_with("ERR-TIME-RECORD:server_time=") => {
@@ -182,14 +188,18 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                         .trim_start_matches("ERR-TIME-RECORD:server_time=")
                         .parse()
                         .unwrap_or(estimated_server_now);
+
                     // [BUG-N1 FIX] 同样校验二次 server_ts
                     if server_ts2 < 1_704_067_200 {
                         return Err(format!(
                             "ERR-CLOCK-SKEW-PERSISTENT:invalid-server-time={server_ts2}"
                         ));
                     }
+
                     let t5 = now_secs();
-                    let delay2 = ((t5 - t1) / 2).max(0);
+                    // [BUG-N2 FIX] 改用 t4 作为二次重试基准（t4 是第一次重试发出前的时刻）
+                    // 原代码用 t1 导致 RTT 跨越整个三次交互，偏移量严重高估
+                    let delay2 = ((t5 - t4) / 2).max(0);
                     let est2 = server_ts2 + delay2;
                     let offset2 = estimated_server_now - est2;
                     if offset2.abs() > MAX_CLOCK_OFFSET_SECS {
@@ -221,20 +231,24 @@ pub async fn validate_system_time() -> Result<(), String> {
     if local_now < min_ts || local_now > max_ts {
         return Err(format!("系统时间 {} 超出合理范围", local_now));
     }
+
     let client = get_http_client();
     let cf_ts = get_time_from_cf_trace(client).await;
     let http_ts = get_time_from_http_date(client).await;
     let timestamps: Vec<i64> = [cf_ts, http_ts].into_iter().flatten().collect();
+
     if timestamps.is_empty() {
         return Err(
             "无法获取外部时间源（CF trace 和 HTTP Date 均不可用），请检查网络连接".to_string(),
         );
     }
+
     let avg_offset: i64 = timestamps
         .iter()
         .map(|&t| local_now as i64 - t)
         .sum::<i64>()
         / timestamps.len() as i64;
+
     if avg_offset.abs() > SYSTEM_TIME_HARD_LIMIT_SECS {
         return Err(format!(
             "系统时间偏差 {}s 超过限制 {}s，请同步时钟",
@@ -312,6 +326,7 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     let h: u32 = tp[0].parse().ok()?;
     let m: u32 = tp[1].parse().ok()?;
     let s: u32 = tp[2].parse().ok()?;
+
     // ✅ [BUG-N2 FIX] 基本范围校验
     if day == 0 || day > 31 {
         return None;
@@ -325,6 +340,7 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     if h > 23 || m > 59 || s > 60 {
         return None;
     } // s=60 允许闰秒
+
     let days = days_since_1970(year, month, day);
     Some(days * 86400 + h as u64 * 3600 + m as u64 * 60 + s as u64)
 }

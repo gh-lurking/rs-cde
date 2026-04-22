@@ -1,10 +1,11 @@
-// client/src/time_guard.rs — 优化版 v5
+// client/src/time_guard.rs — 优化版 v6
 //
 // [C-03 FIX]  时间正向大跳变（>3600s）后更新基准，避免永久误报
 // [BUG-10 FIX] watchdog Ok(_) 分支也视为异常
 // [OPT]        MONITOR_STARTED AtomicBool 防止重复启动
 // [BUG-14 FIX] 添加 EXPIRY_TIME 零值检查
-// [BUG-C5 NOTE] 回拨容差 60s 已知偏小，可视业务需求调整为 300s
+// [BUG-T1 FIX] ROLLBACK_TOLERANCE_SECS 改为 300s，与服务端 TIMESTAMP_WINDOW_SECS 一致
+//              可通过 ROLLBACK_TOLERANCE_SECS 环境变量覆盖
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
@@ -14,9 +15,14 @@ static LAST_VALID_TIME: AtomicI64 = AtomicI64::new(0);
 static EXPIRY_TIME: AtomicI64 = AtomicI64::new(0);
 static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
-// 时间回拨容差（秒）。建议与服务端 TIMESTAMP_WINDOW_SECS 保持一致（300s）。
-// [BUG-C5] 当前硬编码为 60s，NTP 回拨 > 60s 时会误判，可按业务需求调整。
-const ROLLBACK_TOLERANCE_SECS: i64 = 60;
+// [BUG-T1 FIX] 与服务端 TIMESTAMP_WINDOW_SECS 保持一致（300s）
+// 原值 60s 会导致 NTP 大步回拨（60~300s 范围）误判为时钟篡改而终止进程
+fn rollback_tolerance_secs() -> i64 {
+    std::env::var("ROLLBACK_TOLERANCE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
+}
 
 pub fn set_expiry_time(expires_at: i64) {
     EXPIRY_TIME.store(expires_at, Ordering::SeqCst);
@@ -59,10 +65,15 @@ pub fn start_monitor() {
         })
         .expect("Failed to spawn time-guard watchdog");
 
-    tracing::info!("[TimeGuard] 监控线程已启动（含 watchdog）");
+    tracing::info!(
+        "[TimeGuard] 监控线程已启动（含 watchdog），回拨容差={}s",
+        rollback_tolerance_secs()
+    );
 }
 
 fn monitor_loop() {
+    let tolerance = rollback_tolerance_secs();
+
     loop {
         thread::sleep(Duration::from_secs(15));
 
@@ -81,12 +92,13 @@ fn monitor_loop() {
         }
 
         // 1. 时间回拨检测
-        if current < last - ROLLBACK_TOLERANCE_SECS {
+        if current < last - tolerance {
             tracing::error!(
-                "时间回拨: last={} current={} diff={}s，终止进程",
+                "时间回拨: last={} current={} diff={}s > tolerance={}s，终止进程",
                 last,
                 current,
-                last - current
+                last - current,
+                tolerance
             );
             std::process::exit(1);
         }

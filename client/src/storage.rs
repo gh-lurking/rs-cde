@@ -1,8 +1,7 @@
-// client/src/storage.rs — 优化版 v8
+// client/src/storage.rs — 优化版 v9
 //
-// [BUG-S1 FIX] 自修复只在 winner_count >= 2（多数派）时执行，
-//              避免单票可疑值被写入所有副本
-
+// [BUG-S1 FIX] read_count < 2 时直接返回 Insufficient，强制要求至少 2/3 副本一致
+//              原逻辑 majority_needed=1 允许单副本通过，无法检测篡改
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     aead::{Aead, OsRng},
@@ -161,11 +160,15 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             values.push(pair);
         }
     }
+
     let read_count = values.len();
-    if read_count == 0 {
-        return LocalReadResult::Insufficient { read_count: 0 };
+
+    // [BUG-S1 FIX] 强制要求至少 2 副本可读，单副本无法证明未被篡改
+    if read_count < 2 {
+        return LocalReadResult::Insufficient { read_count };
     }
 
+    // 统计各值出现次数，取最多数
     let mut counts: Vec<((u64, u64), usize)> = Vec::new();
     for &v in &values {
         if let Some(e) = counts.iter_mut().find(|(val, _)| *val == v) {
@@ -174,26 +177,28 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
             counts.push((v, 1));
         }
     }
+
     let (winner, winner_count) = counts.iter().max_by_key(|(_, c)| *c).copied().unwrap();
-    let majority_needed = if read_count >= 2 { 2 } else { 1 };
-    if winner_count < majority_needed {
-        return LocalReadResult::Insufficient { read_count };
+
+    // 要求多数派（读到 2/3 时需要 2 票，读到 3/3 时仍需 2 票）
+    if winner_count < 2 {
+        // 3 副本各不相同，无法确定哪个正确
+        return LocalReadResult::Tampered { read_count };
     }
 
     // [BUG-S1 FIX] 仅在多数派（>=2 票）时自修复，防止单票可疑值传播
     let mut repair_failed = false;
-    if winner_count >= 2 {
-        for slot in 0..3u8 {
-            let path = derive_path(hkey, salt, slot);
-            match read_slot(&path, &key) {
-                Some(v) if v == winner => {}
-                _ => {
-                    if write_slot(&path, &key, winner.0, winner.1).is_err() {
-                        repair_failed = true;
-                    }
+    for slot in 0..3u8 {
+        let path = derive_path(hkey, salt, slot);
+        match read_slot(&path, &key) {
+            Some(v) if v == winner => {}
+            _ => {
+                if write_slot(&path, &key, winner.0, winner.1).is_err() {
+                    repair_failed = true;
                 }
             }
         }
     }
+
     validate_and_return(winner, read_count, repair_failed)
 }

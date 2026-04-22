@@ -1,9 +1,11 @@
-// client/src/license_guard.rs — 优化版 v5
+// client/src/license_guard.rs — 优化版 v5（无逻辑变更，注释更新）
 //
 // [C-01 FIX]  activation_ts / expires_at 零值语义修正（在线 + 离线双路均检查）
 // [BUG-01 FIX] 离线路径中增加零值检查
 // [BUG-13 FIX] ERR_NOT_ACTIVATED 视为不可恢复错误（不降级离线）
 // [BUG-14 FIX] 服务端响应零值检查，防止空响应绕过验证
+// NOTE: storage::write_all_replicas 在 time_guard::set_expiry_time 之前调用
+//       main.rs 保证 check_and_enforce().await 先于 start_monitor()，顺序正确
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,6 +61,7 @@ pub async fn check_and_enforce() {
             let remaining = (resp.expires_at - now) / 86400;
             println!("[License] 在线验证通过，剩余 {} 天", remaining);
 
+            // NOTE: write_all_replicas 先于 set_expiry_time，顺序依赖由 main.rs 保证
             storage::write_all_replicas(
                 &hkey,
                 &salt,
