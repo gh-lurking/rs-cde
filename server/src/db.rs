@@ -3,6 +3,7 @@
 // [BUG-12 FIX] extend_license db 层 clamp 保护（handler 层已做 checked_mul，双重防御）
 // [BUG-14 FIX] 添加索引监控，检测慢查询
 // [OPT] allow_expired=true 时用 GREATEST(expires_at, now) 防止在已超期的旧值上累加
+
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -197,4 +198,42 @@ pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx
     )
     .fetch_all(pool)
     .await
+}
+
+/// 使用 unnest() 批量 INSERT，O(1) DB trips
+pub async fn batch_init_keys(
+    pool: &DbPool,
+    keys: &[String],
+    note: &str,
+) -> Result<(), sqlx::Error> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let now = now_db();
+    let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
+    let created_ats = vec![now; keys.len()];
+    let notes = vec![note.to_string(); keys.len()];
+
+    sqlx::query(
+        "INSERT INTO licenses (key, key_hash, created_at, note) 
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[]) 
+         ON CONFLICT (key_hash) DO NOTHING",
+    )
+    .bind(keys)
+    .bind(&key_hashes)
+    .bind(&created_ats)
+    .bind(&notes)
+    .execute(pool)
+    .await?;
+
+    tracing::info!("[DB] batch_init_keys: {} keys inserted", keys.len());
+    Ok(())
+}
+
+fn hash_key(key: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(key.as_bytes());
+    hex::encode(h.finalize())
 }

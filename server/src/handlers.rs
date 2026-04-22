@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<sha2::Sha256>;
 
-static SERVER_ID: OnceLock<String>  = OnceLock::new();
+static SERVER_ID: OnceLock<String> = OnceLock::new();
 
 fn get_server_id() -> &'static str {
     SERVER_ID.get_or_init(|| {
@@ -558,30 +558,46 @@ pub struct BatchInitReq {
 
 pub async fn batch_init(
     Extension(pool): Extension<Arc<db::DbPool>>,
-    Extension(admin): Extension<Arc<String>>,
+    Extension(admin_token): Extension<Arc<String>>,
     Json(req): Json<BatchInitReq>,
 ) -> impl IntoResponse {
-    if !auth::verify_admin_token(&req.token, &admin) {
-        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+    if !auth::verify_admin_token(&req.token, &admin_token) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
-    let count = req.count.min(1000);
-    let note = req.note.as_deref().unwrap_or("");
-    let now = now_secs();
-    let mut keys = Vec::with_capacity(count);
-    for _ in 0..count {
-        let hkey = generate_hkey();
-        let key_hash = hash_key(&hkey);
-        if db::insert_license(&pool, &hkey, &key_hash, now, note)
-            .await
-            .is_ok()
-        {
-            keys.push(serde_json::json!({ "key": hkey, "key_hash": key_hash }));
+
+    if req.count == 0 || req.count > 10_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "count must be 1..10000"})),
+        )
+            .into_response();
+    }
+
+    let note = req.note.unwrap_or_default();
+    let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
+
+    match db::batch_init_keys(&pool, &keys, &note).await {
+        Ok(()) => {
+            let results: Vec<_> = keys
+                .iter()
+                .map(|k| {
+                    serde_json::json!({
+                        "key": k,
+                        "key_hash": hash_key(k)
+                    })
+                })
+                .collect();
+            tracing::info!("[Admin] batch_init: {} keys created", keys.len());
+            Json(serde_json::json!({
+                "ok": true,
+                "count": keys.len(),
+                "keys": results,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!("[Admin] batch_init error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
-    let count = keys.len();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "keys": keys, "count": count })),
-    )
-        .into_response()
 }
