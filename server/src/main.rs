@@ -3,12 +3,14 @@
 // MED-2 FIX : 启动 nonce_fallback::start_cleanup_task()
 // OPT-1 FIX : 启动 cache::start_cache_cleanup_task()
 // NEW       : 优雅关闭同时监听 SIGTERM（生产容器友好）
+// [OPT-3] 新增 key_cache 模块声明
 
 mod auth;
 mod cache;
 mod db;
 mod handlers;
-mod nonce_fallback;
+mod key_cache;
+mod nonce_fallback; // [OPT-3] 进程内 key 映射缓存
 
 use axum::{
     extract::DefaultBodyLimit,

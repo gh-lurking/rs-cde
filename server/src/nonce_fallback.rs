@@ -1,9 +1,9 @@
-// server/src/nonce_fallback.rs
+// server/src/nonce_fallback.rs — 优化版
 //
-// [BUG-NF1 FIX] cleanup_loop 外层重启逻辑，防止 panic 后 GC 永久停止
-// [BUG-02 FIX]  check_and_store 语义完全修正
-// [OPT]         Entry API 原子化 check+insert，消除 TOCTOU 竞态
-// [OPT]         MAX_NONCE_ENTRIES 上界防内存耗尽 DoS
+// [OPT-2 FIX] check_and_store：内存满时先同步 GC 过期条目，再判断是否可插入
+//             避免 GC 任务 30s 间隔期间所有合法请求被拒绝（BUG-EXP-3）
+//
+// 与 CLAUDE.md §2 「Simplicity First」一致：不引入新抽象，仅在 check_and_store 内增加 GC 调用
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -48,7 +48,7 @@ pub fn start_cleanup_task() {
     }
     tokio::spawn(async {
         loop {
-            cleanup_once().await; // ✅ 单次 GC
+            cleanup_once().await;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
@@ -57,12 +57,21 @@ pub fn start_cleanup_task() {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
+/// 同步清理一批过期 nonce（用于内存满时的紧急 GC）
+fn sync_cleanup_expired() -> usize {
+    let map = nonce_map();
+    let now = now_secs();
+    let before = map.len();
+    map.retain(|_, v| v.expires_at > now);
+    before - map.len()
+}
+
 /// Nonce 去重（Redis 不可用时的内存降级）
-/// 返回 true  → nonce 首次出现（或已过期），请求合法
+/// 返回 true → nonce 首次出现（或已过期），请求合法
 /// 返回 false → nonce 在有效期内，重放攻击，拒绝
 pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     let map = nonce_map();
@@ -71,13 +80,24 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
 
     NONCE_CHECKED_COUNT.fetch_add(1, Ordering::Relaxed);
 
+    // [OPT-2] 内存满时先尝试同步 GC，而非直接拒绝
     if map.len() >= MAX_NONCE_ENTRIES {
-        tracing::error!(
-            "[NonceFallback] 内存已满 ({}), 拒绝新 nonce",
-            MAX_NONCE_ENTRIES
-        );
-        NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
-        return false;
+        let cleaned = sync_cleanup_expired();
+        if cleaned == 0 {
+            // GC 后仍满（所有条目都未过期），真正的内存压力，拒绝
+            tracing::error!(
+                "[NonceFallback] 内存已满 ({}) 且无可清理条目，拒绝新 nonce",
+                MAX_NONCE_ENTRIES
+            );
+            NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        tracing::info!("[NonceFallback] 紧急 GC 清理 {} 条，继续处理请求", cleaned);
+        // GC 后重新检查（极端并发下仍可能满，但概率极低）
+        if map.len() >= MAX_NONCE_ENTRIES {
+            NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
     }
 
     use dashmap::mapref::entry::Entry;

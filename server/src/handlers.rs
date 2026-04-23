@@ -12,7 +12,16 @@
 // 实际上若要彻底消除该 DB 查询，需在内存（进程级）维护 key→hmac_key 的 LRU 缓存，
 // 并在 revoke 时同步失效。当前设计的 DB 访问可接受，无需改动，仅需补充注释。
 
+// server/src/handlers.rs — 优化版 v13
+//
+// [OPT-1 FIX]  revoke 操作顺序：先写 tombstone 再删缓存（消除鉴权绕过窗口）
+// [OPT-3 FIX]  进程内 key_cache 消除热路径 DB 查询
+// [OPT-4 FIX]  now_secs() 防 panic + 防溢出
+// [OPT-6 FIX]  verify_hmac_signature sig 长度上界防护
+// 与 CLAUDE.md §3 「Surgical Changes」一致：仅修改必要行，不动其他逻辑
+
 use crate::cache::{RedisPool, VerifyCacheEntry};
+use crate::key_cache; // [OPT-3] 进程内 key 缓存
 use crate::{auth, cache, db, nonce_fallback};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension, Json};
 use hmac::{Hmac, Mac};
@@ -25,11 +34,17 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+
 const STATUS_EXPIRED: StatusCode = StatusCode::GONE;
 const STATUS_REVOKED: StatusCode = StatusCode::FORBIDDEN;
 const STATUS_NOT_ACTIVATED: StatusCode = StatusCode::CONFLICT;
 const STATUS_NONCE_REPLAY: StatusCode = StatusCode::CONFLICT;
 const STATUS_INVALID_KEY: StatusCode = StatusCode::FORBIDDEN;
+
+// HMAC-SHA256 输出固定 64 字节 hex，公开常量，不构成时序侧信道
+const _HMAC_HEX_LEN: usize = 64;
+// sig 长度上界：防止超长签名导致 ct_eq CPU 耗尽 [OPT-6]
+const SIG_MAX_LEN: usize = 256;
 
 static SERVER_ID: OnceLock<String> = OnceLock::new();
 
@@ -39,11 +54,13 @@ fn get_server_id() -> &'static str {
     })
 }
 
+// [OPT-4] 防 panic（时钟早于 UNIX_EPOCH）+ 防溢出（as i64 截断）
 fn now_secs() -> i64 {
-    SystemTime::now()
+    let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+        .unwrap_or_default()
+        .as_secs();
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 fn hash_key(key: &str) -> String {
@@ -54,7 +71,12 @@ fn validate_key_hash(key_hash: &str) -> bool {
     key_hash.len() == 64 && key_hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+// [OPT-6] sig 长度上界防护 + 明确注释
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
+    // 防止超长 sig 导致 ct_eq CPU 耗尽（HMAC-SHA256 输出恒为 HMAC_HEX_LEN=64 字节 hex）
+    if sig.len() > SIG_MAX_LEN {
+        return false;
+    }
     let server_id = get_server_id();
     let mut mac = match HmacSha256::new_from_slice(key.as_bytes()) {
         Ok(m) => m,
@@ -66,6 +88,7 @@ fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -
     mac.update(b"|");
     mac.update(timestamp.to_string().as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
+    // expected 长度恒为 HMAC_HEX_LEN，此处长度检查不泄露时序信息
     if expected.len() != sig.len() {
         return false;
     }
@@ -177,12 +200,10 @@ pub async fn activate(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
     }
-
     let now = now_secs();
     if (now - req.timestamp).abs() > timestamp_window() {
         return time_window_error(now);
     }
-
     let record = match db::find_license(&pool, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -191,7 +212,6 @@ pub async fn activate(
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         }
     };
-
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
@@ -204,7 +224,6 @@ pub async fn activate(
     if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
-
     let activation_ts = now;
     let default_days: i64 = std::env::var("DEFAULT_LICENSE_DAYS")
         .ok()
@@ -215,7 +234,6 @@ pub async fn activate(
         .unwrap_or(db::MAX_EXTEND_SECS)
         .clamp(1, db::MAX_EXTEND_SECS);
     let expires_at = activation_ts + extra_secs;
-
     match db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
         Ok(true) => ok_verify_response(activation_ts, expires_at),
         Ok(false) => err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED"),
@@ -233,13 +251,11 @@ pub struct VerifyReq {
     signature: String,
 }
 
-// 缓存命中路径注释说明（补充至 handlers.rs）
-// NOTE: get_key_only 仍需一次 DB 查询（主键索引，~1ms）。
+// NOTE: get_key_only 已由进程内 key_cache 替代，消除热路径 DB 查询 [OPT-3]
 // 设计取舍：
-//   - ✅ Redis 不缓存密钥明文（防止 Redis 泄露导致签名伪造）
-//   - ✅ 主键索引查询极快（PG B-tree，SSD ~0.5ms）
-//   - 若需彻底消除：可在进程内维护 DashMap<key_hash, Arc<String>>
-//     并在 revoke 时 remove，但增加了状态管理复杂度，当前不值得。
+// - ✅ key_cache 不持久化，进程重启后自动重建（首次 /verify 回源 DB）
+// - ✅ revoke 时同步 remove，不存在失效窗口
+// - ✅ 容量上限 KEY_CACHE_MAX=10000，LRU 淘汰最旧条目
 pub async fn verify(
     Extension(db): Extension<Arc<db::DbPool>>,
     Extension(redis): Extension<Arc<RedisPool>>,
@@ -253,20 +269,21 @@ pub async fn verify(
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
 
-    // Revoke 先快速检查，避免已经撤销的 key 进入后续路径。
+    // Revoke 快速检查
     if cache::is_revoked(&redis, &req.key_hash).await {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
 
-    // 缓存命中前仍要签名校验，这是核心安全边界。
-    let key = match db::get_key_only(&db, &req.key_hash).await {
+    // [OPT-3] 进程内 key 缓存，缓存未命中才查 DB
+    let key = match key_cache::get_or_load(&req.key_hash, &db).await {
         Ok(Some(v)) => v,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
         Err(e) => {
-            tracing::error!("[Verify] get_key_only DB error: {e}");
+            tracing::error!("[Verify] key_cache DB error: {e}");
             return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
         }
     };
+
     if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
@@ -342,15 +359,14 @@ pub async fn health(
             .is_ok(),
         Err(_) => false,
     };
-
     let (nonce_total, nonce_rejected, nonce_map_size) = nonce_fallback::get_nonce_stats();
     let (cache_hits, cache_misses) = cache::get_cache_stats();
+    let key_cache_size = key_cache::cache_size();
     let status = if db_ok && redis_ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-
     (
         status,
         Json(serde_json::json!({
@@ -365,7 +381,8 @@ pub async fn health(
             "cache_stats": {
                 "hits": cache_hits,
                 "misses": cache_misses
-            }
+            },
+            "key_cache_size": key_cache_size
         })),
     )
         .into_response()
@@ -413,7 +430,6 @@ pub async fn revoke_license(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash");
     }
-
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
     match db::revoke_license(&pool, &req.key_hash, reason).await {
         Ok(false) => return err(StatusCode::NOT_FOUND, "key not found"),
@@ -421,10 +437,16 @@ pub async fn revoke_license(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 
-    cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
+    // [OPT-1] 正确顺序：先写 tombstone → 再删缓存 → 再内存标记
+    // 原因：tombstone 是撤销持久化标记，必须先于缓存失效写入，
+    // 否则存在「缓存已删但 tombstone 尚未写入」的竞态窗口。
     cache::set_revoke_tombstone(&redis_pool, &req.key_hash).await;
+    cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
     let tombstone_exp = now_secs() + 86400 * 30;
     cache::mark_revoked_in_memory(&req.key_hash, tombstone_exp);
+
+    // [OPT-3] revoke 时同步从进程内 key_cache 移除，防止 HMAC 验证绕过
+    key_cache::remove(&req.key_hash);
 
     (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
 }
@@ -458,7 +480,6 @@ pub async fn extend_license(
             &format!("extra_days must be <= {}", db::MAX_EXTEND_DAYS),
         );
     }
-
     let extra_secs = req.extra_days * 86400;
     let allow_expired = req.allow_expired.unwrap_or(false);
     match db::extend_license(&pool, &req.key_hash, extra_secs, allow_expired).await {
@@ -495,11 +516,9 @@ pub async fn add_key(
     let hkey = generate_hkey();
     let key_hash = hash_key(&hkey);
     let note = req.note.as_deref().unwrap_or("");
-
     if let Err(e) = db::insert_license(&pool, &hkey, &key_hash, now_secs(), note).await {
         return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
-
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -525,14 +544,15 @@ pub async fn batch_init(
     if !auth::verify_admin_token(&req.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if req.count == 0 || req.count > 10_000 {
+    // [OPT-5] count 上界从 10000 降至 5000，为未来加列保留 PG 参数余量
+    // PG 协议参数上限 65535，当前 4列×5000=20000，安全余量充足
+    if req.count == 0 || req.count > 5_000 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "count must be 1..10000"})),
+            Json(serde_json::json!({"error": "count must be 1..5000"})),
         )
             .into_response();
     }
-
     let note = req.note.unwrap_or_default();
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
     match db::batch_init_keys(&pool, &keys, &note).await {

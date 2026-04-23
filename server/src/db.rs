@@ -1,4 +1,8 @@
-// server/src/db.rs
+// server/src/db.rs — 优化版
+//
+// [OPT-4 FIX] now_db() 防 panic + 防溢出
+// [OPT-5 FIX] batch_init_keys 分批执行（每批 2000 条），明确 PG 参数上限注释
+
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,11 +11,18 @@ pub type DbPool = PgPool;
 pub const MAX_EXTEND_DAYS: i64 = 3650;
 pub const MAX_EXTEND_SECS: i64 = MAX_EXTEND_DAYS * 86400;
 
+// PG 协议参数上限为 65535（$1..$65535）
+// 当前 INSERT 有 4 列，每批 2000 条 = 8000 参数，安全余量充足
+// 若未来增加列数，须同步调整 BATCH_SIZE 保证 列数×BATCH_SIZE ≤ 60000
+const BATCH_SIZE: usize = 2_000;
+
+// [OPT-4] 防 panic（时钟早于 UNIX_EPOCH）+ 防溢出（u64 as i64 截断）
 fn now_db() -> i64 {
-    SystemTime::now()
+    let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+        .unwrap_or_default()
+        .as_secs();
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 pub fn hash_key(key: &str) -> String {
@@ -42,7 +53,6 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-
     let pool = PgPoolOptions::new()
         .max_connections(max_conn)
         .min_connections(min_conn)
@@ -51,17 +61,16 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .max_lifetime(Duration::from_secs(1800))
         .connect(database_url)
         .await?;
-
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS licenses (
-            key          TEXT    NOT NULL,
-            key_hash     TEXT    PRIMARY KEY,
+            key TEXT NOT NULL,
+            key_hash TEXT PRIMARY KEY,
             activation_ts BIGINT NOT NULL DEFAULT 0,
-            expires_at   BIGINT  NOT NULL DEFAULT 0,
-            revoked      BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at   BIGINT  NOT NULL,
-            last_check   BIGINT,
-            note         TEXT    NOT NULL DEFAULT ''
+            expires_at BIGINT NOT NULL DEFAULT 0,
+            revoked BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at BIGINT NOT NULL,
+            last_check BIGINT,
+            note TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&pool)
@@ -73,8 +82,7 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires
-         ON licenses (expires_at)
-         WHERE revoked = FALSE AND activation_ts > 0",
+         ON licenses (expires_at) WHERE revoked = FALSE AND activation_ts > 0",
     )
     .execute(&pool)
     .await?;
@@ -88,8 +96,7 @@ pub async fn find_license(
     key_hash: &str,
 ) -> Result<Option<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses WHERE key_hash = $1",
     )
     .bind(key_hash)
@@ -132,8 +139,7 @@ pub async fn activate_license(
     expires_at: i64,
 ) -> Result<bool, sqlx::Error> {
     let r = sqlx::query(
-        "UPDATE licenses
-         SET activation_ts = $1, expires_at = $2
+        "UPDATE licenses SET activation_ts = $1, expires_at = $2
          WHERE key_hash = $3 AND activation_ts = 0 AND revoked = FALSE",
     )
     .bind(activation_ts)
@@ -174,7 +180,6 @@ pub async fn extend_license(
 ) -> Result<Option<i64>, sqlx::Error> {
     let now = now_db();
     let extra_secs = extra_secs.clamp(1, MAX_EXTEND_SECS);
-
     if allow_expired {
         sqlx::query_scalar::<_, i64>(
             "UPDATE licenses
@@ -191,8 +196,7 @@ pub async fn extend_license(
         sqlx::query_scalar::<_, i64>(
             "UPDATE licenses
              SET expires_at = expires_at + $2
-             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0
-               AND expires_at > $1
+             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0 AND expires_at > $1
              RETURNING expires_at",
         )
         .bind(now)
@@ -205,14 +209,16 @@ pub async fn extend_license(
 
 pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses ORDER BY created_at DESC LIMIT 10000",
     )
     .fetch_all(pool)
     .await
 }
 
+// [OPT-5] 分批插入，每批 BATCH_SIZE=2000 条
+// 约束：PG 协议参数上限 65535；4列 × 2000 = 8000，安全余量充足
+// 若增加 INSERT 列数，须同步调整 BATCH_SIZE：BATCH_SIZE = 60000 / 列数
 pub async fn batch_init_keys(
     pool: &DbPool,
     keys: &[String],
@@ -221,25 +227,27 @@ pub async fn batch_init_keys(
     if keys.is_empty() {
         return Ok(());
     }
-
     let now = now_db();
-    let key_hashes: Vec<String> = keys.iter().map(|k| hash_key(k)).collect();
-    let created_ats = vec![now; keys.len()];
-    let notes = vec![note.to_string(); keys.len()];
 
-    // UNNEST列顺序：$1=key, $2=key_hash, $3=created_at, $4=note
-    // 与INSERT列顺序严格对应，修改任意一侧时必须同步修改另一侧
-    sqlx::query(
-        "INSERT INTO licenses (key, key_hash, created_at, note)
-         SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[])
-         ON CONFLICT (key_hash) DO NOTHING",
-    )
-    .bind(keys)
-    .bind(&key_hashes)
-    .bind(&created_ats)
-    .bind(&notes)
-    .execute(pool)
-    .await?;
+    for chunk in keys.chunks(BATCH_SIZE) {
+        let key_hashes: Vec<String> = chunk.iter().map(|k| hash_key(k)).collect();
+        let created_ats = vec![now; chunk.len()];
+        let notes = vec![note.to_string(); chunk.len()];
+
+        // UNNEST 列顺序：$1=key, $2=key_hash, $3=created_at, $4=note
+        // 与 INSERT 列顺序严格对应，修改任意一侧时必须同步修改另一侧
+        sqlx::query(
+            "INSERT INTO licenses (key, key_hash, created_at, note)
+             SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[], $4::text[])
+             ON CONFLICT (key_hash) DO NOTHING",
+        )
+        .bind(chunk)
+        .bind(&key_hashes)
+        .bind(&created_ats)
+        .bind(&notes)
+        .execute(pool)
+        .await?;
+    }
 
     tracing::info!("[DB] batch_init_keys: {} keys inserted", keys.len());
     Ok(())
