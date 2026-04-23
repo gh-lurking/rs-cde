@@ -8,11 +8,10 @@ use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
-use crate::cache::Ordering::SeqCst;
-// use std::sync::atomic::Ordering::SeqCst;
 
 pub type RedisPool = Pool;
 const KEY_NS: &str = "lc:v1:";
@@ -103,25 +102,28 @@ pub fn mark_revoked_in_memory(key_hash: &str, expires_at: i64) {
 }
 
 pub fn start_cache_cleanup_task() {
-    if CACHE_CLEANUP_STARTED.compare_exchange(false, true, SeqCst, SeqCst).is_err() { return; }
+    if CACHE_CLEANUP_STARTED
+        .compare_exchange(false, true, SeqCst, SeqCst)
+        .is_err()
+    {
+        return;
+    }
     tokio::spawn(async {
         loop {
-            cleanup_memory_revokes_once().await;   // ✅ 单次 GC，不含 loop
-            tracing::debug!("[Cache] GC tick done");
+            cleanup_memory_revokes_once().await;
             tokio::time::sleep(Duration::from_secs(300)).await;
         }
     });
 }
 
 async fn cleanup_memory_revokes_once() {
-    // ✅ 单次扫描，不含 loop
     let map = memory_revoke_map();
     let now = now_ts();
     let before = map.len();
     map.retain(|_, exp| *exp > now);
     let cleaned = before - map.len();
     if cleaned > 0 {
-        tracing::info!("[Cache] GC 清理 {} 条过期 revoke 记录", cleaned);
+        tracing::info!("[Cache] GC cleaned {} expired revoke records", cleaned);
     }
 }
 
@@ -139,12 +141,12 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
 
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
     if entry.activation_ts <= 0 || entry.expires_at <= 0 {
-        tracing::warn!("[Cache] 跳过零值缓存写入: {}", key_hash);
+        tracing::warn!("[Cache] skip invalid cache write: {}", key_hash);
         return;
     }
     if entry.activation_ts >= entry.expires_at {
         tracing::warn!(
-            "[Cache] 跳过逻辑异常缓存: act={} >= exp={}",
+            "[Cache] skip inconsistent cache write: act={} >= exp={}",
             entry.activation_ts,
             entry.expires_at
         );
@@ -187,13 +189,10 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
     let Ok(mut conn) = pool.get().await else {
         return false;
     };
-
-    // [BUG-H1 FIX] 局部变量复用，消除重复 String 分配
     let tkey = tombstone_key(key_hash);
 
     match conn.get::<_, Option<String>>(&tkey).await {
         Ok(Some(_)) => {
-            // [BUG-C1 FIX] TTL 查询失败时降级为 MIN_MEMORY_REVOKE_TTL(60s)
             let remaining_ttl: i64 = redis::cmd("TTL")
                 .arg(&tkey)
                 .query_async(&mut conn)
@@ -210,7 +209,7 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
         }
         Ok(None) => false,
         Err(e) => {
-            tracing::warn!("[Cache] tombstone 查询失败: {}", e);
+            tracing::warn!("[Cache] tombstone read failed: {}", e);
             false
         }
     }
