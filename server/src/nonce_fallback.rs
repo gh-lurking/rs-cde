@@ -1,7 +1,7 @@
-// server/src/nonce_fallback.rs — 优化版
+// server/src/nonce_fallback.rs — 优化版 v2
 //
 // [OPT-2 FIX] check_and_store：内存满时先同步 GC 过期条目，再判断是否可插入
-//             避免 GC 任务 30s 间隔期间所有合法请求被拒绝（BUG-EXP-3）
+// 避免 GC 任务 30s 间隔期间所有合法请求被拒绝（BUG-EXP-3）
 //
 // 与 CLAUDE.md §2 「Simplicity First」一致：不引入新抽象，仅在 check_and_store 内增加 GC 调用
 
@@ -20,9 +20,9 @@ struct NonceEntry {
 }
 
 const MAX_NONCE_ENTRIES: usize = 500_000;
-
 static MEMORY_NONCES: Lazy<Arc<DashMap<String, NonceEntry>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
+
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 static NONCE_CHECKED_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NONCE_REJECTED_COUNT: AtomicUsize = AtomicUsize::new(0);

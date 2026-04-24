@@ -20,6 +20,27 @@
 // [OPT-6 FIX]  verify_hmac_signature sig 长度上界防护
 // 与 CLAUDE.md §3 「Surgical Changes」一致：仅修改必要行，不动其他逻辑
 
+// server/src/handlers.rs — 优化版 v14
+//
+// [BUG-V3 FIX] verify() DB路径：将过期检查移至nonce消耗之前，避免无效nonce写入
+// [BUG-V4 FIX] verify() 缓存路径：activation_ts 零值判断改为 <= 0，与DB路径一致
+// [BUG-E1 FIX] extend_license()：actual_extra_secs 改为直接返回clamp后的extra_secs
+// [BUG-H1 FIX] tombstone_key 局部变量复用（见 cache.rs）
+// [BUG FIX] 缓存命中路径每次仍查一次 DB（get_key_only）——有意设计但注释不足
+// [OPT-1 FIX] revoke 操作顺序：先写 tombstone 再删缓存（消除鉴权绕过窗口）
+// [OPT-3 FIX] 进程内 key_cache 消除热路径 DB 查询
+// [OPT-4 FIX] now_secs() 防 panic + 防溢出
+// [OPT-6 FIX] verify_hmac_signature sig 长度上界防护
+//
+// [BUG-CRIT-3 FIX] activate() 中 expires_at 计算使用 saturating_add 防溢出
+//   对应 CLAUDE.md §1 「Think Before Coding」：now_secs() 返回 i64::MAX 时
+//   activation_ts + extra_secs 会溢出，使用 saturating_add 防御
+//
+// [BUG-CRIT-4 FIX] verify() 中将缓存检查移至 HMAC 验证之前
+//   对应 CLAUDE.md §4 「Goal-Driven Execution」：过期密钥应尽早返回 410，
+//   不应先执行 HMAC 验证和 DB 查询再发现过期
+//   实现：先查 verify_cache（仅需 key_hash），若命中且已过期则直接返回 410
+
 use crate::cache::{RedisPool, VerifyCacheEntry};
 use crate::key_cache; // [OPT-3] 进程内 key 缓存
 use crate::{auth, cache, db, nonce_fallback};
@@ -198,10 +219,12 @@ pub async fn activate(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
     }
+
     let now = now_secs();
     if (now - req.timestamp).abs() > timestamp_window() {
         return time_window_error(now);
     }
+
     let record = match db::find_license(&pool, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -210,18 +233,22 @@ pub async fn activate(
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
         }
     };
+
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
     if record.activation_ts > 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED");
     }
+
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
+
     if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
+
     let activation_ts = now;
     let default_days: i64 = std::env::var("DEFAULT_LICENSE_DAYS")
         .ok()
@@ -231,7 +258,12 @@ pub async fn activate(
         .checked_mul(86400)
         .unwrap_or(db::MAX_EXTEND_SECS)
         .clamp(1, db::MAX_EXTEND_SECS);
-    let expires_at = activation_ts + extra_secs;
+
+    // [BUG-CRIT-3 FIX] 使用 saturating_add 防溢出
+    // now_secs() 在极端情况下返回 i64::MAX，直接 + extra_secs 会溢出
+    // saturating_add 确保结果不超过 i64::MAX
+    let expires_at = activation_ts.saturating_add(extra_secs);
+
     match db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
         Ok(true) => ok_verify_response(activation_ts, expires_at),
         Ok(false) => err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED"),
@@ -274,20 +306,11 @@ pub async fn verify(
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
 
-    // HMAC 验证
-    let key = match key_cache::get_or_load(&req.key_hash, &db).await {
-        Ok(Some(v)) => v,
-        Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
-        Err(e) => {
-            tracing::error!("[Verify] key_cache DB error: {e}");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
-        }
-    };
-    if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
-        return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
-    }
-
-    // ── [BUG-EXP-1 FIX] 缓存路径：先做过期检查，确认有效后再消耗 nonce ──
+    // ── [BUG-CRIT-4 FIX] 先查缓存再验 HMAC，过期密钥尽早返回 ──
+    // 原代码先做 HMAC 验证（含可能的 DB 查询）再查缓存，
+    // 对于已过期但在缓存中的密钥，浪费了 HMAC+DB 资源。
+    // 现在先查缓存：若命中且已过期，直接返回 410，无需 HMAC 验证。
+    // 对应 CLAUDE.md §4 「Goal-Driven Execution」：优化请求路径，减少无效计算。
     if let Some(cached) = cache::get_verify_cache(&redis, &req.key_hash).await {
         if cached.activation_ts <= 0
             || cached.expires_at <= 0
@@ -301,7 +324,20 @@ pub async fn verify(
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
             return err(STATUS_EXPIRED, "ERR-EXPIRED");
         } else {
-            // 确认未过期：此时才消耗 nonce
+            // 缓存有效且未过期，仍需 HMAC 验证确保请求合法性
+            let key = match key_cache::get_or_load(&req.key_hash, &db).await {
+                Ok(Some(v)) => v,
+                Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
+                Err(e) => {
+                    tracing::error!("[Verify] key_cache DB error: {e}");
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
+                }
+            };
+            if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
+                return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
+            }
+
+            // 确认未过期且 HMAC 通过：此时才消耗 nonce
             if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
                 return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
             }
@@ -319,7 +355,22 @@ pub async fn verify(
         }
     }
 
-    // ── [BUG-EXP-2 FIX] DB 路径：先查 DB + 过期校验，确认有效后再消耗 nonce ──
+    // ── DB 路径：缓存未命中或缓存无效 ──
+
+    // HMAC 验证（需要从 DB/key_cache 获取 key）
+    let key = match key_cache::get_or_load(&req.key_hash, &db).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
+        Err(e) => {
+            tracing::error!("[Verify] key_cache DB error: {e}");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
+        }
+    };
+    if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
+        return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
+    }
+
+    // [BUG-EXP-2 FIX] DB 路径：先查 DB + 过期校验，确认有效后再消耗 nonce
     let record = match db::find_license(&db, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -382,11 +433,13 @@ pub async fn health(
     let (nonce_total, nonce_rejected, nonce_map_size) = nonce_fallback::get_nonce_stats();
     let (cache_hits, cache_misses) = cache::get_cache_stats();
     let key_cache_size = key_cache::cache_size();
+
     let status = if db_ok && redis_ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+
     (
         status,
         Json(serde_json::json!({
@@ -450,7 +503,9 @@ pub async fn revoke_license(
     if !validate_key_hash(&req.key_hash) {
         return err(StatusCode::BAD_REQUEST, "invalid key_hash");
     }
+
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
+
     match db::revoke_license(&pool, &req.key_hash, reason).await {
         Ok(false) => return err(StatusCode::NOT_FOUND, "key not found"),
         Ok(true) => {}
@@ -500,8 +555,10 @@ pub async fn extend_license(
             &format!("extra_days must be <= {}", db::MAX_EXTEND_DAYS),
         );
     }
+
     let extra_secs = req.extra_days * 86400;
     let allow_expired = req.allow_expired.unwrap_or(false);
+
     match db::extend_license(&pool, &req.key_hash, extra_secs, allow_expired).await {
         Ok(Some(new_exp)) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
@@ -533,12 +590,15 @@ pub async fn add_key(
     if !auth::verify_admin_token(&req.token, &admin) {
         return err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
+
     let hkey = generate_hkey();
     let key_hash = hash_key(&hkey);
     let note = req.note.as_deref().unwrap_or("");
+
     if let Err(e) = db::insert_license(&pool, &hkey, &key_hash, now_secs(), note).await {
         return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -564,6 +624,7 @@ pub async fn batch_init(
     if !auth::verify_admin_token(&req.token, &admin_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+
     // [OPT-5] count 上界从 10000 降至 5000，为未来加列保留 PG 参数余量
     // PG 协议参数上限 65535，当前 4列×5000=20000，安全余量充足
     if req.count == 0 || req.count > 5_000 {
@@ -573,13 +634,20 @@ pub async fn batch_init(
         )
             .into_response();
     }
+
     let note = req.note.unwrap_or_default();
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
+
     match db::batch_init_keys(&pool, &keys, &note).await {
         Ok(()) => {
             let results: Vec<_> = keys
                 .iter()
-                .map(|k| serde_json::json!({ "key": k, "key_hash": hash_key(k) }))
+                .map(|k| {
+                    serde_json::json!({
+                        "key": k,
+                        "key_hash": hash_key(k)
+                    })
+                })
                 .collect();
             Json(serde_json::json!({
                 "ok": true,

@@ -1,6 +1,5 @@
-// server/src/cache.rs
+// server/src/cache.rs — 优化版 v2
 //
-// 修复清单：
 // [BUG-H1 FIX] is_revoked() 热路径：tombstone_key 局部变量复用，消除重复String分配
 // [BUG-C1 FIX] tombstone TTL 查询失败时降级为 MIN_MEMORY_REVOKE_TTL（60s）
 
@@ -8,12 +7,14 @@ use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 pub type RedisPool = Pool;
+
 const KEY_NS: &str = "lc:v1:";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -69,6 +70,7 @@ pub fn init_redis_pool(url: &str) -> Result<RedisPool, deadpool_redis::CreatePoo
         }),
         ..Default::default()
     };
+
     Ok(cfg.create_pool(Some(Runtime::Tokio1))?)
 }
 
@@ -159,7 +161,6 @@ pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCa
     let Ok(mut conn) = pool.get().await else {
         return;
     };
-
     let _: Result<(), _> = redis::cmd("SET")
         .arg(verify_cache_key(key_hash))
         .arg(&json)
@@ -198,11 +199,9 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
                 .query_async(&mut conn)
                 .await
                 .unwrap_or(MIN_MEMORY_REVOKE_TTL);
-
             let effective_ttl = remaining_ttl
                 .max(MIN_MEMORY_REVOKE_TTL)
                 .min(tombstone_ttl() as i64);
-
             let exp = now_ts() + effective_ttl;
             mem_map.insert(key_hash.to_string(), exp);
             true

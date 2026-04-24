@@ -1,10 +1,15 @@
-// client/src/time_guard.rs
+// client/src/time_guard.rs — 优化版 v2
 //
 // [C-03 FIX]  时间大幅跳跃（>3600s）时保守处理，校验 License 而非直接退出
 // [BUG-10 FIX] watchdog Ok(_) 正常退出也触发退出（含清晰注释）
 // [OPT]       MONITOR_STARTED AtomicBool 防重复启动
 // [BUG-14 FIX] EXPIRY_TIME=0 时报错退出（不再静默 continue）
 // [BUG-T1 FIX] ROLLBACK_TOLERANCE_SECS 默认 300s，与 TIMESTAMP_WINDOW_SECS 一致
+// [BUG-CRIT-5 FIX] 大时钟跳跃后不再使用 continue 跳过过期检查
+//   对应 CLAUDE.md §1 「Think Before Coding」：
+//   原代码在 current > last + 3600 且 current < expiry 时使用 continue，
+//   跳过了本轮正常的 expiry 检查，多出 15 秒过期盲区。
+//   修复：设置重验证标志后继续执行正常的过期检查，不跳过。
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
@@ -71,6 +76,7 @@ fn monitor_loop() {
     let tolerance = rollback_tolerance_secs();
     loop {
         thread::sleep(Duration::from_secs(15));
+
         let current = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -82,28 +88,37 @@ fn monitor_loop() {
             tracing::error!("[TimeGuard] EXPIRY_TIME not initialized");
             std::process::exit(1);
         }
+
+        // 时钟回拨检测
         if current < last - tolerance {
             tracing::error!("[TimeGuard] clock rollback detected");
             std::process::exit(1);
         }
+
+        // 大时钟跳跃处理
         if current > last + 3600 {
             if current >= expiry {
                 tracing::error!("[TimeGuard] expired after large clock jump");
                 std::process::exit(1);
             }
-            // [BUG-EXP-3 FIX] 大跳跃但未过期：触发重新联网验证，不静默放行
+            // [BUG-CRIT-5 FIX] 设置重验证标志后不跳过本轮检查
+            // 原代码在此处使用 continue，导致跳过下方正常过期检查，
+            // 多出 15 秒过期盲区。现在 fall through 到正常检查路径。
             tracing::warn!(
                 "[TimeGuard] large clock jump +{}s, requesting revalidation",
                 current - last
             );
             NEEDS_REVALIDATION.store(true, Ordering::SeqCst);
             LAST_VALID_TIME.store(current, Ordering::SeqCst);
-            continue;
+            // 不 continue，继续执行下方的正常过期检查
         }
+
+        // 正常过期检查
         if current >= expiry {
             tracing::error!("[TimeGuard] license expired");
             std::process::exit(1);
         }
+
         LAST_VALID_TIME.store(current, Ordering::SeqCst);
     }
 }

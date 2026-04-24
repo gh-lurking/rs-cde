@@ -3,6 +3,7 @@
 // ✅ BUG-10 FIX: 地理检测两层降级，网络不可用时退出而非忽略
 use reqwest::Client;
 use std::process;
+use std::time::Duration;
 mod cn_cidr;
 mod geo_check;
 mod license_guard;
@@ -27,6 +28,21 @@ async fn main() {
     println!("✅ Your license is valid");
 
     run_client().await;
+
+    // [BUG-CRIT-1 FIX] 主循环：消费 time_guard 的重验证请求
+    // time_guard 在检测到大时钟跳跃时设置 NEEDS_REVALIDATION 标志，
+    // 主循环每 30 秒检查一次，触发时调用 check_and_enforce() 重新联网验证。
+    // 对应 CLAUDE.md §4 「Goal-Driven Execution」：标志必须被消费，否则是死信。
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        if time_guard::take_revalidation_request() {
+            tracing::warn!("[Main] revalidation requested by time_guard, re-checking license...");
+            license_guard::check_and_enforce().await;
+            tracing::info!("[Main] revalidation completed, license still valid");
+        }
+        // 业务代码也应周期性检查 take_revalidation_request()
+    }
 }
 
 async fn loc_detection() {
@@ -41,7 +57,7 @@ async fn loc_detection() {
             process::exit(1);
         }
         Ok(false) => {
-            println!("✅ Your country (region) is supported.")
+            println!("✅ Your country (region) is supported.");
         }
         Err(e) => {
             eprintln!("Failure with DETECTION ONE: {e}");

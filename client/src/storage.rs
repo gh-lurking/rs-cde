@@ -1,9 +1,15 @@
-// client/src/storage.rs
+// client/src/storage.rs — 优化版 v2
 //
 // [BUG-S1 FIX] 投票 quorum 阈值：动态多数 (read_count/2)+1，而非固定 >= 2
 // [BUG-S2 NOTE] validate_and_return 中 act_ts 零值检查已添加
-//               (time_guard + validate_system_time 保护时钟回拨)
+// (time_guard + validate_system_time 保护时钟回拨)
 // [BUG-01 FIX + C-01 FIX] act_ts == 0 / exp_ts == 0 提前拒绝
+//
+// [BUG-CRIT-2 FIX] 新增 LocalReadResult::Expired 变体，区分"过期"与"篡改"
+//   对应 CLAUDE.md §1 「Think Before Coding」：
+//   原代码将 now >= exp_ts 返回 Tampered，导致用户看到误导的 "tampered" 错误，
+//   无法区分真实数据损坏与正常过期。现在返回 Expired 变体，
+//   调用方 license_guard.rs 可给出准确的 "key expired (local)" 提示。
 
 use aes_gcm::{
     aead::{Aead, OsRng},
@@ -11,13 +17,13 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
-
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_LICENSE_PERIOD: u64 = 10 * 365 * 86400;
+
 static WRITE_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 static READ_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -32,11 +38,18 @@ pub fn _get_storage_stats() -> (u64, u64, u64, u64) {
     )
 }
 
+// [BUG-CRIT-2 FIX] 新增 Expired 变体
+// 与 CLAUDE.md §1 「Think Before Coding」一致：区分过期与篡改，
+// 让调用方能给出准确的错误信息
 pub enum LocalReadResult {
     Insufficient {
         read_count: usize,
     },
     Tampered {
+        read_count: usize,
+    },
+    Expired {
+        value: (u64, u64),
         read_count: usize,
     },
     Success {
@@ -58,7 +71,6 @@ fn derive_path(hkey: &str, salt: &str, slot: u8) -> PathBuf {
     // [BUG-M1 NOTE] debug_assert + release 安全截断
     debug_assert!(slot < 16, "slot must be < 16 to prevent path collision");
     let slot = slot.min(15);
-
     let mut h = sha2::Sha256::new();
     use sha2::Digest;
     h.update(hkey.as_bytes());
@@ -93,7 +105,6 @@ fn write_slot(
     if let Some(p) = path.parent() {
         let _ = fs::create_dir_all(p);
     }
-
     let mut out = nonce_bytes.to_vec();
     out.extend_from_slice(&ct);
     fs::write(path, &out).map_err(|e| format!("write: {e}"))?;
@@ -133,6 +144,7 @@ pub fn write_all_replicas(hkey: &str, salt: &str, activation_ts: u64, expires_at
 }
 
 // [BUG-EXP-4 FIX] validate_and_return 增加 now >= exp_ts 的过期检查
+// [BUG-CRIT-2 FIX] 过期时返回 Expired 而非 Tampered
 // 与 CLAUDE.md §2「Simplicity First」一致：单一函数自完备，调用方无需外部检查
 fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) -> LocalReadResult {
     let now_u64 = SystemTime::now()
@@ -157,10 +169,13 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
     if act_ts >= exp_ts {
         return LocalReadResult::Tampered { read_count };
     }
-    // [BUG-EXP-4 NEW] 已过期检查（自完备）
-    // 原代码依赖外部调用方做 now >= local_expires 检查，存在新增调用路径时遗漏的风险
+    // [BUG-CRIT-2 FIX] 已过期 → 返回 Expired 而非 Tampered
+    // 调用方可根据变体给出准确的错误提示
     if now_u64 >= exp_ts {
-        return LocalReadResult::Tampered { read_count };
+        return LocalReadResult::Expired {
+            value: val,
+            read_count,
+        };
     }
 
     LocalReadResult::Success {
@@ -173,7 +188,6 @@ fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) 
 pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     let key = derive_key(hkey, salt);
     let mut values: Vec<(u64, u64)> = Vec::with_capacity(3);
-
     for slot in 0..3u8 {
         let path = derive_path(hkey, salt, slot);
         if let Some(pair) = read_slot(&path, &key) {
@@ -182,7 +196,6 @@ pub fn read_local_record(hkey: &str, salt: &str) -> LocalReadResult {
     }
 
     let read_count = values.len();
-
     // 至少 2 个副本才能投票
     if read_count < 2 {
         return LocalReadResult::Insufficient { read_count };
