@@ -73,7 +73,6 @@ fn validate_key_hash(key_hash: &str) -> bool {
 
 // [OPT-6] sig 长度上界防护 + 明确注释
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
-    // 防止超长 sig 导致 ct_eq CPU 耗尽（HMAC-SHA256 输出恒为 HMAC_HEX_LEN=64 字节 hex）
     if sig.len() > SIG_MAX_LEN {
         return false;
     }
@@ -88,7 +87,6 @@ fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -
     mac.update(b"|");
     mac.update(timestamp.to_string().as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
-    // expected 长度恒为 HMAC_HEX_LEN，此处长度检查不泄露时序信息
     if expected.len() != sig.len() {
         return false;
     }
@@ -262,6 +260,8 @@ pub async fn verify(
     Json(req): Json<VerifyReq>,
 ) -> axum::response::Response {
     let now = now_secs();
+
+    // ── 基础校验（不消耗 nonce）
     if (now - req.timestamp).abs() > timestamp_window() {
         return time_window_error(now);
     }
@@ -274,7 +274,7 @@ pub async fn verify(
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
 
-    // [OPT-3] 进程内 key 缓存，缓存未命中才查 DB
+    // HMAC 验证
     let key = match key_cache::get_or_load(&req.key_hash, &db).await {
         Ok(Some(v)) => v,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -283,14 +283,11 @@ pub async fn verify(
             return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
         }
     };
-
     if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
-    if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
-        return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
-    }
 
+    // ── [BUG-EXP-1 FIX] 缓存路径：先做过期检查，确认有效后再消耗 nonce ──
     if let Some(cached) = cache::get_verify_cache(&redis, &req.key_hash).await {
         if cached.activation_ts <= 0
             || cached.expires_at <= 0
@@ -298,14 +295,31 @@ pub async fn verify(
         {
             tracing::warn!("[Verify] invalid cached entry, fallback to DB path");
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
+            // fall through to DB path
         } else if now >= cached.expires_at {
+            // [BUG-EXP-1 FIX] 过期直接返回，不消耗 nonce
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
             return err(STATUS_EXPIRED, "ERR-EXPIRED");
         } else {
+            // 确认未过期：此时才消耗 nonce
+            if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
+                return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
+            }
+            // [BUG-CACHE-1 FIX] 缓存命中路径也更新 last_check
+            if should_update_last_check(&redis, &req.key_hash).await {
+                let db2 = Arc::clone(&db);
+                let kh = req.key_hash.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = db::update_last_check(&db2, &kh, now).await {
+                        tracing::warn!("[Verify] cache-hit update_last_check failed: {e}");
+                    }
+                });
+            }
             return ok_verify_response(cached.activation_ts, cached.expires_at);
         }
     }
 
+    // ── [BUG-EXP-2 FIX] DB 路径：先查 DB + 过期校验，确认有效后再消耗 nonce ──
     let record = match db::find_license(&db, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -324,8 +338,14 @@ pub async fn verify(
     if record.activation_ts >= record.expires_at {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-DATA-INCONSISTENCY");
     }
+    // [BUG-EXP-2 FIX] 过期检查在 nonce 消耗之前
     if now >= record.expires_at {
         return err(STATUS_EXPIRED, "ERR-EXPIRED");
+    }
+
+    // DB 路径确认有效：此时才消耗 nonce
+    if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
+        return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
 
     let entry = VerifyCacheEntry {

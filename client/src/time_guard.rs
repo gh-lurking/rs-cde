@@ -14,6 +14,9 @@ static LAST_VALID_TIME: AtomicI64 = AtomicI64::new(0);
 static EXPIRY_TIME: AtomicI64 = AtomicI64::new(0);
 static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
+// [BUG-EXP-3 NEW] 大时钟跳跃时通知主循环重新联网验证
+static NEEDS_REVALIDATION: AtomicBool = AtomicBool::new(false);
+
 fn rollback_tolerance_secs() -> i64 {
     std::env::var("ROLLBACK_TOLERANCE_SECS")
         .ok()
@@ -59,17 +62,19 @@ pub fn start_monitor() {
         .expect("Failed to spawn time-guard watchdog");
 }
 
+/// 主循环调用：检查是否需要重新联网验证（并清除标志）
+pub fn take_revalidation_request() -> bool {
+    NEEDS_REVALIDATION.swap(false, Ordering::SeqCst)
+}
+
 fn monitor_loop() {
     let tolerance = rollback_tolerance_secs();
-
     loop {
         thread::sleep(Duration::from_secs(15));
-
         let current = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-
         let last = LAST_VALID_TIME.load(Ordering::SeqCst);
         let expiry = EXPIRY_TIME.load(Ordering::SeqCst);
 
@@ -77,26 +82,28 @@ fn monitor_loop() {
             tracing::error!("[TimeGuard] EXPIRY_TIME not initialized");
             std::process::exit(1);
         }
-
         if current < last - tolerance {
             tracing::error!("[TimeGuard] clock rollback detected");
             std::process::exit(1);
         }
-
         if current > last + 3600 {
             if current >= expiry {
                 tracing::error!("[TimeGuard] expired after large clock jump");
                 std::process::exit(1);
             }
+            // [BUG-EXP-3 FIX] 大跳跃但未过期：触发重新联网验证，不静默放行
+            tracing::warn!(
+                "[TimeGuard] large clock jump +{}s, requesting revalidation",
+                current - last
+            );
+            NEEDS_REVALIDATION.store(true, Ordering::SeqCst);
             LAST_VALID_TIME.store(current, Ordering::SeqCst);
             continue;
         }
-
         if current >= expiry {
             tracing::error!("[TimeGuard] license expired");
             std::process::exit(1);
         }
-
         LAST_VALID_TIME.store(current, Ordering::SeqCst);
     }
 }

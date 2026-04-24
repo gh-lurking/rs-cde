@@ -231,6 +231,9 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
     }
 }
 
+// [BUG-NET-1 FIX] validate_system_time：过滤明显异常时间戳再求平均
+// 与 CLAUDE.md §1「Think Before Coding」一致：
+//   外部时间源可能返回 0 或极大值，防御性过滤
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -239,30 +242,39 @@ pub async fn validate_system_time() -> Result<(), String> {
 
     let min_ts: u64 = 1_704_067_200; // 2024-01-01
     let max_ts: u64 = local_now + 10 * 365 * 86400;
-
     if local_now < min_ts || local_now > max_ts {
         return Err(format!("系统时间 {} 超出合理范围", local_now));
     }
 
     let client = get_http_client();
-
-    // [OPT-2 FIX] 两个时间源并发请求
+    // [OPT-2] 两个时间源并发请求（保留）
     let (cf_ts, http_ts) = tokio::join!(
         get_time_from_cf_trace(client),
         get_time_from_http_date(client)
     );
-
     let timestamps: Vec<i64> = [cf_ts, http_ts].into_iter().flatten().collect();
-
     if timestamps.is_empty() {
         return Err("无法获取外部时间源，请检查网络连接".to_string());
     }
 
-    let avg_offset: i64 = timestamps
+    // [BUG-NET-1 FIX] 过滤明显异常时间戳（偏差超过 HARD_LIMIT * 10 直接丢弃）
+    let local_i64 = local_now as i64;
+    let filter_threshold = SYSTEM_TIME_HARD_LIMIT_SECS * 10; // 3000s
+    let valid_timestamps: Vec<i64> = timestamps
         .iter()
-        .map(|&t| local_now as i64 - t)
-        .sum::<i64>()
-        / timestamps.len() as i64;
+        .filter(|&&t| (local_i64 - t).abs() < filter_threshold)
+        .cloned()
+        .collect();
+
+    if valid_timestamps.is_empty() {
+        return Err(format!(
+            "所有外部时间源均返回异常值（本地时间 {}，过滤阈值 {}s）",
+            local_now, filter_threshold
+        ));
+    }
+
+    let avg_offset: i64 = valid_timestamps.iter().map(|&t| local_i64 - t).sum::<i64>()
+        / valid_timestamps.len() as i64;
 
     if avg_offset.abs() > SYSTEM_TIME_HARD_LIMIT_SECS {
         return Err(format!(
@@ -270,7 +282,6 @@ pub async fn validate_system_time() -> Result<(), String> {
             avg_offset, SYSTEM_TIME_HARD_LIMIT_SECS
         ));
     }
-
     if avg_offset.abs() > SYSTEM_TIME_WARN_SECS {
         tracing::warn!(
             "[Time] 时间偏差 {}s > {}s 警告阈值",
@@ -278,7 +289,6 @@ pub async fn validate_system_time() -> Result<(), String> {
             SYSTEM_TIME_WARN_SECS
         );
     }
-
     Ok(())
 }
 

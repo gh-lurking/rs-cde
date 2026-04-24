@@ -132,31 +132,34 @@ pub fn write_all_replicas(hkey: &str, salt: &str, activation_ts: u64, expires_at
     }
 }
 
+// [BUG-EXP-4 FIX] validate_and_return 增加 now >= exp_ts 的过期检查
+// 与 CLAUDE.md §2「Simplicity First」一致：单一函数自完备，调用方无需外部检查
 fn validate_and_return(val: (u64, u64), read_count: usize, repair_failed: bool) -> LocalReadResult {
     let now_u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-
     let (act_ts, exp_ts) = val;
 
     // [C-01 FIX + BUG-01 FIX] 零值必须最先拒绝
     if act_ts == 0 || exp_ts == 0 {
         return LocalReadResult::Tampered { read_count };
     }
-
     // 防未来时间戳（允许 5 分钟时钟偏差）
     if act_ts > now_u64 + 300 {
         return LocalReadResult::Tampered { read_count };
     }
-
     // 防超长有效期（超过 10 年视为篡改）
     if exp_ts > now_u64 + MAX_LICENSE_PERIOD {
         return LocalReadResult::Tampered { read_count };
     }
-
     // 逻辑一致性
     if act_ts >= exp_ts {
+        return LocalReadResult::Tampered { read_count };
+    }
+    // [BUG-EXP-4 NEW] 已过期检查（自完备）
+    // 原代码依赖外部调用方做 now >= local_expires 检查，存在新增调用路径时遗漏的风险
+    if now_u64 >= exp_ts {
         return LocalReadResult::Tampered { read_count };
     }
 
