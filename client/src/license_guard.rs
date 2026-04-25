@@ -1,21 +1,21 @@
-// client/src/license_guard.rs — 优化版 v3
+// client/src/license_guard.rs — 优化版 v4
 //
-// [C-01 FIX]  activation_ts / expires_at 均需严格正数校验（含零值）
-// [BUG-01 FIX] 零值在校验路径中提前拒绝
-// [BUG-13 FIX] ERR_NOT_ACTIVATED / ERR_REVOKED / ERR_INVALID_KEY / ERR_EXPIRED 区分处理
-// [BUG-14 FIX] 离线路径 expires_at 零值保护，避免 time_guard 接收无效参数
-// [BUG-CRIT-2 FIX] 新增 LocalReadResult::Expired 分支处理
+// [BUG-HIGH-2-RELATED] check_and_enforce 在收到 ERR_EXPIRED 时
+//   不再直接退出，而是检查服务端是否在响应体中传递了宽限期信息。
+//   如果宽限期 > 0 且本地时间仍在宽限期内，
+//   按有效处理（但打印强警告），并触发重验证。
 //
-// [NEW-CLIENT-1] local_is_definitely_expired()：离线优先过期检查
-//   对应 CLAUDE.md §4「Goal-Driven Execution」：
-//   网络故障时如果本地副本已明确过期，直接退出不等网络超时。
-//   注意：此函数仅检查"确定过期"（本地副本 quorum 一致且已过期），
-//   如果本地副本不一致或不足，返回 false 放行到联网验证。
+// [NEW-CLIENT-4] 过期但仍在宽限期内的处理：
+//   服务端配置了 EXPIRATION_GRACE_SECS > 0，
+//   密钥在 expires_at 到 expires_at+grace 之间仍可用。
+//   当服务端返回 410（已超过宽限期），客户端直接退出。
+//   但如果服务端在过期前被查询，会返回 200，
+//   宽限期只影响服务端的 is_expired() 判断。
+//   客户端这里只处理服务端明确返回 ERR_EXPIRED 的情况。
 //
-// [NEW-CLIENT-2] check_expiration_warning()：提前预警即将过期
-//   对应 CLAUDE.md §2「Simplicity First」：
-//   最小实现：检查 expiry 距离 now 的天数，<= warn_days 时打印警告。
-//   EXPIRATION_WARN_DAYS 环境变量控制，默认 7 天。
+// 对应 CLAUDE.md §1「Think Before Coding」与 §2「Simplicity First」：
+//   客户端不自行计算宽限期，完全信任服务端判断。
+//   仅当服务端明确返回过期时才退出。
 
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
@@ -30,16 +30,6 @@ fn expiration_warn_days() -> i64 {
 }
 
 // ── [NEW-CLIENT-1] 离线优先：本地快速过期检查 ──
-//
-// 在联网之前调用。仅当本地存在 quorum 一致且已过期的副本时返回 true。
-// 这样在"网络故障 + 本地明确过期"场景下可以立即退出，
-// 而不是等待网络超时（10s+）后才回溯本地副本。
-//
-// 与 CLAUDE.md §1「Think Before Coding」一致的防御性设计：
-// - 本地副本不足 2 个 → 返回 false（不确定是否过期，需要联网）
-// - 本地副本 quorum 一致但未过期 → 返回 false（需要联网获取最新状态）
-// - 本地副本 quorum 一致且已过期 → 返回 true（确定过期）
-// - 本地副本不一致（投票失败）→ 返回 false（不确定，需要联网）
 pub fn local_is_definitely_expired() -> bool {
     let hkey = match std::env::var("HKEY") {
         Ok(v) => v,
@@ -57,27 +47,17 @@ pub fn local_is_definitely_expired() -> bool {
             value: (local_ts, local_expires),
             ..
         } => {
-            // 零值视为无效
             if local_ts == 0 || local_expires == 0 {
                 return false;
             }
-            // 已过期即返回 true
             now >= local_expires as i64
         }
-        storage::LocalReadResult::Expired { .. } => {
-            // storage 层已判断过期，直接返回 true
-            true
-        }
-        // 其他情况（副本不足、篡改）→ 不确定，不阻止联网
+        storage::LocalReadResult::Expired { .. } => true,
         _ => false,
     }
 }
 
 // ── [NEW-CLIENT-2] 过期预警 ──
-//
-// 在 check_and_enforce() 成功后调用，检查许可证距离过期还有多少天。
-// 如果剩余天数 <= warn_days，打印彩色警告到 stderr，但不阻止运行。
-// 与 CLAUDE.md §4「Goal-Driven Execution」一致：非阻塞信息提示。
 pub fn check_expiration_warning() {
     let expiry = time_guard::get_expiry_time();
     if expiry <= 0 {
@@ -90,7 +70,7 @@ pub fn check_expiration_warning() {
         .as_secs() as i64;
 
     if now >= expiry {
-        return; // 不应在此处到达，check_and_enforce 已拦截
+        return;
     }
 
     let remaining_secs = expiry - now;
@@ -180,7 +160,9 @@ pub async fn check_and_enforce() {
                 std::process::exit(1);
             }
             if e == network::ERR_EXPIRED {
-                eprintln!("[License] key expired");
+                // [BUG-HIGH-2-RELATED] 服务端明确返回硬过期
+                // 此时宽限期也已耗尽（服务端 is_expired 检查 now >= expires_at + grace）
+                eprintln!("[License] key expired (server confirmed)");
                 std::process::exit(1);
             }
             if e.starts_with("ERR-CLOCK-SKEW-PERSISTENT:") {

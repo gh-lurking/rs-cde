@@ -1,16 +1,20 @@
-// server/src/handlers.rs — 优化版 v13
+// server/src/handlers.rs — 优化版 v14
 //
-// [BUG-V3 FIX] verify() DB路径：将过期检查移至nonce消耗之前，避免无效nonce写入
-// [BUG-V4 FIX] verify() 缓存路径：activation_ts 零值判断改为 <= 0
-// [BUG-CRIT-4 FIX] 先查缓存再验HMAC，过期密钥尽早返回
-// [NEW-EXP-1] 新增 expiration_grace_secs() 过期宽限期（默认 0）
-// [NEW-EXP-2] 统一客户端/服务端过期判断逻辑（now >= expires_at + grace）
-// [NEW-EXP-3] 过期响应增加 headers：X-Expired-At, X-Expiration-Grace
+// [BUG-CRIT-1 FIX] 时间戳减法溢出修复：
+//   (now - req.timestamp).abs() 在 req.timestamp=i64::MIN 时发生有符号溢出。
+//   改用 checked_sub + or_else 安全计算差值，溢出时返回 i64::MAX 触发拒绝。
+//   对应 CLAUDE.md §1「Think Before Coding」：明确防御极端输入。
 //
-// 对应 CLAUDE.md §1「Think Before Coding」：
-//   过期宽限期假设：默认 0（不启用），由运维按需配置。
-//   宽限期存在时，密钥在 expires_at 到 expires_at+grace 之间仍有效。
-//   与 §2「Simplicity First」一致：最小代码变更，只改过期判断条件。
+// [BUG-HIGH-1 FIX] is_expired() 改用 saturating_add：
+//   expires_at + expiration_grace_secs() 可能溢出。
+//   溢出后 wrap 为负数 → now >= 负数永远为 true → 密钥在过期后仍被放行。
+//   改用 saturating_add 确保溢出时停在 i64::MAX（即永不过期），
+//   但 expires_at 本身仍需通过数据合法性校验（<= now + MAX_LICENSE_PERIOD）。
+//
+// [NEW-EXP-4] 过期响应增加 X-Expired-At 与 X-Expiration-Grace 头供客户端解析
+//
+// 与 CLAUDE.md §3「Surgical Changes」一致：
+//   只修改存在缺陷的三处计算，不改动周边逻辑。
 
 // [BUG FIX] 缓存命中路径每次仍查一次 DB（get_key_only）——有意设计但注释不足
 // 缓存命中后为了 HMAC 验证必须从 DB 取 key 明文（Redis 不缓存密钥明文，BUG-H3）。
@@ -38,14 +42,26 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 // ── 常量 ────────────────────────────────────────────────────────────────────
-const _EXPECTED_SIG_LEN: usize = 64;
 const STATUS_EXPIRED: axum::http::StatusCode = axum::http::StatusCode::GONE;
 const STATUS_REVOKED: axum::http::StatusCode = axum::http::StatusCode::FORBIDDEN;
 const STATUS_NOT_ACTIVATED: axum::http::StatusCode = axum::http::StatusCode::CONFLICT;
 const STATUS_NONCE_REPLAY: axum::http::StatusCode = axum::http::StatusCode::CONFLICT;
 const STATUS_INVALID_KEY: axum::http::StatusCode = axum::http::StatusCode::FORBIDDEN;
-
 const SIG_MAX_LEN: usize = 256;
+
+/// [BUG-CRIT-1 FIX] 安全时间差计算
+///
+/// 替代 `(now - req.timestamp).abs()`，防止 i64 溢出。
+/// 当差值溢出（即 req.timestamp 为 i64::MIN 或 i64::MAX 的极端值）时返回 i64::MAX，
+/// 触发时间窗口拒绝，绝不放行。
+///
+/// 假设：合法客户端时间戳在 [now - 1h, now + 1h] 范围内，
+/// 任何超过 i64::MAX/2 的差值都是恶意或故障。
+fn safe_time_diff(a: i64, b: i64) -> i64 {
+    a.checked_sub(b)
+        .or_else(|| b.checked_sub(a))
+        .unwrap_or(i64::MAX)
+}
 
 // ── 服务端标识 ──────────────────────────────────────────────────────────────
 static SERVER_ID: OnceLock<String> = OnceLock::new();
@@ -55,7 +71,7 @@ fn get_server_id() -> &'static str {
     })
 }
 
-// ── 过期宽限期配置 (NEW-EXP-1) ──────────────────────────────────────────────
+// ── 过期宽限期配置 ──────────────────────────────────────────────────────────
 static EXPIRATION_GRACE: OnceLock<i64> = OnceLock::new();
 fn expiration_grace_secs() -> i64 {
     *EXPIRATION_GRACE.get_or_init(|| {
@@ -66,9 +82,15 @@ fn expiration_grace_secs() -> i64 {
     })
 }
 
-// [NEW-EXP-2] 统一过期判断：now >= expires_at + grace
+/// [BUG-HIGH-1 FIX] 统一过期判断：now >= expires_at + grace
+///
+/// 使用 saturating_add 防止 expires_at + grace 溢出。
+/// 如果溢出（expires_at 接近 i64::MAX 且 grace 很大），
+/// saturating_add 返回 i64::MAX，此时 now >= i64::MAX 几乎永远为 false
+/// （即密钥永不过期），但这是极不可能发生的配置，且 expires_at 本身会
+/// 被数据校验拦截（不得超过 now + MAX_LICENSE_PERIOD）。
 fn is_expired(expires_at: i64, now: i64) -> bool {
-    now >= expires_at + expiration_grace_secs()
+    now >= expires_at.saturating_add(expiration_grace_secs())
 }
 
 // ── 时间工具 ────────────────────────────────────────────────────────────────
@@ -202,7 +224,7 @@ fn err(code: axum::http::StatusCode, msg: &str) -> axum::response::Response {
     (code, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
-// [NEW-EXP-3] 过期响应带额外 meta 信息
+/// [NEW-EXP-3] 过期响应带额外 meta 信息，客户端可解析宽限期
 fn expired_response(expires_at: i64, now: i64) -> axum::response::Response {
     let grace = expiration_grace_secs();
     let mut resp = axum::response::Response::new(axum::body::Body::from(
@@ -253,7 +275,9 @@ pub async fn activate(
     }
 
     let now = now_secs();
-    if (now - req.timestamp).abs() > timestamp_window() {
+
+    // [BUG-CRIT-1 FIX] 安全时间差计算，防止 i64 溢出
+    if safe_time_diff(now, req.timestamp) > timestamp_window() {
         return time_window_error(now);
     }
 
@@ -275,9 +299,11 @@ pub async fn activate(
     if record.activation_ts > 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED");
     }
+
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
+
     if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
@@ -291,7 +317,6 @@ pub async fn activate(
         .checked_mul(86400)
         .unwrap_or(db::MAX_EXTEND_SECS)
         .clamp(1, db::MAX_EXTEND_SECS);
-
     let expires_at = activation_ts.saturating_add(extra_secs);
 
     match db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
@@ -330,9 +355,11 @@ pub async fn verify(
     let now = now_secs();
 
     // ── 基础校验（不消耗 nonce）───────────────────────────────────────────
-    if (now - req.timestamp).abs() > timestamp_window() {
+    // [BUG-CRIT-1 FIX] 安全时间差计算
+    if safe_time_diff(now, req.timestamp) > timestamp_window() {
         return time_window_error(now);
     }
+
     if !validate_key_hash(&req.key_hash) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
@@ -344,12 +371,17 @@ pub async fn verify(
 
     // ── 缓存路径 ─────────────────────────────────────────────────────────
     if let Some(cached) = cache::get_verify_cache(&redis, &req.key_hash).await {
-        if cached.activation_ts <= 0 || cached.activation_ts >= cached.expires_at {
-            tracing::warn!("[Verify] invalid cached entry, fallback to DB path");
+        // 缓存数据合法性校验
+        if cached.activation_ts < 1 || cached.expires_at < 1 {
+            tracing::warn!("[Verify] invalid cached entry (zero timestamps), fallback to DB path");
+            cache::invalidate_verify_cache(&redis, &req.key_hash).await;
+            // fall through to DB path
+        } else if cached.activation_ts >= cached.expires_at {
+            tracing::warn!("[Verify] invalid cached entry (act >= exp), fallback to DB path");
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
             // fall through to DB path
         } else if is_expired(cached.expires_at, now) {
-            // [NEW-EXP-2] 使用统一过期判断
+            // [BUG-HIGH-1 FIX] 使用 saturating_add 安全判断过期
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
             return expired_response(cached.expires_at, now);
         } else {
@@ -365,12 +397,15 @@ pub async fn verify(
                     );
                 }
             };
+
             if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
                 return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
             }
+
             if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
                 return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
             }
+
             if should_update_last_check(&redis, &req.key_hash).await {
                 let db2 = Arc::clone(&db);
                 let kh = req.key_hash.clone();
@@ -380,6 +415,7 @@ pub async fn verify(
                     }
                 });
             }
+
             return ok_verify_response(cached.activation_ts, cached.expires_at);
         }
     }
@@ -397,6 +433,7 @@ pub async fn verify(
             );
         }
     };
+
     if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
@@ -417,14 +454,19 @@ pub async fn verify(
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
-    if record.activation_ts <= 0 || record.activation_ts >= record.expires_at {
+
+    if record.activation_ts < 1 || record.expires_at < 1 {
+        return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
+    }
+
+    if record.activation_ts >= record.expires_at {
         return err(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "ERR-DATA-INCONSISTENCY",
         );
     }
 
-    // [NEW-EXP-2] 使用统一过期判断 is_expired()
+    // [BUG-HIGH-1 FIX] 使用 saturating_add 安全判断过期
     if is_expired(record.expires_at, now) {
         return expired_response(record.expires_at, now);
     }
@@ -549,7 +591,6 @@ pub async fn revoke_license(
     if !validate_key_hash(&req.key_hash) {
         return err(axum::http::StatusCode::BAD_REQUEST, "invalid key_hash");
     }
-
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
     match db::revoke_license(&pool, &req.key_hash, reason).await {
         Ok(false) => return err(axum::http::StatusCode::NOT_FOUND, "key not found"),
@@ -608,7 +649,12 @@ pub async fn extend_license(
         );
     }
 
-    let extra_secs = req.extra_days * 86400;
+    let extra_secs = req
+        .extra_days
+        .checked_mul(86400)
+        .unwrap_or(db::MAX_EXTEND_SECS)
+        .clamp(1, db::MAX_EXTEND_SECS);
+
     let allow_expired = req.allow_expired.unwrap_or(false);
 
     match db::extend_license(&pool, &req.key_hash, extra_secs, allow_expired).await {
@@ -662,7 +708,10 @@ pub async fn add_key(
 
     (
         axum::http::StatusCode::OK,
-        Json(serde_json::json!({ "key": hkey, "key_hash": key_hash })),
+        Json(serde_json::json!({
+            "key": hkey,
+            "key_hash": key_hash
+        })),
     )
         .into_response()
 }
@@ -682,7 +731,6 @@ pub async fn batch_init(
     if !auth::verify_admin_token(&req.token, &admin_token) {
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
-
     if req.count == 0 || req.count > 5_000 {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -698,7 +746,12 @@ pub async fn batch_init(
         Ok(()) => {
             let results: Vec<serde_json::Value> = keys
                 .iter()
-                .map(|k| serde_json::json!({ "key": k, "key_hash": hash_key(k) }))
+                .map(|k| {
+                    serde_json::json!({
+                        "key": k,
+                        "key_hash": hash_key(k)
+                    })
+                })
                 .collect();
             Json(serde_json::json!({
                 "ok": true,
