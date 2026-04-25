@@ -1,4 +1,4 @@
-// client/src/network.rs
+// client/src/network.rs — 优化版 v2
 //
 // [BUG-N1 FIX] 二次重试使用独立 RTT（t5/t6），而非沿用第一次 RTT
 // [BUG-N1-PARTIAL FIX] 第二次ERR-TIME-RECORD处理增加server_ts2上界校验
@@ -39,9 +39,7 @@ pub struct VerifyResponse {
 fn get_server_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| {
-        option_env!("BUILD_SERVER_ID")
-            .unwrap_or("license-server-v1")
-            .to_string()
+        std::env::var("BUILD_SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string())
     })
 }
 
@@ -93,7 +91,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
                 }
                 "ERR-NONCE-REPLAY" => "ERR-NONCE-REPLAY".to_string(),
                 _ => format!("ERR-FORBIDDEN:{}", err_code),
-            }
+            };
         }
         403 => {
             return match err_code {
@@ -101,7 +99,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
                 "ERR-INVALID-KEY" | "invalid key" => ERR_INVALID_KEY.to_string(),
                 "ERR-NOT-ACTIVATED" | "not activated" => ERR_NOT_ACTIVATED.to_string(),
                 _ => format!("ERR-FORBIDDEN:{}", err_code),
-            }
+            };
         }
         _ => {}
     }
@@ -124,6 +122,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
 async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyResponse, String> {
     let key_hash = hash_key(hkey);
     let signature = sign_request(hkey, &key_hash, ts);
+
     let req = VerifyRequest {
         key_hash,
         timestamp: ts,
@@ -163,7 +162,6 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                 .trim_start_matches("ERR-TIME-RECORD:server_time=")
                 .parse()
                 .unwrap_or(t1);
-
             let t2 = now_secs();
             let full_rtt = t2 - t1;
 
@@ -196,7 +194,6 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                         .trim_start_matches("ERR-TIME-RECORD:server_time=")
                         .parse()
                         .unwrap_or(estimated_server_now);
-
                     let rtt2 = t6 - t5;
 
                     // [BUG-N1-PARTIAL FIX] 第二次也做上界校验
@@ -233,7 +230,7 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
 
 // [BUG-NET-1 FIX] validate_system_time：过滤明显异常时间戳再求平均
 // 与 CLAUDE.md §1「Think Before Coding」一致：
-//   外部时间源可能返回 0 或极大值，防御性过滤
+// 外部时间源可能返回 0 或极大值，防御性过滤
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -242,17 +239,21 @@ pub async fn validate_system_time() -> Result<(), String> {
 
     let min_ts: u64 = 1_704_067_200; // 2024-01-01
     let max_ts: u64 = local_now + 10 * 365 * 86400;
+
     if local_now < min_ts || local_now > max_ts {
         return Err(format!("系统时间 {} 超出合理范围", local_now));
     }
 
     let client = get_http_client();
-    // [OPT-2] 两个时间源并发请求（保留）
+
+    // [OPT-2] 两个时间源并发请求
     let (cf_ts, http_ts) = tokio::join!(
         get_time_from_cf_trace(client),
         get_time_from_http_date(client)
     );
+
     let timestamps: Vec<i64> = [cf_ts, http_ts].into_iter().flatten().collect();
+
     if timestamps.is_empty() {
         return Err("无法获取外部时间源，请检查网络连接".to_string());
     }
@@ -282,6 +283,7 @@ pub async fn validate_system_time() -> Result<(), String> {
             avg_offset, SYSTEM_TIME_HARD_LIMIT_SECS
         ));
     }
+
     if avg_offset.abs() > SYSTEM_TIME_WARN_SECS {
         tracing::warn!(
             "[Time] 时间偏差 {}s > {}s 警告阈值",
@@ -289,6 +291,7 @@ pub async fn validate_system_time() -> Result<(), String> {
             SYSTEM_TIME_WARN_SECS
         );
     }
+
     Ok(())
 }
 
