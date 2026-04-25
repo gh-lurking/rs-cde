@@ -1,9 +1,10 @@
 // server/src/nonce_fallback.rs — 优化版 v2
 //
 // [OPT-2 FIX] check_and_store：内存满时先同步 GC 过期条目，再判断是否可插入
-// 避免 GC 任务 30s 间隔期间所有合法请求被拒绝
+//   避免 GC 任务 30s 间隔期间所有合法请求被拒绝
 //
-// 与 CLAUDE.md §2 「Simplicity First」一致：不引入新抽象，仅在 check_and_store 内增加 GC 调用
+// 与 CLAUDE.md §2「Simplicity First」一致：
+//   不引入新抽象，仅在 check_and_store 内增加 GC 调用
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -23,6 +24,7 @@ const MAX_NONCE_ENTRIES: usize = 500_000;
 
 static MEMORY_NONCES: Lazy<Arc<DashMap<String, NonceEntry>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
+
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 static NONCE_CHECKED_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NONCE_REJECTED_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -46,7 +48,6 @@ pub fn start_cleanup_task() {
     {
         return;
     }
-
     tokio::spawn(async {
         loop {
             cleanup_once().await;
@@ -86,13 +87,16 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
         let cleaned = sync_cleanup_expired();
         if cleaned == 0 {
             tracing::error!(
-                "[NonceFallback] 内存已满 ({}) 且无可清理条目，拒绝新 nonce",
+                "[NonceFallback] memory full ({}) and nothing to clean, rejecting nonce",
                 MAX_NONCE_ENTRIES
             );
             NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        tracing::info!("[NonceFallback] 紧急 GC 清理 {} 条，继续处理请求", cleaned);
+        tracing::info!(
+            "[NonceFallback] emergency GC cleaned {} entries, continuing",
+            cleaned
+        );
         if map.len() >= MAX_NONCE_ENTRIES {
             NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -123,6 +127,6 @@ async fn cleanup_once() {
     map.retain(|_, v| v.expires_at > now);
     let cleaned = before - map.len();
     if cleaned > 0 {
-        tracing::debug!("[NonceFallback] GC 清理 {} 条过期 nonce", cleaned);
+        tracing::debug!("[NonceFallback] GC cleaned {} expired nonces", cleaned);
     }
 }

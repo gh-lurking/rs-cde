@@ -1,9 +1,12 @@
-// server/src/db.rs — 优化版 v4
+// server/src/db.rs — 优化版 v5
 //
 // [BUG-HIGH-1-RELATED] MAX_EXTEND_SECS 计算防护：
-//   MAX_EXTEND_DAYS * 86400 = 3650 * 86400 = 315,360,000，
-//   远小于 i64::MAX，但为防御未来修改，改用 checked_mul + unwrap_or。
-//   与 CLAUDE.md §1「Think Before Coding」一致：防御性处理。
+// MAX_EXTEND_DAYS * 86400 = 3650 * 86400 = 315,360,000，
+// 远小于 i64::MAX，但为防御未来修改，改用 checked_mul + unwrap_or。
+// 与 CLAUDE.md §1「Think Before Coding」一致：防御性处理。
+//
+// [EXP-FIX-1] clean_expired_licenses 现在同时清理过期未激活密钥
+// 以及已撤销的过期密钥，防止数据库无限增长。
 
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -21,7 +24,6 @@ pub const MAX_EXTEND_SECS: i64 = {
 };
 
 const BATCH_SIZE: usize = 2_000;
-
 const EXPIRED_CLEANUP_RETENTION_DAYS: i64 = 90;
 const EXPIRED_CLEANUP_INTERVAL_HOURS: u64 = 6;
 
@@ -52,7 +54,7 @@ pub struct LicenseRecord {
     pub note: String,
 }
 
-pub async fn init_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
     let max_conn: u32 = std::env::var("PG_POOL_MAX_CONN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -89,10 +91,8 @@ pub async fn init_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_licenses_key_hash ON licenses (key_hash)")
         .execute(&pool)
         .await?;
-
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires ON licenses (expires_at)
-         WHERE revoked = FALSE AND activation_ts > 0",
+        "CREATE INDEX IF NOT EXISTS idx_licenses_active_expires ON licenses (expires_at) WHERE revoked = FALSE AND activation_ts > 0",
     )
     .execute(&pool)
     .await?;
@@ -106,8 +106,7 @@ pub async fn find_license(
     key_hash: &str,
 ) -> Result<Option<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses WHERE key_hash = $1",
     )
     .bind(key_hash)
@@ -131,8 +130,7 @@ pub async fn insert_license(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO licenses (key, key_hash, created_at, note)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (key_hash) DO NOTHING",
+         VALUES ($1, $2, $3, $4) ON CONFLICT (key_hash) DO NOTHING",
     )
     .bind(key)
     .bind(key_hash)
@@ -150,8 +148,7 @@ pub async fn activate_license(
     expires_at: i64,
 ) -> Result<bool, sqlx::Error> {
     let r = sqlx::query(
-        "UPDATE licenses
-         SET activation_ts = $1, expires_at = $2
+        "UPDATE licenses SET activation_ts = $1, expires_at = $2
          WHERE key_hash = $3 AND activation_ts = 0 AND revoked = FALSE",
     )
     .bind(activation_ts)
@@ -209,8 +206,7 @@ pub async fn extend_license(
         sqlx::query_scalar::<_, i64>(
             "UPDATE licenses
              SET expires_at = expires_at + $2
-             WHERE key_hash = $3 AND revoked = FALSE
-               AND activation_ts > 0 AND expires_at > $1
+             WHERE key_hash = $3 AND revoked = FALSE AND activation_ts > 0 AND expires_at > $1
              RETURNING expires_at",
         )
         .bind(now)
@@ -223,8 +219,7 @@ pub async fn extend_license(
 
 pub async fn list_all_licenses(pool: &DbPool) -> Result<Vec<LicenseRecord>, sqlx::Error> {
     sqlx::query_as::<_, LicenseRecord>(
-        "SELECT key, key_hash, activation_ts, expires_at, revoked,
-                created_at, last_check, note
+        "SELECT key, key_hash, activation_ts, expires_at, revoked, created_at, last_check, note
          FROM licenses ORDER BY created_at DESC LIMIT 10000",
     )
     .fetch_all(pool)
@@ -263,9 +258,13 @@ pub async fn batch_init_keys(
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // [NEW-EXP-1] 过期密钥清理任务
+// [EXP-FIX-1] 现在同时清理：
+//   (a) 已撤销且过期的密钥
+//   (b) 过期超过 retention_days 天且从未激活的密钥
+// 防止数据库无限增长。
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn start_expired_cleanup_task(pool: Arc<PgPool>) {
+pub fn start_expired_cleanup_task(pool: Arc<DbPool>) {
     let interval_hours: u64 = std::env::var("EXPIRED_CLEANUP_INTERVAL_HOURS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -290,7 +289,6 @@ pub fn start_expired_cleanup_task(pool: Arc<PgPool>) {
             }
         }
     });
-
     tracing::info!(
         "[DB] expired cleanup task started (interval={}h)",
         interval_hours
@@ -305,12 +303,16 @@ async fn clean_expired_licenses(pool: &DbPool) -> Result<u64, sqlx::Error> {
 
     let cutoff = now_db() - retention_days * 86400;
 
+    // [EXP-FIX-1] 扩展清理范围：
+    // - 已撤销 + 已过期的密钥
+    // - 未激活 (activation_ts==0) + 创建超过 retention 天 + expires_at 已过期的密钥
     let result = sqlx::query(
         "DELETE FROM licenses
-         WHERE revoked = TRUE
-           AND activation_ts > 0
-           AND expires_at < $1
-           AND expires_at > 0",
+         WHERE (
+             (revoked = TRUE AND activation_ts > 0 AND expires_at < $1 AND expires_at > 0)
+             OR
+             (activation_ts = 0 AND created_at < $1 AND expires_at > 0 AND expires_at < $1)
+         )",
     )
     .bind(cutoff)
     .execute(pool)

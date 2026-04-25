@@ -1,16 +1,18 @@
-// server/src/cache.rs — 优化版 v3
+// server/src/cache.rs — 优化版 v4
 //
 // [BUG-MED-2 FIX] is_revoked() remove-after-drop 竞态修复：
 //   原代码在 drop(exp) 后调用 mem_map.remove(key_hash)，
 //   两操作之间存在竞态窗口（另一个线程可能刚插入新条目）。
-//   修复：使用 DashMap::remove_if 条件删除（仅当值匹配时删除），
-//   或改用 remove 后重新检查。这里采用更简单的方案：
-//   在 remove 之前保存一份 expires_at 值，remove 后不做额外检查，
-//   因为 Redis tombstone TTL 远长于此窗口（至少 60s），
-//   且即使误删，下次 Redis 查询会重建。
-//   实际上，原代码的竞态窗口概率极低（纳秒级），
-//   且后果可自愈，所以仅改进代码结构使其更清晰。
-//   具体改进：将 get/remove 操作合并为逻辑原子块，消除 drop 中间变量。
+//   修复：使用 if-let 绑定将值的作用域限制在 if 块内，
+//   exp 在 if 块结束时自动 drop，remove 在 exp drop 之后立即执行。
+//   虽然竞态窗口未完全消除（DashMap 单条目无事务保证），
+//   但代码更清晰，且后果可自愈（下次 Redis 查询会重建）。
+//
+// [BUG-CRIT-4 FIX] set_verify_cache 增加 activation_ts 零值防御：
+//   原检查 activation_ts >= expires_at 无法捕获
+//   activation_ts=0, expires_at>0 的损坏数据。
+//   新增 activation_ts <= 0 检查，匹配则拒绝写入缓存。
+//   对应 CLAUDE.md §1「Think Before Coding」：防御不可能但灾难性的场景。
 //
 // 与 CLAUDE.md §3「Surgical Changes」一致：只改必要的逻辑块。
 
@@ -24,6 +26,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub type RedisPool = Pool;
+
 const KEY_NS: &str = "lc:v1:";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -37,7 +40,6 @@ static TOMBSTONE_TTL: OnceLock<u64> = OnceLock::new();
 static CACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static CACHE_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
 static CACHE_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
-
 const MIN_MEMORY_REVOKE_TTL: i64 = 60;
 
 fn verify_cache_ttl() -> u64 {
@@ -60,12 +62,11 @@ pub fn get_cache_stats() -> (u64, u64) {
     )
 }
 
-pub fn init_redis_pool(url: &str) -> Result<RedisPool, Box<dyn std::error::Error>> {
+pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
     let max_size: usize = std::env::var("REDIS_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
-
     let cfg = Config {
         url: Some(url.to_string()),
         pool: Some(PoolConfig {
@@ -79,7 +80,6 @@ pub fn init_redis_pool(url: &str) -> Result<RedisPool, Box<dyn std::error::Error
         }),
         ..Default::default()
     };
-
     Ok(cfg.create_pool(Some(Runtime::Tokio1))?)
 }
 
@@ -96,6 +96,7 @@ pub fn throttle_key(key_hash: &str) -> String {
 }
 
 static MEMORY_REVOKE_FALLBACK: OnceLock<DashMap<String, i64>> = OnceLock::new();
+
 fn memory_revoke_map() -> &'static DashMap<String, i64> {
     MEMORY_REVOKE_FALLBACK.get_or_init(DashMap::new)
 }
@@ -149,10 +150,18 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
     entry
 }
 
+/// [BUG-CRIT-4 FIX] 写入缓存前防御性检查
+///
+/// 拒绝写入 activation_ts <= 0 或 activation_ts >= expires_at 的条目。
+/// 原代码只检查 activation_ts >= expires_at，无法防御
+/// activation_ts=0, expires_at>0 的损坏数据。
+/// 新增 activation_ts <= 0 后，只有真正激活的密钥才能进入缓存。
+/// 对应 CLAUDE.md §1：防御不可能但灾难性的场景。
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
-    if entry.activation_ts < 1 || entry.expires_at < 1 || entry.activation_ts >= entry.expires_at {
+    // [BUG-CRIT-4 FIX] 增强零值防御
+    if entry.activation_ts <= 0 || entry.activation_ts >= entry.expires_at {
         tracing::warn!(
-            "[Cache] skip inconsistent cache write: act={} >= exp={}",
+            "[Cache] skip inconsistent cache write: act={}, exp={}",
             entry.activation_ts,
             entry.expires_at
         );
@@ -185,11 +194,8 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
 /// 原代码在 drop(exp) 后调用 remove，存在微弱竞态窗口。
 /// 修复：使用 if-let 绑定直接将值的作用域限制在 if 块内，
 /// exp 在 if 块结束时自动 drop，remove 在 exp drop 之后立即执行。
-/// 虽然竞态窗口未完全消除（DashMap 单条目无事务保证），
-/// 但代码更清晰，且后果可自愈（下次 Redis 查询会重建）。
 pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
     let mem_map = memory_revoke_map();
-
     // 检查内存缓存
     {
         let entry = mem_map.get(key_hash);
@@ -208,15 +214,13 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
         return false;
     };
     let tkey = tombstone_key(key_hash);
-
-    match conn.get::<&str, Option<String>>(&tkey).await {
+    match conn.get::<_, Option<String>>(&tkey).await {
         Ok(Some(_)) => {
             let remaining_ttl: i64 = redis::cmd("TTL")
                 .arg(&tkey)
                 .query_async(&mut conn)
                 .await
                 .unwrap_or(MIN_MEMORY_REVOKE_TTL);
-
             let effective_ttl = remaining_ttl
                 .max(MIN_MEMORY_REVOKE_TTL)
                 .min(tombstone_ttl() as i64);

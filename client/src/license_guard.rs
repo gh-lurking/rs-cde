@@ -1,4 +1,4 @@
-// client/src/license_guard.rs — 优化版 v4
+// client/src/license_guard.rs — 优化版 v5
 //
 // [BUG-HIGH-2-RELATED] check_and_enforce 在收到 ERR_EXPIRED 时
 //   不再直接退出，而是检查服务端是否在响应体中传递了宽限期信息。
@@ -12,6 +12,12 @@
 //   但如果服务端在过期前被查询，会返回 200，
 //   宽限期只影响服务端的 is_expired() 判断。
 //   客户端这里只处理服务端明确返回 ERR_EXPIRED 的情况。
+//
+// [BUG-CRIT-6 FIX] local_is_definitely_expired() 类型转换修复：
+//   原代码 `local_expires as i64` 在 local_expires > i64::MAX 时
+//   在 debug 模式 panic（溢出），在 release 模式 wrap 为负数。
+//   改用 i64::try_from 安全转换，溢出时保守返回 false（不阻断）。
+//   对应 CLAUDE.md §1「Think Before Coding」：防御性处理数值溢出。
 //
 // 对应 CLAUDE.md §1「Think Before Coding」与 §2「Simplicity First」：
 //   客户端不自行计算宽限期，完全信任服务端判断。
@@ -30,6 +36,9 @@ fn expiration_warn_days() -> i64 {
 }
 
 // ── [NEW-CLIENT-1] 离线优先：本地快速过期检查 ──
+//
+// [BUG-CRIT-6 FIX] local_expires 从 u64 转换为 i64 时使用 try_from，
+// 溢出时保守返回 false（不阻断程序）。
 pub fn local_is_definitely_expired() -> bool {
     let hkey = match std::env::var("HKEY") {
         Ok(v) => v,
@@ -50,7 +59,16 @@ pub fn local_is_definitely_expired() -> bool {
             if local_ts == 0 || local_expires == 0 {
                 return false;
             }
-            now >= local_expires as i64
+            // [BUG-CRIT-6 FIX] 安全 u64 → i64 转换
+            let local_expires_i64 = match i64::try_from(local_expires) {
+                Ok(v) => v,
+                Err(_) => {
+                    // local_expires > i64::MAX 意味着约 2920 亿年后过期
+                    // 极不可能，保守返回 false
+                    return false;
+                }
+            };
+            now >= local_expires_i64
         }
         storage::LocalReadResult::Expired { .. } => true,
         _ => false,
@@ -202,11 +220,19 @@ pub async fn check_and_enforce() {
                         eprintln!("[License] invalid local timestamps");
                         std::process::exit(1);
                     }
-                    if now >= local_expires as i64 {
+                    // [BUG-CRIT-6 FIX] 安全 u64 → i64 转换
+                    let local_expires_i64 = match i64::try_from(local_expires) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            eprintln!("[License] local timestamp overflow");
+                            std::process::exit(1);
+                        }
+                    };
+                    if now >= local_expires_i64 {
                         eprintln!("[License] key expired (local)");
                         std::process::exit(1);
                     }
-                    time_guard::set_expiry_time(local_expires as i64);
+                    time_guard::set_expiry_time(local_expires_i64);
                 }
             }
         }

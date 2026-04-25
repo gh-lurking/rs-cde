@@ -1,4 +1,4 @@
-// server/src/handlers.rs — 优化版 v14
+// server/src/handlers.rs — 优化版 v15
 //
 // [BUG-CRIT-1 FIX] 时间戳减法溢出修复：
 //   (now - req.timestamp).abs() 在 req.timestamp=i64::MIN 时发生有符号溢出。
@@ -11,10 +11,14 @@
 //   改用 saturating_add 确保溢出时停在 i64::MAX（即永不过期），
 //   但 expires_at 本身仍需通过数据合法性校验（<= now + MAX_LICENSE_PERIOD）。
 //
-// [NEW-EXP-4] 过期响应增加 X-Expired-At 与 X-Expiration-Grace 头供客户端解析
+// [BUG-CRIT-4 FIX] 缓存路径增加 activation_ts 零值防御：
+//   set_verify_cache 只拒绝 activation_ts >= expires_at，
+//   无法防御 activation_ts=0, expires_at>0 的损坏数据。
+//   在 /verify 缓存读取路径增加 activation_ts <= 0 检查，
+//   防止未激活密钥被缓存路径误判为有效。
+//   对应 CLAUDE.md §1：防御不可能场景（DB损坏/手动篡改）。
 //
-// 与 CLAUDE.md §3「Surgical Changes」一致：
-//   只修改存在缺陷的三处计算，不改动周边逻辑。
+// [EXP-FIX-2] extend_license 过期状态更精确的错误消息
 
 // [BUG FIX] 缓存命中路径每次仍查一次 DB（get_key_only）——有意设计但注释不足
 // 缓存命中后为了 HMAC 验证必须从 DB 取 key 明文（Redis 不缓存密钥明文，BUG-H3）。
@@ -23,21 +27,21 @@
 // 实际上若要彻底消除该 DB 查询，需在内存（进程级）维护 key→hmac_key 的 LRU 缓存，
 // 并在 revoke 时同步失效。当前设计的 DB 访问可接受，无需改动，仅需补充注释。
 
-use crate::cache::{self, VerifyCacheEntry};
-use crate::db::{self, DbPool};
-use crate::{auth, key_cache, nonce_fallback};
-use axum::extract::Query;
-use axum::response::IntoResponse;
-use axum::{Extension, Json};
-use deadpool_redis::Pool as RedisPool;
+use crate::cache::{self, RedisPool, VerifyCacheEntry};
+use crate::key_cache;
+use crate::nonce_fallback;
+// use deadpool_redis::redis;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use serde_json::json;
 use sha2::Sha256;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
+
+use axum::{extract::Extension, extract::Query, response::IntoResponse, Json};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -103,7 +107,7 @@ fn now_secs() -> i64 {
 }
 
 fn hash_key(key: &str) -> String {
-    db::hash_key(key)
+    crate::db::hash_key(key)
 }
 
 fn validate_key_hash(key_hash: &str) -> bool {
@@ -200,7 +204,7 @@ async fn should_update_last_check(pool: &RedisPool, key_hash: &str) -> bool {
 fn ok_verify_response(activation_ts: i64, expires_at: i64) -> axum::response::Response {
     (
         axum::http::StatusCode::OK,
-        Json(serde_json::json!({
+        Json(json!({
             "activation_ts": activation_ts,
             "expires_at": expires_at,
             "revoked": false,
@@ -212,7 +216,7 @@ fn ok_verify_response(activation_ts: i64, expires_at: i64) -> axum::response::Re
 fn time_window_error(now: i64) -> axum::response::Response {
     (
         axum::http::StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
+        Json(json!({
             "error": "ERR-TIME-RECORD",
             "server_time": now
         })),
@@ -221,14 +225,14 @@ fn time_window_error(now: i64) -> axum::response::Response {
 }
 
 fn err(code: axum::http::StatusCode, msg: &str) -> axum::response::Response {
-    (code, Json(serde_json::json!({ "error": msg }))).into_response()
+    (code, Json(json!({ "error": msg }))).into_response()
 }
 
 /// [NEW-EXP-3] 过期响应带额外 meta 信息，客户端可解析宽限期
 fn expired_response(expires_at: i64, now: i64) -> axum::response::Response {
     let grace = expiration_grace_secs();
     let mut resp = axum::response::Response::new(axum::body::Body::from(
-        serde_json::to_string(&serde_json::json!({
+        serde_json::to_string(&json!({
             "error": "ERR-EXPIRED",
             "expires_at": expires_at,
             "server_time": now,
@@ -263,7 +267,7 @@ pub struct ActivateReq {
 }
 
 pub async fn activate(
-    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(pool): Extension<Arc<crate::db::DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Json(req): Json<ActivateReq>,
 ) -> impl IntoResponse {
@@ -281,7 +285,7 @@ pub async fn activate(
         return time_window_error(now);
     }
 
-    let record = match db::find_license(&pool, &req.key_hash).await {
+    let record = match crate::db::find_license(&pool, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
         Err(e) => {
@@ -296,6 +300,7 @@ pub async fn activate(
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
+
     if record.activation_ts > 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED");
     }
@@ -315,11 +320,11 @@ pub async fn activate(
         .unwrap_or(365);
     let extra_secs = default_days
         .checked_mul(86400)
-        .unwrap_or(db::MAX_EXTEND_SECS)
-        .clamp(1, db::MAX_EXTEND_SECS);
+        .unwrap_or(crate::db::MAX_EXTEND_SECS)
+        .clamp(1, crate::db::MAX_EXTEND_SECS);
     let expires_at = activation_ts.saturating_add(extra_secs);
 
-    match db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
+    match crate::db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
         Ok(true) => ok_verify_response(activation_ts, expires_at),
         Ok(false) => err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED"),
         Err(e) => {
@@ -348,7 +353,7 @@ pub struct VerifyReq {
 // - ✅ revoke 时同步 remove，不存在失效窗口
 // - ✅ 容量上限 KEY_CACHE_MAX=10000，LRU 淘汰最旧条目
 pub async fn verify(
-    Extension(db): Extension<Arc<DbPool>>,
+    Extension(db): Extension<Arc<crate::db::DbPool>>,
     Extension(redis): Extension<Arc<RedisPool>>,
     Json(req): Json<VerifyReq>,
 ) -> axum::response::Response {
@@ -371,13 +376,17 @@ pub async fn verify(
 
     // ── 缓存路径 ─────────────────────────────────────────────────────────
     if let Some(cached) = cache::get_verify_cache(&redis, &req.key_hash).await {
-        // 缓存数据合法性校验
-        if cached.activation_ts < 1 || cached.expires_at < 1 {
-            tracing::warn!("[Verify] invalid cached entry (zero timestamps), fallback to DB path");
-            cache::invalidate_verify_cache(&redis, &req.key_hash).await;
-            // fall through to DB path
-        } else if cached.activation_ts >= cached.expires_at {
-            tracing::warn!("[Verify] invalid cached entry (act >= exp), fallback to DB path");
+        // [BUG-CRIT-4 FIX] 防御 activation_ts 为零值的损坏缓存条目
+        //   set_verify_cache 检查 activation_ts >= expires_at 无法捕获
+        //   activation_ts=0, expires_at>0 的场景（DB 损坏/手动篡改）。
+        //   新增 activation_ts <= 0 检查，匹配则回源 DB 路径。
+        //   对应 CLAUDE.md §1：防御性处理不可能但灾难性的场景。
+        if cached.activation_ts <= 0 || cached.activation_ts >= cached.expires_at {
+            tracing::warn!(
+                "[Verify] invalid cached entry (act={}, exp={}), fallback to DB path",
+                cached.activation_ts,
+                cached.expires_at
+            );
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
             // fall through to DB path
         } else if is_expired(cached.expires_at, now) {
@@ -397,25 +406,21 @@ pub async fn verify(
                     );
                 }
             };
-
             if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
                 return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
             }
-
             if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
                 return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
             }
-
             if should_update_last_check(&redis, &req.key_hash).await {
                 let db2 = Arc::clone(&db);
                 let kh = req.key_hash.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = db::update_last_check(&db2, &kh, now).await {
+                    if let Err(e) = crate::db::update_last_check(&db2, &kh, now).await {
                         tracing::warn!("[Verify] cache-hit update_last_check failed: {e}");
                     }
                 });
             }
-
             return ok_verify_response(cached.activation_ts, cached.expires_at);
         }
     }
@@ -433,13 +438,12 @@ pub async fn verify(
             );
         }
     };
-
     if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
 
     // DB 查询 + 过期校验（先于 nonce 消耗）
-    let record = match db::find_license(&db, &req.key_hash).await {
+    let record = match crate::db::find_license(&db, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
         Err(e) => {
@@ -455,8 +459,8 @@ pub async fn verify(
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
 
-    if record.activation_ts < 1 || record.expires_at < 1 {
-        return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
+    if record.activation_ts <= 0 {
+        return err(axum::http::StatusCode::CONFLICT, "ERR-NOT-ACTIVATED");
     }
 
     if record.activation_ts >= record.expires_at {
@@ -486,7 +490,7 @@ pub async fn verify(
         let db2 = Arc::clone(&db);
         let kh = req.key_hash.clone();
         tokio::spawn(async move {
-            if let Err(e) = db::update_last_check(&db2, &kh, now).await {
+            if let Err(e) = crate::db::update_last_check(&db2, &kh, now).await {
                 tracing::warn!("[Verify] update_last_check failed: {e}");
             }
         });
@@ -499,7 +503,7 @@ pub async fn verify(
 // /health
 // ═══════════════════════════════════════════════════════════════════════════════
 pub async fn health(
-    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(pool): Extension<Arc<crate::db::DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
 ) -> impl IntoResponse {
     let db_ok = sqlx::query("SELECT 1").execute(pool.as_ref()).await.is_ok();
@@ -510,7 +514,6 @@ pub async fn health(
             .is_ok(),
         Err(_) => false,
     };
-
     let (nonce_total, nonce_rejected, nonce_map_size) = nonce_fallback::get_nonce_stats();
     let (cache_hits, cache_misses) = cache::get_cache_stats();
     let key_cache_size = key_cache::cache_size();
@@ -523,7 +526,7 @@ pub async fn health(
 
     (
         status,
-        Json(serde_json::json!({
+        Json(json!({
             "status": if db_ok && redis_ok { "ok" } else { "degraded" },
             "db": db_ok,
             "redis": redis_ok,
@@ -552,17 +555,17 @@ pub struct AdminToken {
 }
 
 pub async fn list_licenses(
-    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(pool): Extension<Arc<crate::db::DbPool>>,
     Extension(admin): Extension<Arc<String>>,
     Query(q): Query<AdminToken>,
 ) -> impl IntoResponse {
-    if !auth::verify_admin_token(&q.token, &admin) {
+    if !crate::auth::verify_admin_token(&q.token, &admin) {
         return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
-    match db::list_all_licenses(&pool).await {
+    match crate::db::list_all_licenses(&pool).await {
         Ok(list) => (
             axum::http::StatusCode::OK,
-            Json(serde_json::json!({ "licenses": list })),
+            Json(json!({ "licenses": list })),
         )
             .into_response(),
         Err(e) => err(
@@ -580,19 +583,19 @@ pub struct RevokeReq {
 }
 
 pub async fn revoke_license(
-    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(pool): Extension<Arc<crate::db::DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Extension(admin): Extension<Arc<String>>,
     Json(req): Json<RevokeReq>,
 ) -> impl IntoResponse {
-    if !auth::verify_admin_token(&req.token, &admin) {
+    if !crate::auth::verify_admin_token(&req.token, &admin) {
         return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
     if !validate_key_hash(&req.key_hash) {
         return err(axum::http::StatusCode::BAD_REQUEST, "invalid key_hash");
     }
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
-    match db::revoke_license(&pool, &req.key_hash, reason).await {
+    match crate::db::revoke_license(&pool, &req.key_hash, reason).await {
         Ok(false) => return err(axum::http::StatusCode::NOT_FOUND, "key not found"),
         Ok(true) => {}
         Err(e) => {
@@ -602,18 +605,12 @@ pub async fn revoke_license(
             )
         }
     }
-
     cache::set_revoke_tombstone(&redis_pool, &req.key_hash).await;
     cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
     let tombstone_exp = now_secs() + 86400 * 30;
     cache::mark_revoked_in_memory(&req.key_hash, tombstone_exp);
     key_cache::remove(&req.key_hash);
-
-    (
-        axum::http::StatusCode::OK,
-        Json(serde_json::json!({ "revoked": true })),
-    )
-        .into_response()
+    (axum::http::StatusCode::OK, Json(json!({ "revoked": true }))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -625,54 +622,79 @@ pub struct ExtendReq {
 }
 
 pub async fn extend_license(
-    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(pool): Extension<Arc<crate::db::DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Extension(admin): Extension<Arc<String>>,
     Json(req): Json<ExtendReq>,
 ) -> impl IntoResponse {
-    if !auth::verify_admin_token(&req.token, &admin) {
+    if !crate::auth::verify_admin_token(&req.token, &admin) {
         return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
     if !validate_key_hash(&req.key_hash) {
         return err(axum::http::StatusCode::BAD_REQUEST, "invalid key_hash");
     }
-    if req.extra_days < 1 {
+    if req.extra_days < 1 || req.extra_days > crate::db::MAX_EXTEND_DAYS {
         return err(
             axum::http::StatusCode::BAD_REQUEST,
-            "extra_days must be >= 1",
+            &format!(
+                "extra_days must be >= 1 and <= {}",
+                crate::db::MAX_EXTEND_DAYS
+            ),
         );
     }
-    if req.extra_days > db::MAX_EXTEND_DAYS {
+    if req.extra_days > crate::db::MAX_EXTEND_DAYS {
         return err(
             axum::http::StatusCode::BAD_REQUEST,
-            &format!("extra_days must be <= {}", db::MAX_EXTEND_DAYS),
+            &format!("extra_days must be <= {}", crate::db::MAX_EXTEND_DAYS),
         );
     }
-
     let extra_secs = req
         .extra_days
         .checked_mul(86400)
-        .unwrap_or(db::MAX_EXTEND_SECS)
-        .clamp(1, db::MAX_EXTEND_SECS);
-
+        .unwrap_or(crate::db::MAX_EXTEND_SECS)
+        .clamp(1, crate::db::MAX_EXTEND_SECS);
     let allow_expired = req.allow_expired.unwrap_or(false);
 
-    match db::extend_license(&pool, &req.key_hash, extra_secs, allow_expired).await {
+    match crate::db::extend_license(&pool, &req.key_hash, extra_secs, allow_expired).await {
         Ok(Some(new_exp)) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             (
                 axum::http::StatusCode::OK,
-                Json(serde_json::json!({
+                Json(json!({
                     "new_expires_at": new_exp,
                     "actual_extra_secs": extra_secs,
                 })),
             )
                 .into_response()
         }
-        Ok(None) => err(
-            axum::http::StatusCode::NOT_FOUND,
-            "license not found or not activated",
-        ),
+        // [EXP-FIX-2] 区分 "not found" 和 "expired" 错误消息
+        Ok(None) => {
+            // 查询密钥是否存在，以便给出精确错误
+            let record = crate::db::find_license(&pool, &req.key_hash).await;
+            match record {
+                Ok(Some(r)) => {
+                    if r.revoked {
+                        err(axum::http::StatusCode::FORBIDDEN, "license is revoked")
+                    } else if r.activation_ts <= 0 {
+                        err(axum::http::StatusCode::CONFLICT, "license not activated")
+                    } else if r.expires_at <= now_secs() {
+                        err(
+                            axum::http::StatusCode::GONE,
+                            "license expired — use allow_expired=true to extend from now",
+                        )
+                    } else {
+                        err(
+                            axum::http::StatusCode::NOT_FOUND,
+                            "license not found or not activated",
+                        )
+                    }
+                }
+                _ => err(
+                    axum::http::StatusCode::NOT_FOUND,
+                    "license not found or not activated",
+                ),
+            }
+        }
         Err(e) => err(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),
@@ -687,28 +709,25 @@ pub struct AddKeyReq {
 }
 
 pub async fn add_key(
-    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(pool): Extension<Arc<crate::db::DbPool>>,
     Extension(admin): Extension<Arc<String>>,
     Json(req): Json<AddKeyReq>,
 ) -> impl IntoResponse {
-    if !auth::verify_admin_token(&req.token, &admin) {
+    if !crate::auth::verify_admin_token(&req.token, &admin) {
         return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
-
     let hkey = generate_hkey();
     let key_hash = hash_key(&hkey);
     let note = req.note.as_deref().unwrap_or("");
-
-    if let Err(e) = db::insert_license(&pool, &hkey, &key_hash, now_secs(), note).await {
+    if let Err(e) = crate::db::insert_license(&pool, &hkey, &key_hash, now_secs(), note).await {
         return err(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),
         );
     }
-
     (
         axum::http::StatusCode::OK,
-        Json(serde_json::json!({
+        Json(json!({
             "key": hkey,
             "key_hash": key_hash
         })),
@@ -724,36 +743,35 @@ pub struct BatchInitReq {
 }
 
 pub async fn batch_init(
-    Extension(pool): Extension<Arc<DbPool>>,
+    Extension(pool): Extension<Arc<crate::db::DbPool>>,
     Extension(admin_token): Extension<Arc<String>>,
     Json(req): Json<BatchInitReq>,
 ) -> impl IntoResponse {
-    if !auth::verify_admin_token(&req.token, &admin_token) {
+    if !crate::auth::verify_admin_token(&req.token, &admin_token) {
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
     if req.count == 0 || req.count > 5_000 {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "count must be 1..5000"})),
+            Json(json!({"error": "count must be 1..5000"})),
         )
             .into_response();
     }
-
     let note = req.note.unwrap_or_default();
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
 
-    match db::batch_init_keys(&pool, &keys, &note).await {
+    match crate::db::batch_init_keys(&pool, &keys, &note).await {
         Ok(()) => {
             let results: Vec<serde_json::Value> = keys
                 .iter()
                 .map(|k| {
-                    serde_json::json!({
+                    json!({
                         "key": k,
                         "key_hash": hash_key(k)
                     })
                 })
                 .collect();
-            Json(serde_json::json!({
+            Json(json!({
                 "ok": true,
                 "count": keys.len(),
                 "keys": results

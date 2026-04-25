@@ -1,4 +1,4 @@
-// client/src/time_guard.rs — 优化版 v3
+// client/src/time_guard.rs — 优化版 v4
 //
 // [C-03 FIX]  时间大幅跳跃（>3600s）时保守处理，校验 License 而非直接退出
 // [BUG-10 FIX] watchdog Ok(_) 正常退出也触发退出
@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static LAST_VALID_TIME: AtomicI64 = AtomicI64::new(0);
 static EXPIRY_TIME: AtomicI64 = AtomicI64::new(0);
+
 static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 static NEEDS_REVALIDATION: AtomicBool = AtomicBool::new(false);
 
@@ -97,13 +98,12 @@ fn monitor_loop() {
             std::process::exit(1);
         }
 
-        // 大时钟跳跃处理
+        // [BUG-CRIT-5 FIX] 大时钟跳跃处理：设置重验证标志后不跳过本轮检查
         if current > last + 3600 {
             if current >= expiry {
                 tracing::error!("[TimeGuard] expired after large clock jump");
                 std::process::exit(1);
             }
-            // [BUG-CRIT-5 FIX] 设置重验证标志后不跳过本轮检查
             tracing::warn!(
                 "[TimeGuard] large clock jump +{}s, requesting revalidation",
                 current - last
