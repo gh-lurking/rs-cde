@@ -46,6 +46,8 @@ async fn main() {
     nonce_fallback::start_cleanup_task();
     // OPT-1 FIX: 启动 memory_revoke_map GC
     cache::start_cache_cleanup_task();
+    // [NEW-EXP-1] 过期密钥周期性清理（默认每 6 小时）
+    db::start_expired_cleanup_task(pg_pool.clone());
 
     let app = Router::new()
         .route("/activate", post(handlers::activate))

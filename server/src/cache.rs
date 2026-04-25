@@ -7,7 +7,6 @@ use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -51,7 +50,7 @@ pub fn get_cache_stats() -> (u64, u64) {
     )
 }
 
-pub fn init_redis_pool(url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolError> {
+pub fn init_redis_pool(url: &str) -> Result<RedisPool, Box<dyn std::error::Error>> {
     let max_size: usize = std::env::var("REDIS_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -110,6 +109,7 @@ pub fn start_cache_cleanup_task() {
     {
         return;
     }
+
     tokio::spawn(async {
         loop {
             cleanup_memory_revokes_once().await;
@@ -142,11 +142,7 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
 }
 
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
-    if entry.activation_ts <= 0 || entry.expires_at <= 0 {
-        tracing::warn!("[Cache] skip invalid cache write: {}", key_hash);
-        return;
-    }
-    if entry.activation_ts >= entry.expires_at {
+    if entry.activation_ts <= 0 || entry.activation_ts >= entry.expires_at {
         tracing::warn!(
             "[Cache] skip inconsistent cache write: act={} >= exp={}",
             entry.activation_ts,
@@ -154,7 +150,6 @@ pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCa
         );
         return;
     }
-
     let Ok(json) = serde_json::to_string(entry) else {
         return;
     };
@@ -190,8 +185,8 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
     let Ok(mut conn) = pool.get().await else {
         return false;
     };
-    let tkey = tombstone_key(key_hash);
 
+    let tkey = tombstone_key(key_hash);
     match conn.get::<_, Option<String>>(&tkey).await {
         Ok(Some(_)) => {
             let remaining_ttl: i64 = redis::cmd("TTL")
@@ -199,6 +194,7 @@ pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
                 .query_async(&mut conn)
                 .await
                 .unwrap_or(MIN_MEMORY_REVOKE_TTL);
+
             let effective_ttl = remaining_ttl
                 .max(MIN_MEMORY_REVOKE_TTL)
                 .min(tombstone_ttl() as i64);

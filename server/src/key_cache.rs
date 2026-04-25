@@ -16,7 +16,6 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
 const KEY_CACHE_MAX: usize = 10_000;
-
 static KEY_CACHE: Lazy<DashMap<String, String>> = Lazy::new(DashMap::new);
 
 pub async fn get_or_load(
@@ -32,7 +31,6 @@ pub async fn get_or_load(
     let key = crate::db::get_key_only(pool, key_hash).await?;
 
     if let Some(ref k) = key {
-        // [BUG-KEY-1 FIX] 直接读 len()，无需维护 AtomicUsize
         if KEY_CACHE.len() >= KEY_CACHE_MAX {
             if let Some(old) = KEY_CACHE.iter().next().map(|e| e.key().clone()) {
                 KEY_CACHE.remove(&old);
@@ -46,7 +44,6 @@ pub async fn get_or_load(
 
 pub fn remove(key_hash: &str) {
     KEY_CACHE.remove(key_hash);
-    // [BUG-KEY-1 FIX] 不需要手动维护计数器
 }
 
 /// 用于 /health 接口观测缓存大小（直接读 DashMap::len()，准确）

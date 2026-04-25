@@ -1,9 +1,16 @@
-// server/src/handlers.rs — 优化版 v12
+// server/src/handlers.rs — 优化版 v13
 //
 // [BUG-V3 FIX] verify() DB路径：将过期检查移至nonce消耗之前，避免无效nonce写入
-// [BUG-V4 FIX] verify() 缓存路径：activation_ts 零值判断改为 <= 0，与DB路径一致
-// [BUG-E1 FIX] extend_license()：actual_extra_secs 改为直接返回clamp后的extra_secs
-// [BUG-H1 FIX] tombstone_key 局部变量复用（见 cache.rs）
+// [BUG-V4 FIX] verify() 缓存路径：activation_ts 零值判断改为 <= 0
+// [BUG-CRIT-4 FIX] 先查缓存再验HMAC，过期密钥尽早返回
+// [NEW-EXP-1] 新增 expiration_grace_secs() 过期宽限期（默认 0）
+// [NEW-EXP-2] 统一客户端/服务端过期判断逻辑（now >= expires_at + grace）
+// [NEW-EXP-3] 过期响应增加 headers：X-Expired-At, X-Expiration-Grace
+//
+// 对应 CLAUDE.md §1「Think Before Coding」：
+//   过期宽限期假设：默认 0（不启用），由运维按需配置。
+//   宽限期存在时，密钥在 expires_at 到 expires_at+grace 之间仍有效。
+//   与 §2「Simplicity First」一致：最小代码变更，只改过期判断条件。
 
 // [BUG FIX] 缓存命中路径每次仍查一次 DB（get_key_only）——有意设计但注释不足
 // 缓存命中后为了 HMAC 验证必须从 DB 取 key 明文（Redis 不缓存密钥明文，BUG-H3）。
@@ -12,39 +19,13 @@
 // 实际上若要彻底消除该 DB 查询，需在内存（进程级）维护 key→hmac_key 的 LRU 缓存，
 // 并在 revoke 时同步失效。当前设计的 DB 访问可接受，无需改动，仅需补充注释。
 
-// server/src/handlers.rs — 优化版 v13
-//
-// [OPT-1 FIX]  revoke 操作顺序：先写 tombstone 再删缓存（消除鉴权绕过窗口）
-// [OPT-3 FIX]  进程内 key_cache 消除热路径 DB 查询
-// [OPT-4 FIX]  now_secs() 防 panic + 防溢出
-// [OPT-6 FIX]  verify_hmac_signature sig 长度上界防护
-// 与 CLAUDE.md §3 「Surgical Changes」一致：仅修改必要行，不动其他逻辑
-
-// server/src/handlers.rs — 优化版 v14
-//
-// [BUG-V3 FIX] verify() DB路径：将过期检查移至nonce消耗之前，避免无效nonce写入
-// [BUG-V4 FIX] verify() 缓存路径：activation_ts 零值判断改为 <= 0，与DB路径一致
-// [BUG-E1 FIX] extend_license()：actual_extra_secs 改为直接返回clamp后的extra_secs
-// [BUG-H1 FIX] tombstone_key 局部变量复用（见 cache.rs）
-// [BUG FIX] 缓存命中路径每次仍查一次 DB（get_key_only）——有意设计但注释不足
-// [OPT-1 FIX] revoke 操作顺序：先写 tombstone 再删缓存（消除鉴权绕过窗口）
-// [OPT-3 FIX] 进程内 key_cache 消除热路径 DB 查询
-// [OPT-4 FIX] now_secs() 防 panic + 防溢出
-// [OPT-6 FIX] verify_hmac_signature sig 长度上界防护
-//
-// [BUG-CRIT-3 FIX] activate() 中 expires_at 计算使用 saturating_add 防溢出
-//   对应 CLAUDE.md §1 「Think Before Coding」：now_secs() 返回 i64::MAX 时
-//   activation_ts + extra_secs 会溢出，使用 saturating_add 防御
-//
-// [BUG-CRIT-4 FIX] verify() 中将缓存检查移至 HMAC 验证之前
-//   对应 CLAUDE.md §4 「Goal-Driven Execution」：过期密钥应尽早返回 410，
-//   不应先执行 HMAC 验证和 DB 查询再发现过期
-//   实现：先查 verify_cache（仅需 key_hash），若命中且已过期则直接返回 410
-
-use crate::cache::{RedisPool, VerifyCacheEntry};
-use crate::key_cache; // [OPT-3] 进程内 key 缓存
-use crate::{auth, cache, db, nonce_fallback};
-use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension, Json};
+use crate::cache::{self, VerifyCacheEntry};
+use crate::db::{self, DbPool};
+use crate::{auth, key_cache, nonce_fallback};
+use axum::extract::Query;
+use axum::response::IntoResponse;
+use axum::{Extension, Json};
+use deadpool_redis::Pool as RedisPool;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -56,26 +37,41 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const STATUS_EXPIRED: StatusCode = StatusCode::GONE;
-const STATUS_REVOKED: StatusCode = StatusCode::FORBIDDEN;
-const STATUS_NOT_ACTIVATED: StatusCode = StatusCode::CONFLICT;
-const STATUS_NONCE_REPLAY: StatusCode = StatusCode::CONFLICT;
-const STATUS_INVALID_KEY: StatusCode = StatusCode::FORBIDDEN;
+// ── 常量 ────────────────────────────────────────────────────────────────────
+const _EXPECTED_SIG_LEN: usize = 64;
+const STATUS_EXPIRED: axum::http::StatusCode = axum::http::StatusCode::GONE;
+const STATUS_REVOKED: axum::http::StatusCode = axum::http::StatusCode::FORBIDDEN;
+const STATUS_NOT_ACTIVATED: axum::http::StatusCode = axum::http::StatusCode::CONFLICT;
+const STATUS_NONCE_REPLAY: axum::http::StatusCode = axum::http::StatusCode::CONFLICT;
+const STATUS_INVALID_KEY: axum::http::StatusCode = axum::http::StatusCode::FORBIDDEN;
 
-// HMAC-SHA256 输出固定 64 字节 hex，公开常量，不构成时序侧信道
-const _HMAC_HEX_LEN: usize = 64;
-// sig 长度上界：防止超长签名导致 ct_eq CPU 耗尽 [OPT-6]
 const SIG_MAX_LEN: usize = 256;
 
+// ── 服务端标识 ──────────────────────────────────────────────────────────────
 static SERVER_ID: OnceLock<String> = OnceLock::new();
-
 fn get_server_id() -> &'static str {
     SERVER_ID.get_or_init(|| {
         std::env::var("SERVER_ID").unwrap_or_else(|_| "license-server-v1".to_string())
     })
 }
 
-// [OPT-4] 防 panic（时钟早于 UNIX_EPOCH）+ 防溢出（as i64 截断）
+// ── 过期宽限期配置 (NEW-EXP-1) ──────────────────────────────────────────────
+static EXPIRATION_GRACE: OnceLock<i64> = OnceLock::new();
+fn expiration_grace_secs() -> i64 {
+    *EXPIRATION_GRACE.get_or_init(|| {
+        std::env::var("EXPIRATION_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+// [NEW-EXP-2] 统一过期判断：now >= expires_at + grace
+fn is_expired(expires_at: i64, now: i64) -> bool {
+    now >= expires_at + expiration_grace_secs()
+}
+
+// ── 时间工具 ────────────────────────────────────────────────────────────────
 fn now_secs() -> i64 {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -92,7 +88,6 @@ fn validate_key_hash(key_hash: &str) -> bool {
     key_hash.len() == 64 && key_hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-// [OPT-6] sig 长度上界防护 + 明确注释
 fn verify_hmac_signature(key: &str, key_hash: &str, timestamp: i64, sig: &str) -> bool {
     if sig.len() > SIG_MAX_LEN {
         return false;
@@ -140,6 +135,7 @@ fn nonce_ttl() -> i64 {
     timestamp_window() * 2 + 30
 }
 
+// ── Nonce ───────────────────────────────────────────────────────────────────
 async fn check_and_store_nonce(pool: &RedisPool, key_hash: &str, ts: i64) -> bool {
     let key = format!("nonce:{}:{}", key_hash, ts);
     match pool.get().await {
@@ -161,6 +157,7 @@ async fn check_and_store_nonce(pool: &RedisPool, key_hash: &str, ts: i64) -> boo
     }
 }
 
+// ── Last Check 节流 ─────────────────────────────────────────────────────────
 async fn should_update_last_check(pool: &RedisPool, key_hash: &str) -> bool {
     let throttle_key = cache::throttle_key(key_hash);
     let Ok(mut conn) = pool.get().await else {
@@ -177,9 +174,10 @@ async fn should_update_last_check(pool: &RedisPool, key_hash: &str) -> bool {
     matches!(result, Ok(Some(_)))
 }
 
+// ── 响应构建函数 ─────────────────────────────────────────────────────────────
 fn ok_verify_response(activation_ts: i64, expires_at: i64) -> axum::response::Response {
     (
-        StatusCode::OK,
+        axum::http::StatusCode::OK,
         Json(serde_json::json!({
             "activation_ts": activation_ts,
             "expires_at": expires_at,
@@ -191,7 +189,7 @@ fn ok_verify_response(activation_ts: i64, expires_at: i64) -> axum::response::Re
 
 fn time_window_error(now: i64) -> axum::response::Response {
     (
-        StatusCode::BAD_REQUEST,
+        axum::http::StatusCode::BAD_REQUEST,
         Json(serde_json::json!({
             "error": "ERR-TIME-RECORD",
             "server_time": now
@@ -200,10 +198,41 @@ fn time_window_error(now: i64) -> axum::response::Response {
         .into_response()
 }
 
-fn err(code: StatusCode, msg: &str) -> axum::response::Response {
+fn err(code: axum::http::StatusCode, msg: &str) -> axum::response::Response {
     (code, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
+// [NEW-EXP-3] 过期响应带额外 meta 信息
+fn expired_response(expires_at: i64, now: i64) -> axum::response::Response {
+    let grace = expiration_grace_secs();
+    let mut resp = axum::response::Response::new(axum::body::Body::from(
+        serde_json::to_string(&serde_json::json!({
+            "error": "ERR-EXPIRED",
+            "expires_at": expires_at,
+            "server_time": now,
+            "expiration_grace_secs": grace,
+        }))
+        .unwrap_or_default(),
+    ));
+    *resp.status_mut() = STATUS_EXPIRED;
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-expired-at"),
+        axum::http::HeaderValue::from_str(&expires_at.to_string()).unwrap(),
+    );
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-expiration-grace"),
+        axum::http::HeaderValue::from_str(&grace.to_string()).unwrap(),
+    );
+    resp.headers_mut().insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// /activate
+// ═══════════════════════════════════════════════════════════════════════════════
 #[derive(Deserialize)]
 pub struct ActivateReq {
     key_hash: String,
@@ -212,12 +241,15 @@ pub struct ActivateReq {
 }
 
 pub async fn activate(
-    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(pool): Extension<Arc<DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Json(req): Json<ActivateReq>,
 ) -> impl IntoResponse {
     if !validate_key_hash(&req.key_hash) {
-        return err(StatusCode::BAD_REQUEST, "invalid key_hash format");
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid key_hash format",
+        );
     }
 
     let now = now_secs();
@@ -230,7 +262,10 @@ pub async fn activate(
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
         Err(e) => {
             tracing::error!("[Activate] DB error: {}", e);
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            );
         }
     };
 
@@ -240,11 +275,9 @@ pub async fn activate(
     if record.activation_ts > 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED");
     }
-
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
-
     if !check_and_store_nonce(&redis_pool, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
@@ -259,9 +292,6 @@ pub async fn activate(
         .unwrap_or(db::MAX_EXTEND_SECS)
         .clamp(1, db::MAX_EXTEND_SECS);
 
-    // [BUG-CRIT-3 FIX] 使用 saturating_add 防溢出
-    // now_secs() 在极端情况下返回 i64::MAX，直接 + extra_secs 会溢出
-    // saturating_add 确保结果不超过 i64::MAX
     let expires_at = activation_ts.saturating_add(extra_secs);
 
     match db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
@@ -269,11 +299,17 @@ pub async fn activate(
         Ok(false) => err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED"),
         Err(e) => {
             tracing::error!("[Activate] DB write: {}", e);
-            err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error",
+            )
         }
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// /verify
+// ═══════════════════════════════════════════════════════════════════════════════
 #[derive(Deserialize)]
 pub struct VerifyReq {
     key_hash: String,
@@ -287,13 +323,13 @@ pub struct VerifyReq {
 // - ✅ revoke 时同步 remove，不存在失效窗口
 // - ✅ 容量上限 KEY_CACHE_MAX=10000，LRU 淘汰最旧条目
 pub async fn verify(
-    Extension(db): Extension<Arc<db::DbPool>>,
+    Extension(db): Extension<Arc<DbPool>>,
     Extension(redis): Extension<Arc<RedisPool>>,
     Json(req): Json<VerifyReq>,
 ) -> axum::response::Response {
     let now = now_secs();
 
-    // ── 基础校验（不消耗 nonce）
+    // ── 基础校验（不消耗 nonce）───────────────────────────────────────────
     if (now - req.timestamp).abs() > timestamp_window() {
         return time_window_error(now);
     }
@@ -306,42 +342,35 @@ pub async fn verify(
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
 
-    // ── [BUG-CRIT-4 FIX] 先查缓存再验 HMAC，过期密钥尽早返回 ──
-    // 原代码先做 HMAC 验证（含可能的 DB 查询）再查缓存，
-    // 对于已过期但在缓存中的密钥，浪费了 HMAC+DB 资源。
-    // 现在先查缓存：若命中且已过期，直接返回 410，无需 HMAC 验证。
-    // 对应 CLAUDE.md §4 「Goal-Driven Execution」：优化请求路径，减少无效计算。
+    // ── 缓存路径 ─────────────────────────────────────────────────────────
     if let Some(cached) = cache::get_verify_cache(&redis, &req.key_hash).await {
-        if cached.activation_ts <= 0
-            || cached.expires_at <= 0
-            || cached.activation_ts >= cached.expires_at
-        {
+        if cached.activation_ts <= 0 || cached.activation_ts >= cached.expires_at {
             tracing::warn!("[Verify] invalid cached entry, fallback to DB path");
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
             // fall through to DB path
-        } else if now >= cached.expires_at {
-            // [BUG-EXP-1 FIX] 过期直接返回，不消耗 nonce
+        } else if is_expired(cached.expires_at, now) {
+            // [NEW-EXP-2] 使用统一过期判断
             cache::invalidate_verify_cache(&redis, &req.key_hash).await;
-            return err(STATUS_EXPIRED, "ERR-EXPIRED");
+            return expired_response(cached.expires_at, now);
         } else {
-            // 缓存有效且未过期，仍需 HMAC 验证确保请求合法性
+            // 缓存有效且未过期，仍需 HMAC 验证
             let key = match key_cache::get_or_load(&req.key_hash, &db).await {
                 Ok(Some(v)) => v,
                 Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
                 Err(e) => {
                     tracing::error!("[Verify] key_cache DB error: {e}");
-                    return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
+                    return err(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR-INTERNAL",
+                    );
                 }
             };
             if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
                 return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
             }
-
-            // 确认未过期且 HMAC 通过：此时才消耗 nonce
             if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
                 return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
             }
-            // [BUG-CACHE-1 FIX] 缓存命中路径也更新 last_check
             if should_update_last_check(&redis, &req.key_hash).await {
                 let db2 = Arc::clone(&db);
                 let kh = req.key_hash.clone();
@@ -355,46 +384,52 @@ pub async fn verify(
         }
     }
 
-    // ── DB 路径：缓存未命中或缓存无效 ──
-
+    // ── DB 路径 ──────────────────────────────────────────────────────────
     // HMAC 验证（需要从 DB/key_cache 获取 key）
     let key = match key_cache::get_or_load(&req.key_hash, &db).await {
         Ok(Some(v)) => v,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
         Err(e) => {
             tracing::error!("[Verify] key_cache DB error: {e}");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR-INTERNAL",
+            );
         }
     };
     if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
 
-    // [BUG-EXP-2 FIX] DB 路径：先查 DB + 过期校验，确认有效后再消耗 nonce
+    // DB 查询 + 过期校验（先于 nonce 消耗）
     let record = match db::find_license(&db, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
         Err(e) => {
             tracing::error!("[Verify] DB error: {e}");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-INTERNAL");
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR-INTERNAL",
+            );
         }
     };
 
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
-    if record.activation_ts <= 0 {
-        return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
-    }
-    if record.activation_ts >= record.expires_at {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "ERR-DATA-INCONSISTENCY");
-    }
-    // [BUG-EXP-2 FIX] 过期检查在 nonce 消耗之前
-    if now >= record.expires_at {
-        return err(STATUS_EXPIRED, "ERR-EXPIRED");
+    if record.activation_ts <= 0 || record.activation_ts >= record.expires_at {
+        return err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR-DATA-INCONSISTENCY",
+        );
     }
 
-    // DB 路径确认有效：此时才消耗 nonce
+    // [NEW-EXP-2] 使用统一过期判断 is_expired()
+    if is_expired(record.expires_at, now) {
+        return expired_response(record.expires_at, now);
+    }
+
+    // 确认有效后才消耗 nonce
     if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
@@ -418,8 +453,11 @@ pub async fn verify(
     ok_verify_response(record.activation_ts, record.expires_at)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// /health
+// ═══════════════════════════════════════════════════════════════════════════════
 pub async fn health(
-    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(pool): Extension<Arc<DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
 ) -> impl IntoResponse {
     let db_ok = sqlx::query("SELECT 1").execute(pool.as_ref()).await.is_ok();
@@ -430,14 +468,15 @@ pub async fn health(
             .is_ok(),
         Err(_) => false,
     };
+
     let (nonce_total, nonce_rejected, nonce_map_size) = nonce_fallback::get_nonce_stats();
     let (cache_hits, cache_misses) = cache::get_cache_stats();
     let key_cache_size = key_cache::cache_size();
 
     let status = if db_ok && redis_ok {
-        StatusCode::OK
+        axum::http::StatusCode::OK
     } else {
-        StatusCode::SERVICE_UNAVAILABLE
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
     };
 
     (
@@ -446,6 +485,7 @@ pub async fn health(
             "status": if db_ok && redis_ok { "ok" } else { "degraded" },
             "db": db_ok,
             "redis": redis_ok,
+            "expiration_grace_secs": expiration_grace_secs(),
             "nonce_stats": {
                 "total_checks": nonce_total,
                 "rejected": nonce_rejected,
@@ -461,26 +501,32 @@ pub async fn health(
         .into_response()
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// /admin/*
+// ═══════════════════════════════════════════════════════════════════════════════
 #[derive(Deserialize)]
 pub struct AdminToken {
     token: String,
 }
 
 pub async fn list_licenses(
-    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(pool): Extension<Arc<DbPool>>,
     Extension(admin): Extension<Arc<String>>,
     Query(q): Query<AdminToken>,
 ) -> impl IntoResponse {
     if !auth::verify_admin_token(&q.token, &admin) {
-        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+        return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
     match db::list_all_licenses(&pool).await {
         Ok(list) => (
-            StatusCode::OK,
+            axum::http::StatusCode::OK,
             Json(serde_json::json!({ "licenses": list })),
         )
             .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        ),
     }
 }
 
@@ -492,38 +538,41 @@ pub struct RevokeReq {
 }
 
 pub async fn revoke_license(
-    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(pool): Extension<Arc<DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Extension(admin): Extension<Arc<String>>,
     Json(req): Json<RevokeReq>,
 ) -> impl IntoResponse {
     if !auth::verify_admin_token(&req.token, &admin) {
-        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+        return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
     if !validate_key_hash(&req.key_hash) {
-        return err(StatusCode::BAD_REQUEST, "invalid key_hash");
+        return err(axum::http::StatusCode::BAD_REQUEST, "invalid key_hash");
     }
 
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
-
     match db::revoke_license(&pool, &req.key_hash, reason).await {
-        Ok(false) => return err(StatusCode::NOT_FOUND, "key not found"),
+        Ok(false) => return err(axum::http::StatusCode::NOT_FOUND, "key not found"),
         Ok(true) => {}
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            )
+        }
     }
 
-    // [OPT-1] 正确顺序：先写 tombstone → 再删缓存 → 再内存标记
-    // 原因：tombstone 是撤销持久化标记，必须先于缓存失效写入，
-    // 否则存在「缓存已删但 tombstone 尚未写入」的竞态窗口。
     cache::set_revoke_tombstone(&redis_pool, &req.key_hash).await;
     cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
     let tombstone_exp = now_secs() + 86400 * 30;
     cache::mark_revoked_in_memory(&req.key_hash, tombstone_exp);
-
-    // [OPT-3] revoke 时同步从进程内 key_cache 移除，防止 HMAC 验证绕过
     key_cache::remove(&req.key_hash);
 
-    (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "revoked": true })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -535,23 +584,26 @@ pub struct ExtendReq {
 }
 
 pub async fn extend_license(
-    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(pool): Extension<Arc<DbPool>>,
     Extension(redis_pool): Extension<Arc<RedisPool>>,
     Extension(admin): Extension<Arc<String>>,
     Json(req): Json<ExtendReq>,
 ) -> impl IntoResponse {
     if !auth::verify_admin_token(&req.token, &admin) {
-        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+        return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
     if !validate_key_hash(&req.key_hash) {
-        return err(StatusCode::BAD_REQUEST, "invalid key_hash");
+        return err(axum::http::StatusCode::BAD_REQUEST, "invalid key_hash");
     }
     if req.extra_days < 1 {
-        return err(StatusCode::BAD_REQUEST, "extra_days must be >= 1");
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "extra_days must be >= 1",
+        );
     }
     if req.extra_days > db::MAX_EXTEND_DAYS {
         return err(
-            StatusCode::BAD_REQUEST,
+            axum::http::StatusCode::BAD_REQUEST,
             &format!("extra_days must be <= {}", db::MAX_EXTEND_DAYS),
         );
     }
@@ -563,7 +615,7 @@ pub async fn extend_license(
         Ok(Some(new_exp)) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             (
-                StatusCode::OK,
+                axum::http::StatusCode::OK,
                 Json(serde_json::json!({
                     "new_expires_at": new_exp,
                     "actual_extra_secs": extra_secs,
@@ -571,8 +623,14 @@ pub async fn extend_license(
             )
                 .into_response()
         }
-        Ok(None) => err(StatusCode::NOT_FOUND, "license not found or not activated"),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(None) => err(
+            axum::http::StatusCode::NOT_FOUND,
+            "license not found or not activated",
+        ),
+        Err(e) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        ),
     }
 }
 
@@ -583,12 +641,12 @@ pub struct AddKeyReq {
 }
 
 pub async fn add_key(
-    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(pool): Extension<Arc<DbPool>>,
     Extension(admin): Extension<Arc<String>>,
     Json(req): Json<AddKeyReq>,
 ) -> impl IntoResponse {
     if !auth::verify_admin_token(&req.token, &admin) {
-        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+        return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
 
     let hkey = generate_hkey();
@@ -596,15 +654,15 @@ pub async fn add_key(
     let note = req.note.as_deref().unwrap_or("");
 
     if let Err(e) = db::insert_license(&pool, &hkey, &key_hash, now_secs(), note).await {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        return err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        );
     }
 
     (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "key": hkey,
-            "key_hash": key_hash
-        })),
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "key": hkey, "key_hash": key_hash })),
     )
         .into_response()
 }
@@ -617,19 +675,17 @@ pub struct BatchInitReq {
 }
 
 pub async fn batch_init(
-    Extension(pool): Extension<Arc<db::DbPool>>,
+    Extension(pool): Extension<Arc<DbPool>>,
     Extension(admin_token): Extension<Arc<String>>,
     Json(req): Json<BatchInitReq>,
 ) -> impl IntoResponse {
     if !auth::verify_admin_token(&req.token, &admin_token) {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
 
-    // [OPT-5] count 上界从 10000 降至 5000，为未来加列保留 PG 参数余量
-    // PG 协议参数上限 65535，当前 4列×5000=20000，安全余量充足
     if req.count == 0 || req.count > 5_000 {
         return (
-            StatusCode::BAD_REQUEST,
+            axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "count must be 1..5000"})),
         )
             .into_response();
@@ -640,14 +696,9 @@ pub async fn batch_init(
 
     match db::batch_init_keys(&pool, &keys, &note).await {
         Ok(()) => {
-            let results: Vec<_> = keys
+            let results: Vec<serde_json::Value> = keys
                 .iter()
-                .map(|k| {
-                    serde_json::json!({
-                        "key": k,
-                        "key_hash": hash_key(k)
-                    })
-                })
+                .map(|k| serde_json::json!({ "key": k, "key_hash": hash_key(k) }))
                 .collect();
             Json(serde_json::json!({
                 "ok": true,
@@ -658,7 +709,7 @@ pub async fn batch_init(
         }
         Err(e) => {
             tracing::error!("[Admin] batch_init error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }

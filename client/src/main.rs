@@ -29,19 +29,23 @@ async fn main() {
 
     run_client().await;
 
-    // [BUG-CRIT-1 FIX] 主循环：消费 time_guard 的重验证请求
-    // time_guard 在检测到大时钟跳跃时设置 NEEDS_REVALIDATION 标志，
-    // 主循环每 30 秒检查一次，触发时调用 check_and_enforce() 重新联网验证。
-    // 对应 CLAUDE.md §4 「Goal-Driven Execution」：标志必须被消费，否则是死信。
+    // 主循环：消费 time_guard 的重验证请求
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
 
         if time_guard::take_revalidation_request() {
             tracing::warn!("[Main] revalidation requested by time_guard, re-checking license...");
+
+            // 重新联网前先快速检查本地过期
+            if license_guard::local_is_definitely_expired() {
+                eprintln!("❌ License expired — please renew to continue.");
+                process::exit(1);
+            }
+
             license_guard::check_and_enforce().await;
+            license_guard::check_expiration_warning();
             tracing::info!("[Main] revalidation completed, license still valid");
         }
-        // 业务代码也应周期性检查 take_revalidation_request()
     }
 }
 

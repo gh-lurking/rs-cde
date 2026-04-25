@@ -1,7 +1,7 @@
 // server/src/nonce_fallback.rs — 优化版 v2
 //
 // [OPT-2 FIX] check_and_store：内存满时先同步 GC 过期条目，再判断是否可插入
-// 避免 GC 任务 30s 间隔期间所有合法请求被拒绝（BUG-EXP-3）
+// 避免 GC 任务 30s 间隔期间所有合法请求被拒绝
 //
 // 与 CLAUDE.md §2 「Simplicity First」一致：不引入新抽象，仅在 check_and_store 内增加 GC 调用
 
@@ -20,9 +20,9 @@ struct NonceEntry {
 }
 
 const MAX_NONCE_ENTRIES: usize = 500_000;
+
 static MEMORY_NONCES: Lazy<Arc<DashMap<String, NonceEntry>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
-
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 static NONCE_CHECKED_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NONCE_REJECTED_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -46,6 +46,7 @@ pub fn start_cleanup_task() {
     {
         return;
     }
+
     tokio::spawn(async {
         loop {
             cleanup_once().await;
@@ -84,7 +85,6 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
     if map.len() >= MAX_NONCE_ENTRIES {
         let cleaned = sync_cleanup_expired();
         if cleaned == 0 {
-            // GC 后仍满（所有条目都未过期），真正的内存压力，拒绝
             tracing::error!(
                 "[NonceFallback] 内存已满 ({}) 且无可清理条目，拒绝新 nonce",
                 MAX_NONCE_ENTRIES
@@ -93,7 +93,6 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
             return false;
         }
         tracing::info!("[NonceFallback] 紧急 GC 清理 {} 条，继续处理请求", cleaned);
-        // GC 后重新检查（极端并发下仍可能满，但概率极低）
         if map.len() >= MAX_NONCE_ENTRIES {
             NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -107,7 +106,6 @@ pub fn check_and_store(key: &str, ttl_secs: u64) -> bool {
                 NONCE_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
-            // 已过期，更新并允许
             e.insert(NonceEntry { expires_at });
             true
         }
