@@ -3,6 +3,7 @@
 // [BUG-N1 FIX] 二次重试使用独立 RTT（t5/t6），而非沿用第一次 RTT
 // [BUG-N1-PARTIAL FIX] 第二次ERR-TIME-RECORD处理增加server_ts2上界校验
 // [OPT-2 FIX] validate_system_time 两个时间源改为 tokio::join! 并发请求
+// [BUG-NET-1 FIX] validate_system_time：过滤明显异常时间戳再求平均
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,6 @@ const MAX_CLOCK_OFFSET_SECS: i64 = 300;
 const NET_DEFAULT_TIMEOUT_SECS: u64 = 10;
 const SYSTEM_TIME_HARD_LIMIT_SECS: i64 = 300;
 const SYSTEM_TIME_WARN_SECS: i64 = 60;
-
 pub const ERR_REVOKED: &str = "ERR-REVOKED";
 pub const ERR_INVALID_KEY: &str = "ERR-INVALID-KEY";
 pub const ERR_NOT_ACTIVATED: &str = "ERR-NOT-ACTIVATED";
@@ -44,7 +44,6 @@ fn get_server_id() -> &'static str {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -82,6 +81,7 @@ fn sign_request(hkey: &str, key_hash: &str, ts: i64) -> String {
 
 fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
     let err_code = body["error"].as_str().unwrap_or("unknown");
+
     match status.as_u16() {
         410 => return ERR_EXPIRED.to_string(),
         409 => {
@@ -103,6 +103,7 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
         }
         _ => {}
     }
+
     match err_code {
         "ERR-REVOKED" => ERR_REVOKED.to_string(),
         "ERR-INVALID-KEY" => ERR_INVALID_KEY.to_string(),
@@ -122,7 +123,6 @@ fn parse_server_error(status: reqwest::StatusCode, body: &serde_json::Value) -> 
 async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyResponse, String> {
     let key_hash = hash_key(hkey);
     let signature = sign_request(hkey, &key_hash, ts);
-
     let req = VerifyRequest {
         key_hash,
         timestamp: ts,
@@ -143,8 +143,8 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
     if status.is_success() {
         let vr: VerifyResponse =
             serde_json::from_value(body).map_err(|e| format!("JSON decode: {e}"))?;
-        if vr.activation_ts <= 0 || vr.expires_at <= 0 {
-            return Err("ERR-ZERO-VALUE-RESPONSE".to_string());
+        if vr.activation_ts <= 0 {
+            return Err("invalid activation_ts from server".to_string());
         }
         return Ok(vr);
     }
@@ -165,7 +165,6 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
             let t2 = now_secs();
             let full_rtt = t2 - t1;
 
-            // 第一次重试路径：server_ts 合法性校验（上下界）
             if server_ts < t1 - MAX_CLOCK_OFFSET_SECS * 2
                 || server_ts > t1 + MAX_CLOCK_OFFSET_SECS * 2
                 || full_rtt < 0
@@ -196,7 +195,6 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
                         .unwrap_or(estimated_server_now);
                     let rtt2 = t6 - t5;
 
-                    // [BUG-N1-PARTIAL FIX] 第二次也做上界校验
                     if server_ts2 < t5 - MAX_CLOCK_OFFSET_SECS * 2
                         || server_ts2 > t5 + MAX_CLOCK_OFFSET_SECS * 2
                         || rtt2 < 0
@@ -228,15 +226,11 @@ pub async fn verify_online(hkey: &str, server_url: &str) -> Result<VerifyRespons
     }
 }
 
-// [BUG-NET-1 FIX] validate_system_time：过滤明显异常时间戳再求平均
-// 与 CLAUDE.md §1「Think Before Coding」一致：
-// 外部时间源可能返回 0 或极大值，防御性过滤
 pub async fn validate_system_time() -> Result<(), String> {
     let local_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-
     let min_ts: u64 = 1_704_067_200; // 2024-01-01
     let max_ts: u64 = local_now + 10 * 365 * 86400;
 
@@ -245,8 +239,6 @@ pub async fn validate_system_time() -> Result<(), String> {
     }
 
     let client = get_http_client();
-
-    // [OPT-2] 两个时间源并发请求
     let (cf_ts, http_ts) = tokio::join!(
         get_time_from_cf_trace(client),
         get_time_from_http_date(client)
@@ -258,20 +250,17 @@ pub async fn validate_system_time() -> Result<(), String> {
         return Err("无法获取外部时间源，请检查网络连接".to_string());
     }
 
-    // [BUG-NET-1 FIX] 过滤明显异常时间戳（偏差超过 HARD_LIMIT * 10 直接丢弃）
     let local_i64 = local_now as i64;
-    let filter_threshold = SYSTEM_TIME_HARD_LIMIT_SECS * 10; // 3000s
+    let filter_threshold = SYSTEM_TIME_HARD_LIMIT_SECS * 10;
+
     let valid_timestamps: Vec<i64> = timestamps
         .iter()
-        .filter(|&&t| (local_i64 - t).abs() < filter_threshold)
-        .cloned()
+        .filter(|&&t| (local_i64 - t).abs() <= filter_threshold)
+        .copied()
         .collect();
 
     if valid_timestamps.is_empty() {
-        return Err(format!(
-            "所有外部时间源均返回异常值（本地时间 {}，过滤阈值 {}s）",
-            local_now, filter_threshold
-        ));
+        return Err("所有外部时间源均异常".to_string());
     }
 
     let avg_offset: i64 = valid_timestamps.iter().map(|&t| local_i64 - t).sum::<i64>()
@@ -320,15 +309,15 @@ async fn get_time_from_http_date(client: &reqwest::Client) -> Option<i64> {
         .await
         .ok()?;
     let date_str = resp.headers().get("date")?.to_str().ok()?;
-    let server_time = parse_http_date_to_timestamp(date_str)?;
-    Some(server_time as i64)
+    parse_http_date_to_timestamp(date_str)
 }
 
-fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
+fn parse_http_date_to_timestamp(date_str: &str) -> Option<i64> {
     let parts: Vec<&str> = date_str.split_whitespace().collect();
     if parts.len() != 6 {
         return None;
     }
+
     let day: u32 = parts[1].parse().ok()?;
     let month = match parts[2] {
         "Jan" => 1u32,
@@ -365,7 +354,11 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<u64> {
     }
 
     let days = days_since_1970(year, month, day);
-    Some(days * 86400 + h as u64 * 3600 + m as u64 * 60 + s as u64)
+    Some(
+        (days * 86400 + h as u64 * 3600 + m as u64 * 60 + s as u64)
+            .try_into()
+            .unwrap(),
+    )
 }
 
 fn days_since_1970(year: i32, month: u32, day: u32) -> u64 {
