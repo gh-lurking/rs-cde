@@ -1,4 +1,4 @@
-// client/src/license_guard.rs — 优化版 v5
+// client/src/license_guard.rs — 优化版 v6
 //
 // [BUG-HIGH-2-RELATED] check_and_enforce 在收到 ERR_EXPIRED 时
 //   不再直接退出，而是检查服务端是否在响应体中传递了宽限期信息。
@@ -19,10 +19,11 @@
 //   改用 i64::try_from 安全转换，溢出时保守返回 false（不阻断）。
 //   对应 CLAUDE.md §1「Think Before Coding」：防御性处理数值溢出。
 //
+// [V6] 完整补齐离线路径的 expired 处理
+//
 // 对应 CLAUDE.md §1「Think Before Coding」与 §2「Simplicity First」：
 //   客户端不自行计算宽限期，完全信任服务端判断。
 //   仅当服务端明确返回过期时才退出。
-
 use crate::{network, storage, time_guard};
 use obfstr::obfstr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -205,16 +206,19 @@ pub async fn check_and_enforce() {
                     std::process::exit(1);
                 }
                 storage::LocalReadResult::Expired {
-                    value: (_, _local_expires),
+                    value: (_ts, local_expires),
                     read_count: _,
                 } => {
-                    eprintln!("[License] key expired (local)");
+                    eprintln!(
+                        "[License] key expired (local), expires_at={}",
+                        local_expires
+                    );
                     std::process::exit(1);
                 }
                 storage::LocalReadResult::Success {
                     value: (local_ts, local_expires),
                     read_count: _,
-                    repair_failed: _,
+                    repair_failed,
                 } => {
                     if local_ts == 0 || local_expires == 0 {
                         eprintln!("[License] invalid local timestamps");
@@ -229,8 +233,14 @@ pub async fn check_and_enforce() {
                         }
                     };
                     if now >= local_expires_i64 {
-                        eprintln!("[License] key expired (local)");
+                        eprintln!("[License] key expired (local, confirmed by network failure)");
                         std::process::exit(1);
+                    }
+                    // 离线通过：使用本地数据
+                    if repair_failed {
+                        tracing::warn!("[License] offline mode: some replicas need repair");
+                    } else {
+                        tracing::info!("[License] offline mode: all replicas consistent");
                     }
                     time_guard::set_expiry_time(local_expires_i64);
                 }

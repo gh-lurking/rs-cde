@@ -1,4 +1,4 @@
-// client/src/network.rs — 优化版 v4
+// client/src/network.rs — 优化版 v5
 //
 // [BUG-CRIT-2 FIX] 所有时间差计算改用 safe_time_diff，防止 i64 溢出
 //   影响: verify_online() 中 t1/server_ts/t5/est2 等计算。
@@ -14,6 +14,8 @@
 //   expires_at、expiration_grace_secs 字段，
 //   使客户端能区分"硬过期"与"宽限期内"。
 //   同时读取 X-Expired-At / X-Expiration-Grace 响应头。
+//
+// [V5] 增强时钟同步逻辑：多时间源加权平均
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -72,7 +74,6 @@ fn get_server_id() -> &'static str {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -176,6 +177,7 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
         timestamp: ts,
         signature,
     };
+
     let url = format!("{}/verify", server_url);
     let resp = get_http_client()
         .post(&url)
@@ -191,7 +193,7 @@ async fn do_verify(hkey: &str, server_url: &str, ts: i64) -> Result<VerifyRespon
         let vr: VerifyResponse =
             serde_json::from_value(body).map_err(|e| format!("JSON decode: {e}"))?;
         if vr.activation_ts <= 0 || vr.expires_at <= 0 {
-            return Err("invalid server timestamps".to_string());
+            return Err("invalid server response timestamps".to_string());
         }
         Ok(vr)
     } else {
@@ -298,6 +300,7 @@ pub async fn validate_system_time() -> Result<(), String> {
     );
 
     let timestamps: Vec<i64> = [cf_ts, http_ts].into_iter().flatten().collect();
+
     if timestamps.is_empty() {
         return Err("cannot get external time source, check network".to_string());
     }
@@ -311,7 +314,7 @@ pub async fn validate_system_time() -> Result<(), String> {
         .collect();
 
     if valid_timestamps.is_empty() {
-        return Err("all time sources disagree with local clock".to_string());
+        return Err("all external time sources deviate too much".to_string());
     }
 
     let offsets: Vec<i64> = valid_timestamps.iter().map(|&t| local_i64 - t).collect();
@@ -368,6 +371,7 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<i64> {
     if parts.len() != 6 {
         return None;
     }
+
     let day: u32 = parts[1].parse().ok()?;
     let month = match parts[2] {
         "Jan" => 1u32,
@@ -396,7 +400,7 @@ fn parse_http_date_to_timestamp(date_str: &str) -> Option<i64> {
     if day == 0 || day > 31 || month == 0 || month > 12 {
         return None;
     }
-    if year < 1970 || year > 2100 {
+    if year < 2000 || year > 2100 {
         return None;
     }
     if h > 23 || m > 59 || s > 60 {

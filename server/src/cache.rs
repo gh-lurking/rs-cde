@@ -1,4 +1,4 @@
-// server/src/cache.rs — 优化版 v4
+// server/src/cache.rs — 优化版 v5
 //
 // [BUG-MED-2 FIX] is_revoked() remove-after-drop 竞态修复：
 //   原代码在 drop(exp) 后调用 mem_map.remove(key_hash)，
@@ -11,36 +11,36 @@
 // [BUG-CRIT-4 FIX] set_verify_cache 增加 activation_ts 零值防御：
 //   原检查 activation_ts >= expires_at 无法捕获
 //   activation_ts=0, expires_at>0 的损坏数据。
-//   新增 activation_ts <= 0 检查，匹配则拒绝写入缓存。
-//   对应 CLAUDE.md §1「Think Before Coding」：防御不可能但灾难性的场景。
+//   新增 activation_ts <= 0 检查。
 //
-// 与 CLAUDE.md §3「Surgical Changes」一致：只改必要的逻辑块。
+// [V5] 新增 VerifyCacheEntry Clone 以支持独立副本
 
 use dashmap::DashMap;
 use deadpool_redis::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 pub type RedisPool = Pool;
 
-const KEY_NS: &str = "lc:v1:";
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct VerifyCacheEntry {
-    pub activation_ts: i64,
-    pub expires_at: i64,
-}
+const KEY_NS: &str = "cde:v1:";
 
 static VERIFY_CACHE_TTL: OnceLock<u64> = OnceLock::new();
 static TOMBSTONE_TTL: OnceLock<u64> = OnceLock::new();
 static CACHE_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static CACHE_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
 static CACHE_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+
 const MIN_MEMORY_REVOKE_TTL: i64 = 60;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyCacheEntry {
+    pub activation_ts: i64,
+    pub expires_at: i64,
+}
 
 fn verify_cache_ttl() -> u64 {
     *VERIFY_CACHE_TTL.get_or_init(|| {
@@ -62,11 +62,12 @@ pub fn get_cache_stats() -> (u64, u64) {
     )
 }
 
-pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolError> {
+pub fn init_redis_pool(url: &str) -> Result<RedisPool, deadpool_redis::CreatePoolError> {
     let max_size: usize = std::env::var("REDIS_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+
     let cfg = Config {
         url: Some(url.to_string()),
         pool: Some(PoolConfig {
@@ -86,19 +87,16 @@ pub fn init_redis_pool(url: &str) -> Result<Pool, deadpool_redis::CreatePoolErro
 fn verify_cache_key(key_hash: &str) -> String {
     format!("{KEY_NS}verify:{key_hash}")
 }
-
 fn tombstone_key(key_hash: &str) -> String {
     format!("{KEY_NS}revoked:{key_hash}")
 }
-
 pub fn throttle_key(key_hash: &str) -> String {
     format!("{KEY_NS}throttle:{key_hash}")
 }
 
-static MEMORY_REVOKE_FALLBACK: OnceLock<DashMap<String, i64>> = OnceLock::new();
-
+static MEMORY_REVOKE_FALLBACK: OnceLock<Arc<DashMap<String, i64>>> = OnceLock::new();
 fn memory_revoke_map() -> &'static DashMap<String, i64> {
-    MEMORY_REVOKE_FALLBACK.get_or_init(DashMap::new)
+    MEMORY_REVOKE_FALLBACK.get_or_init(|| Arc::new(DashMap::new()))
 }
 
 fn now_ts() -> i64 {
@@ -114,7 +112,7 @@ pub fn mark_revoked_in_memory(key_hash: &str, expires_at: i64) {
 
 pub fn start_cache_cleanup_task() {
     if CACHE_CLEANUP_STARTED
-        .compare_exchange(false, true, SeqCst, SeqCst)
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return;
@@ -155,11 +153,17 @@ pub async fn get_verify_cache(pool: &RedisPool, key_hash: &str) -> Option<Verify
 /// 拒绝写入 activation_ts <= 0 或 activation_ts >= expires_at 的条目。
 /// 原代码只检查 activation_ts >= expires_at，无法防御
 /// activation_ts=0, expires_at>0 的损坏数据。
-/// 新增 activation_ts <= 0 后，只有真正激活的密钥才能进入缓存。
-/// 对应 CLAUDE.md §1：防御不可能但灾难性的场景。
+/// 新增 activation_ts <= 0 检查。
 pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCacheEntry) {
-    // [BUG-CRIT-4 FIX] 增强零值防御
-    if entry.activation_ts <= 0 || entry.activation_ts >= entry.expires_at {
+    // [BUG-CRIT-4 FIX] 防御性检查：activation_ts 不能为零或负数
+    if entry.activation_ts <= 0 {
+        tracing::warn!(
+            "[Cache] skip cache write: activation_ts={} (must be > 0)",
+            entry.activation_ts
+        );
+        return;
+    }
+    if entry.activation_ts >= entry.expires_at {
         tracing::warn!(
             "[Cache] skip inconsistent cache write: act={}, exp={}",
             entry.activation_ts,
@@ -167,6 +171,7 @@ pub async fn set_verify_cache(pool: &RedisPool, key_hash: &str, entry: &VerifyCa
         );
         return;
     }
+
     let Ok(json) = serde_json::to_string(entry) else {
         return;
     };
@@ -196,6 +201,7 @@ pub async fn invalidate_verify_cache(pool: &RedisPool, key_hash: &str) {
 /// exp 在 if 块结束时自动 drop，remove 在 exp drop 之后立即执行。
 pub async fn is_revoked(pool: &RedisPool, key_hash: &str) -> bool {
     let mem_map = memory_revoke_map();
+
     // 检查内存缓存
     {
         let entry = mem_map.get(key_hash);

@@ -1,4 +1,4 @@
-// client/src/time_guard.rs — 优化版 v4
+// client/src/time_guard.rs — 优化版 v5
 //
 // [C-03 FIX]  时间大幅跳跃（>3600s）时保守处理，校验 License 而非直接退出
 // [BUG-10 FIX] watchdog Ok(_) 正常退出也触发退出
@@ -8,6 +8,8 @@
 // [BUG-CRIT-5 FIX] 大时钟跳跃后不再使用 continue 跳过过期检查
 //
 // [NEW-CLIENT-3] 新增 get_expiry_time() 供 license_guard 预警使用
+//
+// [V5] 增加时间回拨的 NTP 校正提示
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
@@ -55,6 +57,7 @@ pub fn start_monitor() {
         .spawn(monitor_loop)
         .expect("Failed to spawn time-guard thread");
 
+    // [BUG-10 FIX] watchdog 正确处理正常退出和 panic
     thread::Builder::new()
         .name("time-guard-watchdog".to_string())
         .spawn(move || match handle.join() {
@@ -87,6 +90,7 @@ fn monitor_loop() {
         let last = LAST_VALID_TIME.load(Ordering::SeqCst);
         let expiry = EXPIRY_TIME.load(Ordering::SeqCst);
 
+        // [BUG-14 FIX] EXPIRY_TIME 未初始化时报错退出
         if expiry == 0 {
             tracing::error!("[TimeGuard] EXPIRY_TIME not initialized");
             std::process::exit(1);
@@ -94,7 +98,13 @@ fn monitor_loop() {
 
         // 时钟回拨检测
         if current < last - tolerance {
-            tracing::error!("[TimeGuard] clock rollback detected");
+            tracing::error!(
+                "[TimeGuard] clock rollback detected: last={}, current={}, delta={}s. \
+                 If this was NTP correction, restart the application.",
+                last,
+                current,
+                last - current
+            );
             std::process::exit(1);
         }
 

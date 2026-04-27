@@ -1,8 +1,8 @@
-// server/src/handlers.rs — 优化版 v15
+// server/src/handlers.rs — 优化版 v16
 //
 // [BUG-CRIT-1 FIX] 时间戳减法溢出修复：
 //   (now - req.timestamp).abs() 在 req.timestamp=i64::MIN 时发生有符号溢出。
-//   改用 checked_sub + or_else 安全计算差值，溢出时返回 i64::MAX 触发拒绝。
+//   改用 safe_time_diff 安全计算差值，溢出时返回 i64::MAX 触发拒绝。
 //   对应 CLAUDE.md §1「Think Before Coding」：明确防御极端输入。
 //
 // [BUG-HIGH-1 FIX] is_expired() 改用 saturating_add：
@@ -11,14 +11,15 @@
 //   改用 saturating_add 确保溢出时停在 i64::MAX（即永不过期），
 //   但 expires_at 本身仍需通过数据合法性校验（<= now + MAX_LICENSE_PERIOD）。
 //
-// [BUG-CRIT-4 FIX] 缓存路径增加 activation_ts 零值防御：
-//   set_verify_cache 只拒绝 activation_ts >= expires_at，
-//   无法防御 activation_ts=0, expires_at>0 的损坏数据。
-//   在 /verify 缓存读取路径增加 activation_ts <= 0 检查，
-//   防止未激活密钥被缓存路径误判为有效。
-//   对应 CLAUDE.md §1：防御不可能场景（DB损坏/手动篡改）。
+// [BUG-CRIT-4 FIX] 缓存条目 activation_ts 防御：
+//   在 /verify 缓存路径增加 activation_ts <= 0 检查，
+//   防止 activation_ts=0, expires_at>0 的损坏数据被缓存。
 //
-// [EXP-FIX-2] extend_license 过期状态更精确的错误消息
+// [BUG-HIGH-4 FIX] /verify 增加 activation_ts > now 校验：
+//   防止 DB 损坏导致的未来时间戳被接受。
+//   同时增加 validate_license_sanity 调用。
+//
+// [V16] 统一数据合法性校验入口：调用 db::validate_license_sanity()
 
 // [BUG FIX] 缓存命中路径每次仍查一次 DB（get_key_only）——有意设计但注释不足
 // 缓存命中后为了 HMAC 验证必须从 DB 取 key 明文（Redis 不缓存密钥明文，BUG-H3）。
@@ -26,14 +27,15 @@
 // 这是有意的安全设计（不在 Redis 存密钥），但注释说明不足，容易被误解为可优化项。
 // 实际上若要彻底消除该 DB 查询，需在内存（进程级）维护 key→hmac_key 的 LRU 缓存，
 // 并在 revoke 时同步失效。当前设计的 DB 访问可接受，无需改动，仅需补充注释。
-
-use crate::cache::{self, RedisPool, VerifyCacheEntry};
+use crate::cache;
+use crate::db;
 use crate::key_cache;
 use crate::nonce_fallback;
-// use deadpool_redis::redis;
+
+use axum::{extract::Query, response::IntoResponse, Extension, Json};
+use deadpool_redis::Pool as RedisPool;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
-use serde_json::json;
 use sha2::Sha256;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -41,10 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use axum::{extract::Extension, extract::Query, response::IntoResponse, Json};
-
 type HmacSha256 = Hmac<Sha256>;
-
 // ── 常量 ────────────────────────────────────────────────────────────────────
 const STATUS_EXPIRED: axum::http::StatusCode = axum::http::StatusCode::GONE;
 const STATUS_REVOKED: axum::http::StatusCode = axum::http::StatusCode::FORBIDDEN;
@@ -204,7 +203,7 @@ async fn should_update_last_check(pool: &RedisPool, key_hash: &str) -> bool {
 fn ok_verify_response(activation_ts: i64, expires_at: i64) -> axum::response::Response {
     (
         axum::http::StatusCode::OK,
-        Json(json!({
+        Json(serde_json::json!({
             "activation_ts": activation_ts,
             "expires_at": expires_at,
             "revoked": false,
@@ -216,7 +215,7 @@ fn ok_verify_response(activation_ts: i64, expires_at: i64) -> axum::response::Re
 fn time_window_error(now: i64) -> axum::response::Response {
     (
         axum::http::StatusCode::BAD_REQUEST,
-        Json(json!({
+        Json(serde_json::json!({
             "error": "ERR-TIME-RECORD",
             "server_time": now
         })),
@@ -225,14 +224,14 @@ fn time_window_error(now: i64) -> axum::response::Response {
 }
 
 fn err(code: axum::http::StatusCode, msg: &str) -> axum::response::Response {
-    (code, Json(json!({ "error": msg }))).into_response()
+    (code, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
 /// [NEW-EXP-3] 过期响应带额外 meta 信息，客户端可解析宽限期
 fn expired_response(expires_at: i64, now: i64) -> axum::response::Response {
     let grace = expiration_grace_secs();
     let mut resp = axum::response::Response::new(axum::body::Body::from(
-        serde_json::to_string(&json!({
+        serde_json::to_string(&serde_json::json!({
             "error": "ERR-EXPIRED",
             "expires_at": expires_at,
             "server_time": now,
@@ -279,7 +278,6 @@ pub async fn activate(
     }
 
     let now = now_secs();
-
     // [BUG-CRIT-1 FIX] 安全时间差计算，防止 i64 溢出
     if safe_time_diff(now, req.timestamp) > timestamp_window() {
         return time_window_error(now);
@@ -300,11 +298,11 @@ pub async fn activate(
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
-
     if record.activation_ts > 0 {
         return err(STATUS_NOT_ACTIVATED, "ERR-ALREADY-ACTIVATED");
     }
 
+    // HMAC 验证（在 nonce 消耗之前，防止无效请求消耗 nonce）
     if !verify_hmac_signature(&record.key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
@@ -318,10 +316,12 @@ pub async fn activate(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(365);
+
     let extra_secs = default_days
         .checked_mul(86400)
         .unwrap_or(crate::db::MAX_EXTEND_SECS)
         .clamp(1, crate::db::MAX_EXTEND_SECS);
+
     let expires_at = activation_ts.saturating_add(extra_secs);
 
     match crate::db::activate_license(&pool, &req.key_hash, activation_ts, expires_at).await {
@@ -377,10 +377,7 @@ pub async fn verify(
     // ── 缓存路径 ─────────────────────────────────────────────────────────
     if let Some(cached) = cache::get_verify_cache(&redis, &req.key_hash).await {
         // [BUG-CRIT-4 FIX] 防御 activation_ts 为零值的损坏缓存条目
-        //   set_verify_cache 检查 activation_ts >= expires_at 无法捕获
-        //   activation_ts=0, expires_at>0 的场景（DB 损坏/手动篡改）。
-        //   新增 activation_ts <= 0 检查，匹配则回源 DB 路径。
-        //   对应 CLAUDE.md §1：防御性处理不可能但灾难性的场景。
+        // set_verify_cache 检查 activation_ts <= 0 但可能仍有旧缓存。
         if cached.activation_ts <= 0 || cached.activation_ts >= cached.expires_at {
             tracing::warn!(
                 "[Verify] invalid cached entry (act={}, exp={}), fallback to DB path",
@@ -406,12 +403,15 @@ pub async fn verify(
                     );
                 }
             };
+
             if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
                 return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
             }
+
             if !check_and_store_nonce(&redis, &req.key_hash, req.timestamp).await {
                 return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
             }
+
             if should_update_last_check(&redis, &req.key_hash).await {
                 let db2 = Arc::clone(&db);
                 let kh = req.key_hash.clone();
@@ -421,6 +421,7 @@ pub async fn verify(
                     }
                 });
             }
+
             return ok_verify_response(cached.activation_ts, cached.expires_at);
         }
     }
@@ -438,11 +439,12 @@ pub async fn verify(
             );
         }
     };
+
     if !verify_hmac_signature(&key, &req.key_hash, req.timestamp, &req.signature) {
         return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY");
     }
 
-    // DB 查询 + 过期校验（先于 nonce 消耗）
+    // DB 查询 + 过期校验
     let record = match crate::db::find_license(&db, &req.key_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return err(STATUS_INVALID_KEY, "ERR-INVALID-KEY"),
@@ -455,14 +457,37 @@ pub async fn verify(
         }
     };
 
+    // 业务状态检查
     if record.revoked {
         return err(STATUS_REVOKED, "ERR-REVOKED");
     }
-
     if record.activation_ts <= 0 {
-        return err(axum::http::StatusCode::CONFLICT, "ERR-NOT-ACTIVATED");
+        return err(STATUS_NOT_ACTIVATED, "ERR-NOT-ACTIVATED");
     }
 
+    // [BUG-HIGH-4 FIX] activation_ts 不能在将来（防御 DB 损坏）
+    if record.activation_ts > now + 300 {
+        tracing::error!(
+            "[Verify] activation_ts={} is in the future (now={}), possible DB corruption",
+            record.activation_ts,
+            now
+        );
+        return err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR-DATA-INCONSISTENCY",
+        );
+    }
+
+    // [V16] 统一数据合法性校验
+    if let Err(reason) = db::validate_license_sanity(&record, now) {
+        tracing::error!("[Verify] license sanity check failed: {}", reason);
+        return err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR-DATA-INCONSISTENCY",
+        );
+    }
+
+    // 防御 activation_ts >= expires_at（已在 validate_license_sanity 中检查，此处二次确认）
     if record.activation_ts >= record.expires_at {
         return err(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -480,7 +505,8 @@ pub async fn verify(
         return err(STATUS_NONCE_REPLAY, "ERR-NONCE-REPLAY");
     }
 
-    let entry = VerifyCacheEntry {
+    // 写缓存
+    let entry = cache::VerifyCacheEntry {
         activation_ts: record.activation_ts,
         expires_at: record.expires_at,
     };
@@ -514,6 +540,7 @@ pub async fn health(
             .is_ok(),
         Err(_) => false,
     };
+
     let (nonce_total, nonce_rejected, nonce_map_size) = nonce_fallback::get_nonce_stats();
     let (cache_hits, cache_misses) = cache::get_cache_stats();
     let key_cache_size = key_cache::cache_size();
@@ -526,7 +553,7 @@ pub async fn health(
 
     (
         status,
-        Json(json!({
+        Json(serde_json::json!({
             "status": if db_ok && redis_ok { "ok" } else { "degraded" },
             "db": db_ok,
             "redis": redis_ok,
@@ -565,7 +592,7 @@ pub async fn list_licenses(
     match crate::db::list_all_licenses(&pool).await {
         Ok(list) => (
             axum::http::StatusCode::OK,
-            Json(json!({ "licenses": list })),
+            Json(serde_json::json!({ "licenses": list })),
         )
             .into_response(),
         Err(e) => err(
@@ -594,6 +621,7 @@ pub async fn revoke_license(
     if !validate_key_hash(&req.key_hash) {
         return err(axum::http::StatusCode::BAD_REQUEST, "invalid key_hash");
     }
+
     let reason = req.reason.as_deref().unwrap_or("revoked by admin");
     match crate::db::revoke_license(&pool, &req.key_hash, reason).await {
         Ok(false) => return err(axum::http::StatusCode::NOT_FOUND, "key not found"),
@@ -605,12 +633,18 @@ pub async fn revoke_license(
             )
         }
     }
+
     cache::set_revoke_tombstone(&redis_pool, &req.key_hash).await;
     cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
     let tombstone_exp = now_secs() + 86400 * 30;
     cache::mark_revoked_in_memory(&req.key_hash, tombstone_exp);
     key_cache::remove(&req.key_hash);
-    (axum::http::StatusCode::OK, Json(json!({ "revoked": true }))).into_response()
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "revoked": true })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -642,25 +676,20 @@ pub async fn extend_license(
             ),
         );
     }
-    if req.extra_days > crate::db::MAX_EXTEND_DAYS {
-        return err(
-            axum::http::StatusCode::BAD_REQUEST,
-            &format!("extra_days must be <= {}", crate::db::MAX_EXTEND_DAYS),
-        );
-    }
+
+    let allow_expired = req.allow_expired.unwrap_or(false);
     let extra_secs = req
         .extra_days
         .checked_mul(86400)
         .unwrap_or(crate::db::MAX_EXTEND_SECS)
         .clamp(1, crate::db::MAX_EXTEND_SECS);
-    let allow_expired = req.allow_expired.unwrap_or(false);
 
     match crate::db::extend_license(&pool, &req.key_hash, extra_secs, allow_expired).await {
         Ok(Some(new_exp)) => {
             cache::invalidate_verify_cache(&redis_pool, &req.key_hash).await;
             (
                 axum::http::StatusCode::OK,
-                Json(json!({
+                Json(serde_json::json!({
                     "new_expires_at": new_exp,
                     "actual_extra_secs": extra_secs,
                 })),
@@ -676,22 +705,29 @@ pub async fn extend_license(
                     if r.revoked {
                         err(axum::http::StatusCode::FORBIDDEN, "license is revoked")
                     } else if r.activation_ts <= 0 {
-                        err(axum::http::StatusCode::CONFLICT, "license not activated")
-                    } else if r.expires_at <= now_secs() {
+                        err(
+                            axum::http::StatusCode::CONFLICT,
+                            "license not yet activated",
+                        )
+                    } else if !allow_expired && r.expires_at <= now_secs() {
                         err(
                             axum::http::StatusCode::GONE,
-                            "license expired — use allow_expired=true to extend from now",
+                            "license expired, use allow_expired=true to extend",
                         )
                     } else {
                         err(
-                            axum::http::StatusCode::NOT_FOUND,
-                            "license not found or not activated",
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "extend query matched no rows",
                         )
                     }
                 }
-                _ => err(
+                Ok(None) => err(
                     axum::http::StatusCode::NOT_FOUND,
                     "license not found or not activated",
+                ),
+                Err(e) => err(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
                 ),
             }
         }
@@ -716,18 +752,21 @@ pub async fn add_key(
     if !crate::auth::verify_admin_token(&req.token, &admin) {
         return err(axum::http::StatusCode::UNAUTHORIZED, "unauthorized");
     }
+
     let hkey = generate_hkey();
     let key_hash = hash_key(&hkey);
     let note = req.note.as_deref().unwrap_or("");
+
     if let Err(e) = crate::db::insert_license(&pool, &hkey, &key_hash, now_secs(), note).await {
         return err(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),
         );
     }
+
     (
         axum::http::StatusCode::OK,
-        Json(json!({
+        Json(serde_json::json!({
             "key": hkey,
             "key_hash": key_hash
         })),
@@ -753,10 +792,11 @@ pub async fn batch_init(
     if req.count == 0 || req.count > 5_000 {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({"error": "count must be 1..5000"})),
+            Json(serde_json::json!({"error": "count must be 1..5000"})),
         )
             .into_response();
     }
+
     let note = req.note.unwrap_or_default();
     let keys: Vec<String> = (0..req.count).map(|_| generate_hkey()).collect();
 
@@ -765,13 +805,13 @@ pub async fn batch_init(
             let results: Vec<serde_json::Value> = keys
                 .iter()
                 .map(|k| {
-                    json!({
+                    serde_json::json!({
                         "key": k,
                         "key_hash": hash_key(k)
                     })
                 })
                 .collect();
-            Json(json!({
+            Json(serde_json::json!({
                 "ok": true,
                 "count": keys.len(),
                 "keys": results

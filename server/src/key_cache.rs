@@ -36,7 +36,6 @@ pub async fn get_or_load(
 
     // 缓存未命中，查 DB
     let key = crate::db::get_key_only(pool, key_hash).await?;
-
     if let Some(ref k) = key {
         // [BUG-MED-1 FIX] 先尝试淘汰最旧条目，再插入
         if KEY_CACHE.len() >= KEY_CACHE_MAX {
@@ -45,6 +44,7 @@ pub async fn get_or_load(
                 KEY_CACHE.remove(&old);
             }
         }
+
         KEY_CACHE.insert(key_hash.to_string(), k.clone());
 
         // [BUG-HIGH-3 FIX] 二次防御：插入后如果仍超限（并发插入导致），
